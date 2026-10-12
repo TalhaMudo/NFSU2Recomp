@@ -1,0 +1,621 @@
+<title>NFSU2 macOS Portu</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,500..800&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --bg:#F3F5F7; --paper:#FFFFFF; --ink:#14171C; --ink2:#2B313B; --muted:#5A6272; --line:#D8DDE4;
+  --accent:#0F6A86; --accent-soft:#E2EFF3; --find:#8F5300; --find-soft:#FBF0DE;
+  --dec:#433A9E; --dec-soft:#ECEAFB; --neg:#9B2F2F; --neg-soft:#F8E6E4;
+  --code-bg:#EEF1F4;
+  --f-disp:"Archivo","Helvetica Neue",Arial,sans-serif;
+  --f-body:"Source Serif 4",Georgia,"Times New Roman",serif;
+  --f-mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0F1216; --paper:#161A20; --ink:#E8EBEF; --ink2:#C9CED6; --muted:#98A1AF; --line:#2B323C;
+    --accent:#5CB8D4; --accent-soft:#16303A; --find:#E3A74E; --find-soft:#33261170;
+    --dec:#A69EF5; --dec-soft:#25224A; --neg:#EE8A80; --neg-soft:#3A1E1C;
+    --code-bg:#1D232B;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0F1216; --paper:#161A20; --ink:#E8EBEF; --ink2:#C9CED6; --muted:#98A1AF; --line:#2B323C;
+  --accent:#5CB8D4; --accent-soft:#16303A; --find:#E3A74E; --find-soft:#33261170;
+  --dec:#A69EF5; --dec-soft:#25224A; --neg:#EE8A80; --neg-soft:#3A1E1C;
+  --code-bg:#1D232B;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:17px;line-height:1.6;margin:0}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:20px;padding-block:0 64px}
+a{color:var(--accent)}
+code,.mono{font-family:var(--f-mono);font-size:.86em}
+code{background:var(--code-bg);padding:.08em .35em;border-radius:4px}
+h1,h2,h3,h4{font-family:var(--f-disp);text-wrap:balance;letter-spacing:-.01em;color:var(--ink)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* baslik */
+header.top{padding-block:56px 32px;border-bottom:1px solid var(--line);margin-bottom:40px}
+.eyebrow{font-family:var(--f-disp);font-size:13px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
+h1{font-size:clamp(30px,4.6vw,52px);line-height:1.06;font-weight:800;font-stretch:88%;margin:0 0 18px;max-width:22ch}
+.lede{font-size:19px;color:var(--ink2);max-width:62ch;margin:0}
+.meta{display:flex;flex-wrap:wrap;gap:6px 22px;margin-top:22px;font-family:var(--f-disp);font-size:14px;color:var(--muted)}
+.meta b{color:var(--ink);font-weight:600}
+
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-top:34px}
+.stat{background:var(--paper);padding:18px 18px 16px}
+.stat .n{font-family:var(--f-disp);font-weight:750;font-stretch:85%;font-size:34px;line-height:1;color:var(--ink);font-variant-numeric:tabular-nums}
+.stat .l{font-family:var(--f-disp);font-size:13.5px;color:var(--muted);margin-top:8px;line-height:1.35}
+
+/* duzen */
+.layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:48px}
+nav.toc{position:sticky;top:calc(env(safe-area-inset-top,0px) + 24px);align-self:start;font-family:var(--f-disp);font-size:14px}
+nav.toc p{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:0 0 10px;font-weight:600}
+nav.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:2px;counter-reset:t}
+nav.toc a{display:block;padding:5px 10px;border-left:2px solid var(--line);color:var(--ink2);text-decoration:none}
+nav.toc a:hover{border-left-color:var(--accent);color:var(--accent)}
+main{min-width:0}
+section{margin-bottom:64px}
+h2{font-size:28px;font-weight:750;font-stretch:92%;margin:0 0 6px}
+.sub{color:var(--muted);font-family:var(--f-disp);font-size:15px;margin:0 0 24px}
+p{max-width:70ch}
+.prose p{margin:0 0 14px}
+
+/* baslangic */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.panel{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:20px 22px}
+.panel h3{font-size:17px;margin:0 0 10px;font-weight:700}
+.panel ul{margin:0;padding-left:1.1em}
+.panel li{margin-bottom:6px}
+.options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:20px}
+.opt{border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:var(--paper)}
+.opt h4{margin:0 0 4px;font-size:15.5px}
+.opt p{margin:0;font-size:15px;color:var(--ink2)}
+.opt .v{font-family:var(--f-disp);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
+.opt.no .v{color:var(--neg)} .opt.yes{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)} .opt.yes .v{color:var(--accent)}
+
+/* boru hatti */
+.pipe{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:8px 0 18px}
+.stage{flex:1 1 150px;background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:14px 14px 12px;position:relative;margin-right:26px;margin-bottom:12px}
+.stage:last-child{margin-right:0}
+.stage:not(:last-child)::after{content:"→";position:absolute;right:-21px;top:50%;transform:translateY(-50%);color:var(--muted);font-family:var(--f-disp);font-size:18px}
+.stage .k{font-family:var(--f-mono);font-size:11.5px;color:var(--accent);letter-spacing:.02em}
+.stage h4{margin:4px 0 4px;font-size:15.5px}
+.stage p{margin:0;font-size:14px;color:var(--ink2);line-height:1.45}
+.runtime{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.rt{border:1px dashed var(--line);border-radius:8px;padding:10px 12px;background:var(--paper)}
+.rt b{font-family:var(--f-disp);font-size:14px;display:block}
+.rt span{font-size:13.5px;color:var(--muted);line-height:1.4;display:block;margin-top:2px}
+
+/* zaman cizelgesi */
+.tl{list-style:none;margin:0;padding:0;position:relative}
+.tl::before{content:"";position:absolute;left:112px;top:6px;bottom:6px;width:2px;background:var(--line)}
+.tl>li{display:grid;grid-template-columns:112px minmax(0,1fr);gap:0 28px;margin-bottom:34px;position:relative}
+.tl>li::before{content:"";position:absolute;left:107px;top:9px;width:12px;height:12px;border-radius:50%;background:var(--paper);border:2px solid var(--accent)}
+.when{font-family:var(--f-disp);text-align:right;padding-right:6px}
+.when time{display:block;font-weight:700;font-size:16px;color:var(--ink);font-variant-numeric:tabular-nums}
+.when span{display:block;font-size:12.5px;color:var(--muted);margin-top:2px}
+.day h3{font-size:19px;margin:2px 0 10px;font-weight:700}
+.day ul{list-style:none;margin:0;padding:0;display:grid;gap:9px}
+.day li{padding-left:0;font-size:16px;color:var(--ink2)}
+.tag{display:inline-block;font-family:var(--f-disp);font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;padding:2px 7px;border-radius:4px;margin-right:6px;vertical-align:1px;white-space:nowrap}
+.t-find{color:var(--find);background:var(--find-soft)}
+.t-dec{color:var(--dec);background:var(--dec-soft)}
+.t-neg{color:var(--neg);background:var(--neg-soft)}
+.t-user{color:var(--accent);background:var(--accent-soft)}
+.day .why{margin:12px 0 0;font-size:14.5px;color:var(--muted);border-left:2px solid var(--line);padding-left:12px}
+.day .why b{font-family:var(--f-disp);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink2);margin-right:4px}
+.legend{display:flex;flex-wrap:wrap;gap:8px 16px;margin:0 0 28px;font-size:14.5px;color:var(--muted)}
+
+/* tablo */
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--paper)}
+table{border-collapse:collapse;width:100%;min-width:720px;font-size:15px}
+th,td{text-align:left;vertical-align:top;padding:12px 14px;border-bottom:1px solid var(--line)}
+th{font-family:var(--f-disp);font-size:12.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-family:var(--f-disp);font-weight:600;color:var(--ink);width:24%}
+td.alt{color:var(--muted);width:20%}
+td .d{display:block;font-family:var(--f-mono);font-size:12px;color:var(--muted);font-weight:400;margin-top:3px}
+
+/* dogrulama */
+.tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.tool{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.tool h4{margin:0 0 4px;font-size:16px}
+.tool p{margin:0;font-size:15px;color:var(--ink2)}
+.tool .q{font-family:var(--f-mono);font-size:12px;color:var(--accent);margin-bottom:4px}
+
+/* grafik */
+.chart{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:18px 18px 8px;overflow-x:auto}
+.chart svg{display:block;width:100%;min-width:560px;height:auto}
+.chart .ax{stroke:var(--line)} .chart .cap{stroke:var(--neg);stroke-dasharray:5 5}
+.chart .bar{fill:var(--accent)} .chart .bar.last{fill:var(--dec)}
+.chart text{font-family:var(--f-disp);fill:var(--ink2);font-size:13px}
+.chart .val{font-weight:700;font-size:15px;fill:var(--ink)}
+.chart .lab{font-size:12.5px;fill:var(--muted)}
+.chart .capt{fill:var(--neg);font-size:12px}
+.note{font-size:14px;color:var(--muted);margin-top:10px}
+.budget{display:flex;height:34px;border-radius:6px;overflow:hidden;border:1px solid var(--line);margin:14px 0 8px;font-family:var(--f-disp);font-size:12.5px}
+.budget div{display:flex;align-items:center;justify-content:center;color:#fff;white-space:nowrap;overflow:hidden;padding:0 6px}
+.b-x86{background:var(--dec);flex:75} .b-gpu{background:var(--accent);flex:20} .b-rt{background:var(--muted);flex:7}
+
+/* galeri */
+.gal{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.gal figure{margin:0;background:var(--paper);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.gal img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover;background:#000}
+.gal figcaption{padding:10px 12px 12px;font-size:14px;color:var(--ink2);line-height:1.4}
+.gal figcaption b{font-family:var(--f-disp);display:block;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:2px;font-weight:600}
+.gal .wide{grid-column:span 3}
+.gal .wide img{aspect-ratio:auto;object-fit:contain}
+.gal .half{grid-column:span 3}
+
+/* listeler */
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.list{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:18px 22px}
+.list h3{font-size:17px;margin:0 0 10px}
+.list ul{margin:0;padding-left:1.1em}
+.list li{margin-bottom:8px;font-size:15.5px;color:var(--ink2)}
+.foot{border-top:1px solid var(--line);padding-top:20px;font-size:14px;color:var(--muted);font-family:var(--f-disp)}
+
+@media (max-width:900px){
+  .layout{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;margin-bottom:36px}
+  nav.toc ol{display:flex;flex-wrap:wrap;gap:6px}
+  nav.toc a{border:1px solid var(--line);border-radius:999px;padding:4px 12px}
+  .runtime{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .gal{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .gal .wide,.gal .half{grid-column:span 2}
+}
+@media (max-width:640px){
+  body{font-size:16px}
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .two,.cols,.tools,.options{grid-template-columns:1fr}
+  .tl::before{left:6px}
+  .tl>li{grid-template-columns:1fr;padding-left:28px}
+  .tl>li::before{left:1px}
+  .when{text-align:left;margin-bottom:4px}
+  .when time,.when span{display:inline;margin-right:8px}
+  .stage{margin-right:0;flex-basis:100%}
+  .stage:not(:last-child)::after{content:"↓";right:auto;left:50%;top:auto;bottom:-19px;transform:translateX(-50%)}
+  .stage{margin-bottom:26px}
+  .gal{grid-template-columns:1fr}
+  .gal .wide,.gal .half{grid-column:span 1}
+}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+html{scroll-behavior:smooth}
+</style>
+
+<div class="wrap">
+<header class="top">
+  <p class="eyebrow">Bitirme projesi · Çalışma kaydı</p>
+  <h1>Need for Speed: Underground 2'yi Apple Silicon'da yerel çalıştırmak</h1>
+  <p class="lede">2004 tarihli, 32-bit Windows oyununun makine kodunu kaynak kod olmadan C'ye çevirip macOS için ARM64 olarak yeniden derleyen bir statik rekompilasyon projesi. Arada Wine, sanal makine ya da emülatör yok. Bu sayfa, projenin hangi noktadan başladığını, tarih sırasıyla neler yapıldığını, nelerin fark edildiğini ve kararların neye dayandığını anlatıyor.</p>
+  <div class="meta">
+    <span>Dönem <b>24 Ağustos – 27 Eylül 2026</b></span>
+    <span>Donanım <b>MacBook Pro 14", Apple M1 Pro</b></span>
+    <span>Hedef ikili <b>SPEED2.EXE · PE32 · Intel 80386</b></span>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="n">23.278</div><div class="l">x86 fonksiyonu otomatik olarak C'ye çevrilip ARM64'e derlendi</div></div>
+    <div class="stat"><div class="n">~3 milyon</div><div class="l">satır üretilmiş C kodu; elle yazılan katman 13.166 satır, araçlar 4.121 satır</div></div>
+    <div class="stat"><div class="n">13.000+</div><div class="l">rastgele komut vakası gerçek x86 işlemciye karşı birebir doğrulandı (sıfır fark)</div></div>
+    <div class="stat"><div class="n">43 → 119</div><div class="l">yarışta kare hızı (fps). 120, ekranın yenileme sınırı</div></div>
+  </div>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="İçindekiler">
+  <p>İçindekiler</p>
+  <ol>
+    <li><a href="#baslangic">Başlangıç noktası</a></li>
+    <li><a href="#yontem">Yöntem</a></li>
+    <li><a href="#zaman">Tarih sırasıyla</a></li>
+    <li><a href="#kararlar">Kararlar ve gerekçeleri</a></li>
+    <li><a href="#dogrulama">Neye göre: doğrulama</a></li>
+    <li><a href="#performans">Performans</a></li>
+    <li><a href="#gorseller">Görseller</a></li>
+    <li><a href="#acik">Açık konular</a></li>
+    <li><a href="#tez">Tez için sonraki adımlar</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="baslangic">
+  <h2>Başlangıç noktası</h2>
+  <p class="sub">24 Ağustos 2026: elde yalnızca oyunun Windows dosyaları vardı.</p>
+  <div class="two">
+    <div class="panel">
+      <h3>Eldeki</h3>
+      <ul>
+        <li><code>SPEED2.EXE</code>: 32-bit x86 Windows çalıştırılabiliri (3,68 MB kod bölümü, yaklaşık 1,13 milyon komut)</li>
+        <li>Oyunun veri dosyaları (1.261 dosya, eksiksiz)</li>
+        <li>Kaynak kod yok. Oynanabilir bir tersine mühendislik (decompilation) projesi de yok; var olanlar yalnızca belgeleme düzeyinde.</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>Neden zor</h3>
+      <ul>
+        <li>macOS, Catalina'dan (2019) beri 32-bit kodu hiç çalıştırmıyor. Rosetta 2 de yalnızca 64-bit x86'yı çeviriyor.</li>
+        <li>Aspyr'ın 2005 tarihli resmî Mac sürümü PowerPC ve 32-bit Intel için yazılmış; bugünkü macOS'ta çalışmıyor.</li>
+        <li>x86 komutları 1–15 bayt arası değişken uzunlukta. Bu yüzden koddaki bir 4 baytlık değerin adres mi sayı mı olduğu genel durumda kesin olarak bilinemez.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="options" role="list">
+    <div class="opt no" role="listitem"><div class="v">Reddedildi</div><h4>Wine / CrossOver</h4><p>Windows API'lerini çeviren bir uyumluluk katmanı. Projenin "arada hiçbir katman olmasın" şartını karşılamıyor.</p></div>
+    <div class="opt no" role="listitem"><div class="v">Reddedildi</div><h4>Sanal makine</h4><p>İçinde tam bir Windows çalıştırmak demek; yerel çalışmaktan en uzak seçenek.</p></div>
+    <div class="opt yes" role="listitem"><div class="v">Seçildi</div><h4>Statik rekompilasyon</h4><p>Makine kodunu önceden C'ye çevirip yerel olarak derlemek. N64 ve Xbox 360 portlarında kullanılan teknik, burada bir x86 masaüstü (Win32 / Direct3D 9) oyununa uyarlanıyor.</p></div>
+  </div>
+</section>
+
+<section id="yontem">
+  <h2>Yöntem</h2>
+  <p class="sub">Oyunun kendi kodu yeniden yazılmıyor, makine tarafından çevriliyor. Elle yazılan tek şey, Windows'un yerini tutan sınır katmanı.</p>
+  <div class="pipe">
+    <div class="stage"><div class="k">girdi</div><h4>SPEED2.EXE</h4><p>32-bit x86 makine kodu ve Windows içe aktarımları</p></div>
+    <div class="stage"><div class="k">tools/lift.py</div><h4>Ayrıştırma ve çeviri</h4><p>capstone ile komut çözme; relocation tablosu rehberliğinde fonksiyon bulma; her fonksiyonu C'ye çevirme</p></div>
+    <div class="stage"><div class="k">clang -O3</div><h4>Yerel derleme</h4><p>128 parça, tam derleme yaklaşık 5 dakika. Çıktı ARM64 Mach-O</p></div>
+    <div class="stage"><div class="k">runtime/</div><h4>Çalışma zamanı</h4><p>Bellek, dolaylı çağrı tablosu ve Windows'un yerini tutan katmanlar</p></div>
+  </div>
+  <div class="runtime">
+    <div class="rt"><b>Win32 → macOS</b><span>dosya, iş parçacığı, zamanlayıcı, kayıt defteri, pencere</span></div>
+    <div class="rt"><b>Direct3D 9 → Metal</b><span>çizim, dokular, render hedefleri, derinlik ve karışım durumları</span></div>
+    <div class="rt"><b>Shader çevirici</b><span>oyunun vs/ps bytecode'u → Metal Shading Language, GPU'da</span></div>
+    <div class="rt"><b>DirectSound / DirectInput</b><span>→ CoreAudio ve macOS klavye/fare olayları</span></div>
+  </div>
+  <div class="prose" style="margin-top:22px">
+    <p><strong>Yöntemi mümkün kılan bulgu:</strong> EXE'nin relocation (yer değiştirme) tablosu başlıkta silinmiş, ama verisi isimsiz bir bölümde fiziksel olarak duruyordu. Elle ayrıştırılınca 91.106 mutlak adres çıktı ve bunların %100'ü geçerli bir adrese işaret ediyordu. Bu tablo, x86 statik çevirisinin temel sorununu, yani "hangi 4 bayt işaretçi, hangisi sayı?" sorusunu çözdü. Kod bölümünün %96'sı kod olarak kesinleşti, belirsiz kalan kısım %1,3'e indi.</p>
+    <p><strong>Bellek:</strong> oyunun 32-bit adres alanı tek bir bloğa eşleniyor. Konuk adresi ARM64'ün <code>uxtw</code> adresleme kipiyle tek komutta gerçek adrese dönüşüyor, yani her bellek erişimi ek maliyetsiz.</p>
+  </div>
+</section>
+
+<section id="zaman">
+  <h2>Tarih sırasıyla</h2>
+  <p class="sub">Her gün için ne yapıldığı, ne fark edildiği ve kararın neye dayandığı.</p>
+  <div class="legend">
+    <span><span class="tag t-find">Bulgu</span>ölçümle ortaya çıkan kök neden</span>
+    <span><span class="tag t-dec">Karar</span>yön değiştiren seçim</span>
+    <span><span class="tag t-user">Gözlem</span>oyunu oynayarak yapılan tespit</span>
+    <span><span class="tag t-neg">Olumsuz</span>denenip bırakılan</span>
+  </div>
+
+  <ol class="tl">
+    <li>
+      <div class="when"><time datetime="2026-08-24">24 Ağu</time><span>1. gün</span></div>
+      <div class="day">
+        <h3>Fizibilite, yöntem seçimi ve ilk tam derleme</h3>
+        <ul>
+          <li><span class="tag t-dec">Karar</span>Wine ve sanal makine, "yerel olmalı" şartı nedeniyle elendi. Statik rekompilasyon seçildi.</li>
+          <li><span class="tag t-find">Bulgu</span>Silinmiş sanılan relocation tablosu bulundu (91.106 adres, %100 geçerli).</li>
+          <li>Çevirici ilk gün 23.274 fonksiyonun %96,3'ünü tam çevirdi. Tek bir eksik komut (<code>cld</code>) tek başına 710 fonksiyonu tıkıyordu.</li>
+          <li>Dolaylı çağrılar için adres → fonksiyon tablosu kuruldu (sabit zamanlı arama). 23.278 fonksiyon 115,6 MB C koduna çevrildi ve 130 parçada hatasız derlendi. Windows başlangıç kodu 73 sistem çağrısı derinliğe kadar doğru çalıştı.</li>
+          <li><span class="tag t-find">Bulgu</span>Oyun "Buffer overrun detected!" hatası verdi. Sebep, çevirici hatalarıydı: <code>push</code> komutunda değerlendirme sırası yanlıştı, fonksiyonların %25,2'si de yanlış bloktan başlıyordu.</li>
+          <li><span class="tag t-neg">Olumsuz</span>Fonksiyonların argüman sayısını koddan tahmin etmek, bilinen 183 fonksiyonda yalnızca %74,9 doğru çıktı. Yanlış bir sayı yığını bozduğu için bu yol bırakıldı, doğrulanmış bir tablo kullanıldı.</li>
+        </ul>
+        <p class="why"><b>Neye göre</b>Her aşamada kapsama ölçüldü: kod oranı, çevrilen fonksiyon, çözülemeyen çağrı sayısı. İlk birim testleri de oyunun kendi fonksiyonlarını C kütüphanesi karşılıklarıyla bit bit karşılaştırıyordu.</p>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-08-25">25 Ağu</time><span>2. gün</span></div>
+      <div class="day">
+        <h3>Oyun kendi kodunu çalıştırıyor; işlemci çevirisi doğrulandı</h3>
+        <ul>
+          <li>İlk kesintisiz koşu: 60 saniyede 373 kare, 69.540 çizim çağrısı, 64 veri dosyası, sıfır çökme. Windows katmanında dört kritik hata bulundu, örneğin iş parçacıklarının kendini yeniden başlatması ve TLS'nin iş parçacığına özel olmaması.</li>
+          <li>İlk Metal penceresi açıldı. Dokular (DXT1/3/5) ve arayüz çizimi eklendi. Yükleme ekranı piksel piksel doğru çiziliyordu.</li>
+          <li><span class="tag t-find">Bulgu</span>Profil ekranında gri çizgiler vardı: oyun shader'a matris yerine parametre adlarının harf kodlarını yazıyordu. İz, işlemci çevirisindeki hatalara kadar sürüldü.</li>
+          <li><span class="tag t-dec">Karar</span>Belirti kovalamak yerine sistematik doğrulamaya geçildi. Mac'teki Rosetta'yı "doğru cevap" olarak kullanan bir <strong>diferansiyel test aracı</strong> yazıldı: aynı komut baytları hem gerçek x86'da hem bizim kodumuzda çalıştırılıp sonuçlar karşılaştırılıyor. Bu araç 15 gerçek hata buldu. Örnekler: <code>fistp</code> yuvarlama kipi, <code>adc/sbb</code>, SSE'nin 128 bitin yalnızca 64'ünü işlemesi, yaklaşık 20 eksik komut. Sonuçta 13.000 rastgele vakada sıfır fark kaldı; bozuk matris sayısı 79.966'dan 0'a indi.</li>
+          <li><span class="tag t-user">Gözlem</span>"Oyunun akışı devam etmiyor, ilk sahnede kalıyor." Ölçümle doğrulandı: kilit fonksiyonları (EnterCriticalSection) hiçbir şey yapmıyordu, yükleyici, ses ve video iş parçacıkları hiç uyanmıyordu. Uyandırma sayıları 0'dan 145, 46, 34 ve 8'e çıktı.</li>
+          <li><span class="tag t-find">Bulgu</span>Oyunun ürettiği karelerin %86'sı ekrana ulaşmadan eziliyordu. Kare senkronu kurulunca oran 1:1 oldu.</li>
+        </ul>
+        <p class="why"><b>Neye göre</b>Hata sayaçları (desteklenmeyen komut, çözülemeyen çağrı, bozuk matris), iş parçacığı uyandırma sayıları ve yakalanan ekran görüntüleri.</p>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-08-26">26 Ağu</time><span>3. gün</span></div>
+      <div class="day">
+        <h3>Menü açıldı, ilk yarış oynandı</h3>
+        <ul>
+          <li>Araçlar kuruldu:
+            <ul>
+              <li>Oyunun ekranını PNG olarak kaydetmek; böylece her seferinde kullanıcıya "ne görüyorsun" diye sorma döngüsü bitti.</li>
+              <li>Oyunun perakende sürümde susturulmuş kendi hata günlüğünü geri açmak.</li>
+            </ul>
+          </li>
+          <li><span class="tag t-find">Bulgu</span>Menüdeki uzun tıkanma tek satırlık bir hataydı: x87 yığınına kopyalama (<code>fld st(0)</code>) yanlış yuvayı okuyordu. Windows'un kayan sayıyı tam sayıya çeviren rutini bu komutla başladığı için oyundaki her float → int dönüşümü bozuktu, oyunun zamanlayıcısı da donuyordu. Düzeltilince menü, animasyonlar ve girdi hep birlikte çalıştı. Kalan 722.451 bozuk matris de sıfırlandı.</li>
+          <li>İndeksli çizim yolu hiç yoktu: 1,58 milyon çağrı sessizce düşüyordu. O yol ve derinlik tamponu eklenince araba, showroom ve yarış göründü.</li>
+          <li><span class="tag t-find">Bulgu</span>Ölçüm, vertex shader'ların işlemcide yorumlanmasının sürenin yaklaşık %45'ini aldığını gösterdi. Yorumlayıcı %40 hızlandırıldı ama yetmedi.</li>
+          <li>Ses: CoreAudio çıkışı hiç yazılmamıştı, eklendi. Ardından dairesel tampon sarması ve yazma imleci hataları düzeltildi.</li>
+          <li><span class="tag t-dec">Karar</span>"Birebir görünüm" hedefi için oyunun kendi pixel shader'ları Metal Shading Language'e çevrilip GPU'da çalıştırılmaya başlandı. Genel amaçlı sabit bir shader yaklaşımı bırakıldı.</li>
+          <li><span class="tag t-user">Gözlem</span>Yansımaların grafik ayarına bağlı olduğu, ayarı yükseltince de oyunun çöktüğü fark edildi. Bu gözlem üç eksiği ortaya çıkardı: cihaz sıfırlama (<code>Reset</code>), yüzey tanımındaki alan kaymaları ve küp doku çağrıları.</li>
+        </ul>
+        <p class="why"><b>Neye göre</b>Kapsama farkı (hangi fonksiyonlar hiç çalışmıyor), çağrı sayacı profili ve Windows'taki gerçek oyunun davranışı.</p>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-08-27">27 Ağu</time><span>4. gün</span></div>
+      <div class="day">
+        <h3>Shader'lar GPU'da; Windows referansıyla karşılaştırma</h3>
+        <ul>
+          <li>Vertex shader'lar da Metal'e çevrildi. Çizim yolunun süresi 34,6 saniyeden 5,6 saniyeye indi (saniyede 2,4 milyon köşeden 92,4 milyon köşeye). Çevrilemeyen bir shader çıkarsa otomatik olarak işlemci yoluna düşüyor.</li>
+          <li><span class="tag t-find">Bulgu</span>Oyunun kayıt defteri yazımları atılıyordu. Kalıcı hale getirilince çökmeler kullanıcıyı beklemeden, pencere açmadan tekrar üretilebildi. İkili aramayla tek suçlu bulundu: araba yansıması ayarı. Küp doku metodunda her çağrıda 4 bayt yığın sızıntısı vardı; 6 yüz için bu 24 bayt kayma ve çökme demekti.</li>
+          <li><span class="tag t-user">Gözlem</span>Windows'ta alınan 400 MB'lık D3D9 çağrı izi (apitrace) sağlandı. macOS'ta hazır bir okuyucusu yoktu, kendi okuyucumuzu yazdık (38,3 milyon çağrı). İlk bulgu: çizimlerin %38'inde doku koordinatları yanlış kümeden okunuyordu.</li>
+          <li><span class="tag t-find">Bulgu</span>Karanlık ve aşırı parlak görüntünün üç kök nedeni çıktı:
+            <ul>
+              <li>Durum blokları boş nesneydi; her oturumda 1,16 milyon geri yükleme hiçbir şey yapmıyordu.</li>
+              <li>23 eski tip shader, parlaklık kaydırmaları uygulanmadığı için yarım parlaklıkta çıkıyordu.</li>
+              <li>Bir karışım kipi eşlenmemişti ve sahne kendi üstüne ekleniyordu.</li>
+            </ul>
+          </li>
+          <li>Ses: tampon boyutu yanlış alandan okunuyordu, müzik hem hızlı hem kesikti. Menü müziği yarışta durmuyordu. Gecikme 0,55 saniyeden 0,27 saniyeye indi.</li>
+          <li><span class="tag t-find">Bulgu</span>Oyunun çözünürlük tablosu 6 satır ve hepsi 4:3. 7. satırı seçmek oyunun kendi dizisini taşırıyordu.</li>
+        </ul>
+        <p class="why"><b>Neye göre</b>Windows ekran görüntüleriyle aynı sahnelerin karşılaştırılması, apitrace izi ve tek bir geçişi atlayıp ya da renge boyayıp farkı ölçmek.</p>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-08-28">28 Ağu</time><span>5. gün</span></div>
+      <div class="day">
+        <h3>Darboğaz ölçüldü, optimizasyon yönü belirlendi</h3>
+        <ul>
+          <li>Yarış öncesi ara sahne 4,6 fps'ten 30 fps'e çıktı: sanal saatin kare içi tavanı yanlıştı.</li>
+          <li><span class="tag t-find">Bulgu</span>Müzik yarışta yavaşlıyordu, çünkü oyun saati fps'e bağlıydı. Saat gerçek zamana bağlandı; oyun saatinin gerçek zamana oranı 0,885'ten 0,998'e çıktı.</li>
+          <li><span class="tag t-find">Bulgu</span>Kare bütçesi ölçüldü: GPU bütçenin yalnızca %20'sini kullanıyordu, bizim grafik katmanımız 1,8 ms'ydi, geri kalan yaklaşık %75 oyunun çevrilmiş x86 koduydu.</li>
+          <li><span class="tag t-dec">Karar</span>Optimizasyon grafik tarafında değil, çevrilmiş kodda yapılacak.</li>
+          <li><strong>Tembel bayrak hesabı:</strong> x86'nın her aritmetik komutta hesapladığı altı durum bayrağından yalnızca sonradan okunanlar hesaplanıyor. -O3 derlemeyle birlikte yarış karesi 18,7 ms'den 15,7 ms'ye indi (%19).</li>
+          <li><span class="tag t-find">Bulgu</span>capstone kütüphanesi x87 komutlarında FPU durum bitlerini aritmetik bayrak gibi bildiriyor. Bu hata ilk sürümü 12 saniyede çökertti; bulmak için bir denetim aracı (<code>flagaudit</code>) yazıldı.</li>
+          <li>Yüz eleme hiç uygulanmıyordu; araba kapısında ve bina kenarlarındaki titremenin sebebi buydu. Kalabalık figürlerinde yanlış kemik seçimine yol açan <code>expp</code> çevirisi de düzeltildi.</li>
+        </ul>
+        <p class="why"><b>Neye göre</b>macOS <code>sample</code> profili, GPU meşguliyet sayacı, 439 komut testi ve her değişiklikten sonra A/B karşılaştırması.</p>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-09-01">31 Ağu – 2 Eyl</time><span>6.–9. gün</span></div>
+      <div class="day">
+        <h3>Görsel doğruluk, 1080p ve hız</h3>
+        <ul>
+          <li><span class="tag t-find">Bulgu</span>Ekranı kesen ince çizgiler, doku koordinatının seçildiği yerden geliyordu: pixel shader'da seçim yapmak GPU'nun türev hesabını bozuyordu. Seçim vertex tarafına taşındı.</li>
+          <li><span class="tag t-find">Bulgu</span>Sis hiç uygulanmıyordu; oyun sis ayarını 5,3 milyon kez kuruyordu. Gökyüzündeki mozaik ise ekrandan örnekleme yapılmasından geliyordu (Apple GPU'nun 32 piksellik karo sınırları). Gerçek kopyaya geçildi.</li>
+          <li><strong>1080p ve geniş ekran:</strong> oran farkı Hor+ ile telafi ediliyor, görüntü gerilmiyor. Menüdeki son satır oyuna 1600x1200, kullanıcıya 1920x1080 olarak gösteriliyor; böylece oyunun tablosu taşmıyor.</li>
+          <li><span class="tag t-find">Bulgu</span>Karenin %61'i gereksiz bir 60 Hz freninde uykuda geçiyordu. Önceki "optimizasyon işe yaramadı" sonuçlarının gerçek sebebi buydu. Fren kaldırıldı ve D3D çağrı dağıtımı (yarışta 377 milyon çağrı) isim karşılaştırmasından sayısal kimliğe geçirildi. Sonuç: <strong>60,3 → 98,8 fps</strong>.</li>
+          <li><span class="tag t-dec">Karar</span>Ölçüm yöntemi değiştirildi. Tek koşu karşılaştırması ±%7 gürültülüydü; kareleri gerçek zaman dilimlerine göre eşleştirince gürültü %0,1'e indi.</li>
+          <li><span class="tag t-neg">Olumsuz</span>Ölçülüp elenenler: profil güdümlü derleme (PGO, %0,9), bayrak analizini daha ileri götürmek (clang zaten yapıyordu) ve bir çökme sanılan durum (oyun hatası değil, kapanış sırasındaki bir yarış).</li>
+          <li>Araba yansımaları: gerçek küp dokular eklendi. Eski shader'lar doku tipini bildirmediği için her shader'ın iki sürümü üretilip çizim anında seçiliyor. Maliyeti ölçülemeyecek kadar küçük.</li>
+        </ul>
+        <p class="why"><b>Neye göre</b>Hough dönüşümüyle çizgi açısının ölçülmesi (37°, tam ekran köşegeni), mip kapatma deneyleri, eşleştirilmiş performans ölçümü.</p>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-09-02">2 Eyl</time><span>paketleme</span></div>
+      <div class="day">
+        <h3>Çift tıklanan bir macOS uygulaması</h3>
+        <ul>
+          <li><code>./pack.sh</code> → <code>NFSU2.app</code>. Başka makinede oyunu hiç açmayacak iki sessiz engel bulundu:
+            <ul>
+              <li>İkili, derleyen makinenin macOS sürümüyle damgalanıyordu.</li>
+              <li><code>-mcpu=native</code> ayarı yeni bir Mac'te derlenen ikiliyi M1'de çökertebilirdi.</li>
+            </ul>
+          </li>
+          <li>Oyun verisi paketin içine değil yanına konuyor: imzalı pakete yazılamıyor ve yazmak imzayı bozuyor. Gatekeeper için ad-hoc imza kullanıldı ve ölçüldü; notarizasyon olmadan geçmiyor.</li>
+        </ul>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-09-12">12 Eyl</time><span>değerlendirme</span></div>
+      <div class="day">
+        <h3>Hukuki çerçeve ve proje değerlendirmesi</h3>
+        <ul>
+          <li><span class="tag t-dec">Karar</span>Yalnızca dönüştürücü (çevirici ve çalışma zamanı) paylaşılacak. Oyun verisi ve EXE dağıtılmayacak; kullanıcı kendi kopyasını getirecek. Dayanak: birlikte çalışabilirlik amaçlı tersine mühendislik kararları (Sega v. Accolade 1992, Sony v. Connectix 2000). Bilinen riskler: kopya koruması atlatma (DMCA §1201), marka kullanımı, ekran görüntüleri.</li>
+          <li>Benzer çalışmalar incelendi: N64Recomp (Zelda, Mario Kart 64…) ve XenonRecomp (Sonic Unleashed…). Hepsi konsoldan (MIPS, PowerPC) PC'ye çeviriyor. Bu projenin farkı: x86 PC'den ARM64'e ve Direct3D 9'dan Metal'e.</li>
+          <li>Proje 12 ölçütle değerlendirildi. Özgünlük, zorluk ve ölçülebilirlik güçlü çıktı. Genellenebilirlik, literatür ve tekrarlanabilirlik zayıf çıktı (ayrıntı aşağıda).</li>
+        </ul>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-09-13">13 Eyl</time><span>netlik</span></div>
+      <div class="day">
+        <h3>Retina ekranda bulanıklık</h3>
+        <ul>
+          <li><span class="tag t-user">Gözlem</span>Aynı sahnenin Windows ve macOS görüntüleri karşılaştırıldı; macOS görüntüsü bulanıktı.</li>
+          <li><span class="tag t-find">Bulgu</span>1280x960'lık görüntü ekranda yaklaşık 1,91 kat büyütülüyordu. Oyun artık ekranın gerçek piksel sayısında (2448x1836) çiziyor. Kare süresi değişmedi (10,6 ms); GPU süresi 2,0 ms'den 4,9 ms'ye çıktı.</li>
+        </ul>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-09-23">23–24 Eyl</time><span>HLE</span></div>
+      <div class="day">
+        <h3>D3DX efekt kütüphanesini yüksek düzeyde ele almak (HLE)</h3>
+        <ul>
+          <li><span class="tag t-find">Bulgu</span>Oyun süresinin %47'si, oyuna gömülü Microsoft D3DX9 efekt kütüphanesinde geçiyordu. Kare başına 1.398 kez aynı durum yeniden hesaplanıyordu ve girdilerin %95,8'i değişmemişti.</li>
+          <li><span class="tag t-dec">Karar</span>Kütüphanenin davranışını üst düzeyde taklit etme işine başlandı (HLE). Her "bu adım atlanabilir" kararı, orijinali yeniden çalıştırıp bellek ve cihaz durumunu karşılaştıran bir doğrulama kipiyle kanıtlanıyor.</li>
+          <li><strong>Aşama 1</strong>, durum değerlerini hatırlama: oyun kodunun kare başına işlemci süresi 10,9–12,3 ms'den 8,1 ms'ye indi (%29); yarış 90 fps'ten 119 fps'e çıktı. 2,4 milyonu aşkın kontrolde 0 fark. <strong>Aşama 2</strong>, cihaz çağrılarını kaydetme: %5 daha kazanç; 3,5 milyon kontrolde 0 fark.</li>
+          <li><span class="tag t-neg">Olumsuz</span><strong>Aşama 3</strong>, bir geçişin tamamını atlama: doğrulama, isabetlerin %78'inin yanlış olduğunu gösterdi. Oyun dokuları her çizimde değiştiriyor ve bunlar parametre verisinden değil ayrı bir tablodan geliyor. Kod duruyor ama kapalı; olumsuz sonuç belgelendi.</li>
+        </ul>
+        <p class="why"><b>Neye göre</b>Her aşamanın doğrulama kipi ve 60 Hz'e sabitlenmiş ölçüm. 120 Hz ekran sınırında kare süresi, işlemci kazancını gizliyordu.</p>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-09-24">24 Eyl</time><span>görsel</span></div>
+      <div class="day">
+        <h3>Duvar arkasından görünen ışıklar ve tam ekran</h3>
+        <ul>
+          <li><span class="tag t-user">Gözlem</span>Başından beri şehir ışıkları ve bazı arabalar duvarın arkasından görünüyordu.</li>
+          <li><span class="tag t-find">Bulgu</span>Oyun görünürlük sorgusu hiç kullanmıyor; gizleme sıradan derinlik testiyle yapılıyor. Metal katmanında ise tek bir derinlik tamponu vardı ve hedef boyutu her değiştiğinde yeniden yaratılıyordu. Bir karede 320x240, 128x128 ve 640x480 hedefler arasında gidip gelindiği için ekrana her dönüşte derinlik bilgisi kayboluyordu. Çözüm D3D9'daki gibi: her derinlik yüzeyinin kendi dokusu var.</li>
+          <li><strong>Tam ekran:</strong> oyun ekranın gerçek pikselinde (3024x1898) ve geniş ekran olarak çiziliyor. Oyun sırasında geçiş, Windows'taki alt-tab yolunu taklit ediyor: cihaz "kayıp" bildiriliyor, oyun kendi grafiklerini yeni boyuta göre baştan kuruyor.</li>
+          <li>Geliştirme sırasında alınan 192 ekran görüntüsü sohbet kayıtlarından kurtarıldı.</li>
+        </ul>
+      </div>
+    </li>
+
+    <li>
+      <div class="when"><time datetime="2026-09-27">27 Eyl</time><span>son durum</span></div>
+      <div class="day">
+        <h3>İmleç hizası ve 4K</h3>
+        <ul>
+          <li><span class="tag t-user">Gözlem</span>Ekranda iki imleç vardı ve konumları farklıydı.</li>
+          <li><span class="tag t-find">Bulgu</span>Oyun imleç konumunu, katmanın bildirdiği sabit 1280x720 pencere boyutuna göre ölçekliyordu; 1280x960'ta dikeyde 1,33 kat kayma oluşuyordu. İmleç iki bilinen konuma zorlanarak ölçüldü ve düzeltildi. macOS imleci artık oyun alanında gizleniyor.</li>
+          <li>4K ölçüldü: 3840x2160'ta yarış 8,36 ms'den 8,82 ms'ye çıkıyor (yaklaşık 113 fps). Görüntü temiz.</li>
+        </ul>
+      </div>
+    </li>
+  </ol>
+</section>
+
+<section id="kararlar">
+  <h2>Kararlar ve gerekçeleri</h2>
+  <p class="sub">Projenin yönünü belirleyen seçimler, dayandıkları kanıt ve elenen seçenek.</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Karar</th><th>Gerekçe</th><th>Elenen</th></tr></thead>
+      <tbody>
+        <tr><td>Statik rekompilasyon<span class="d">24 Ağu</span></td><td>"Arada katman olmasın" şartı. Relocation tablosunun bulunması yöntemi uygulanabilir kıldı.</td><td class="alt">Wine, sanal makine</td></tr>
+        <tr><td>Otomatik çeviri, davranışı koruyarak<span class="d">24 Ağu</span></td><td>23 bin fonksiyonu elle yeniden yazmak yıllar alır; amaç kaynak kodu geri kazanmak değil, oyunun aynı davranmasını sağlamak.</td><td class="alt">Elle decompilation</td></tr>
+        <tr><td>Belirti yerine sistematik doğrulama<span class="d">25 Ağu</span></td><td>Bir belirti saatlerce kovalanmıştı. Gerçek işlemciye karşı test aracı tek günde 15 hata buldu.</td><td class="alt">Tahmin ve deneme</td></tr>
+        <tr><td>Shader'ları çevirip GPU'da çalıştırmak<span class="d">26–27 Ağu</span></td><td>İşlemcide yorumlama sürenin %45'iydi ve birebir görünüm hedefleniyordu.</td><td class="alt">Sabit shader, işlemci yorumlayıcısı</td></tr>
+        <tr><td>Windows'u referans almak<span class="d">27 Ağu</span></td><td>"Birebir" iddiasını ölçülebilir kılmak için aynı sahnelerin ekran görüntüleri ve API çağrı izi kullanıldı.</td><td class="alt">Göz kararı</td></tr>
+        <tr><td>Hızı çevrilmiş kodda aramak<span class="d">28 Ağu</span></td><td>Kare bütçesi: GPU %20, grafik katmanı 1,8 ms, kalanı x86 kodu.</td><td class="alt">Grafik optimizasyonu</td></tr>
+        <tr><td>60 Hz frenini kaldırmak<span class="d">2 Eyl</span></td><td>Saat gerçek zamana bağlanınca gerekçesi kalmamıştı; karenin %61'i uykuydu. Oyun hızı değişmiyor (oran 0,999).</td><td class="alt">—</td></tr>
+        <tr><td>Geniş ekranı menü satırıyla vermek<span class="d">2 Eyl</span></td><td>Oyunun tablosu bellekte bulunamadı; 7. satır taşma yapıyor.</td><td class="alt">Tabloyu yamamak</td></tr>
+        <tr><td>Yalnızca dönüştürücüyü paylaşmak<span class="d">12 Eyl</span></td><td>Emsal mahkeme kararları var; hiçbir EA varlığı dağıtılmıyor.</td><td class="alt">Hazır .app dağıtmak</td></tr>
+        <tr><td>Doğrulamalı HLE; Aşama 3'ü bırakmak<span class="d">23–24 Eyl</span></td><td>Kütüphane sürenin %47'siydi. Aşama 3, doğrulamada %78 yanlış isabet verdi.</td><td class="alt">Doğrulamasız önbellek</td></tr>
+        <tr><td>Tam ekranı oyunun kendi sıfırlama yoluyla yapmak<span class="d">24 Eyl</span></td><td>Render hedefleri cihaz boyutuna bağlı; oyunun kendi <code>Reset</code>'i hepsini doğru kuruyor.</td><td class="alt">Dışarıdan yeniden boyutlamak</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="dogrulama">
+  <h2>Neye göre: doğrulama yöntemleri</h2>
+  <p class="sub">Bir değişiklik ancak ölçüldükten sonra kabul edildi. Kullanılan araçlar:</p>
+  <div class="tools">
+    <div class="tool"><div class="q">tools/isatest.py · 439 doğrulama</div><h4>Komut testleri</h4><p>Elle kodlanmış x86 makine kodu ve Intel belgesinden türetilen beklenen sonuçlar. Her derlemede otomatik çalışıyor.</p></div>
+    <div class="tool"><div class="q">tools/fuzzisa.py · 13.000+ vaka</div><h4>Gerçek işlemciye karşı test</h4><p>Aynı komut baytları Rosetta üzerinde gerçek x86 olarak ve bizim çevirimizle çalıştırılıyor, sonuçlar karşılaştırılıyor.</p></div>
+    <div class="tool"><div class="q">apitrace okuyucusu</div><h4>Windows referans izi</h4><p>Gerçek oyunun Windows'taki 38 milyon D3D9 çağrısı; "orada hangi durumla çiziliyor?" sorusunu tahmin etmeden cevaplıyor.</p></div>
+    <div class="tool"><div class="q">DUMPFRAME · DRAWSUM · SKIPPS · PSISO</div><h4>Kare ve geçiş yalıtımı</h4><p>Kareyi PNG olarak kaydetme, çizimleri gruplayarak özetleme, tek bir shader geçişini atlama ya da renge boyama.</p></div>
+    <div class="tool"><div class="q">kapsama · sample · sayaçlar</div><h4>Profil ve çalışma raporu</h4><p>Hiç çalışmayan fonksiyonlar, en çok süre alan kod ve "desteklenmeyen komut: 0, çözülemeyen çağrı: 0" gibi sayaçlar.</p></div>
+    <div class="tool"><div class="q">AUTOSEQ · kayıt defteri</div><h4>Kullanıcısız tekrar üretim</h4><p>Menülerden yarışa aynı şekilde giren tuş dizisi ve kalıcı ayarlar. Hatalar pencere açmadan tekrar üretilebiliyor.</p></div>
+    <div class="tool"><div class="q">gerçek zaman kovaları · A/B/A/B</div><h4>Eşleştirilmiş performans ölçümü</h4><p>Tek koşu ±%7 gürültülüydü. Kareleri aynı oyun anına eşleştirince tekrar farkı %0,1'e indi.</p></div>
+    <div class="tool"><div class="q">D3DXVERIFY</div><h4>HLE doğrulama kipi</h4><p>Atlanan her adım için orijinal yeniden çalıştırılıp bellek ve cihaz durumu karşılaştırılıyor; milyonlarca kontrolde sıfır fark.</p></div>
+  </div>
+</section>
+
+<section id="performans">
+  <h2>Performans</h2>
+  <p class="sub">Yarışta kare hızı, dönüm noktaları. Değerler farklı günlerde ölçüldü; eğilimi gösteriyor, birebir karşılaştırma değil.</p>
+  <div class="chart">
+    <svg viewBox="0 0 660 300" role="img" aria-label="Yarışta kare hızı: 26 Ağustos 43, 28 Ağustos 53,5, 28 Ağustos 63,9, 2 Eylül 98,8, 23 Eylül 119 fps">
+      <line class="ax" x1="50" y1="230" x2="640" y2="230"/>
+      <line class="ax" x1="50" y1="30" x2="50" y2="230"/>
+      <text x="42" y="234" text-anchor="end" class="lab">0</text>
+      <text x="42" y="157" text-anchor="end" class="lab">50</text>
+      <line class="ax" x1="46" y1="153" x2="50" y2="153"/>
+      <text x="42" y="80" text-anchor="end" class="lab">100</text>
+      <line class="ax" x1="46" y1="76" x2="50" y2="76"/>
+      <line class="cap" x1="50" y1="45.4" x2="640" y2="45.4"/>
+      <text x="636" y="39" text-anchor="end" class="capt">120 Hz ekran sınırı</text>
+      <rect class="bar" x="75"  y="163.8" width="78" height="66.2" rx="3"/>
+      <rect class="bar" x="190" y="147.7" width="78" height="82.3" rx="3"/>
+      <rect class="bar" x="305" y="131.7" width="78" height="98.3" rx="3"/>
+      <rect class="bar" x="420" y="78"    width="78" height="152"  rx="3"/>
+      <rect class="bar last" x="535" y="46.9" width="78" height="183.1" rx="3"/>
+      <text x="114" y="156" text-anchor="middle" class="val">43</text>
+      <text x="229" y="140" text-anchor="middle" class="val">53,5</text>
+      <text x="344" y="124" text-anchor="middle" class="val">63,9</text>
+      <text x="459" y="70"  text-anchor="middle" class="val">98,8</text>
+      <text x="574" y="64"  text-anchor="middle" class="val" style="fill:var(--ink)">119</text>
+      <text x="114" y="250" text-anchor="middle">26 Ağu</text><text x="114" y="266" text-anchor="middle" class="lab">yorumlayıcı</text>
+      <text x="229" y="250" text-anchor="middle">28 Ağu</text><text x="229" y="266" text-anchor="middle" class="lab">GPU shader, saat</text>
+      <text x="344" y="250" text-anchor="middle">28 Ağu</text><text x="344" y="266" text-anchor="middle" class="lab">-O3, tembel bayrak</text>
+      <text x="459" y="250" text-anchor="middle">2 Eyl</text><text x="459" y="266" text-anchor="middle" class="lab">fren, çağrı dağıtımı</text>
+      <text x="574" y="250" text-anchor="middle">23 Eyl</text><text x="574" y="266" text-anchor="middle" class="lab">D3DX HLE</text>
+    </svg>
+  </div>
+  <div class="prose" style="margin-top:22px">
+    <p><strong>Kare süresi nereye gidiyor (28 Ağustos ölçümü):</strong></p>
+    <div class="budget" role="img" aria-label="Kare bütçesi: yüzde 75 çevrilmiş x86 kodu, yüzde 20 GPU, yüzde 7 grafik katmanı">
+      <div class="b-x86">çevrilmiş x86 kodu ~%75</div><div class="b-gpu">GPU %20</div><div class="b-rt">katman</div>
+    </div>
+    <p>Bu ölçüm, optimizasyonun grafik tarafında değil çevrilmiş kodda yapılması gerektiğini gösterdi. Sonraki kazançların hepsi oradan geldi: tembel bayrak hesabı, sayısal çağrı dağıtımı ve D3DX HLE. Bugün yarış, M1 Pro'da ekranın 120 Hz sınırına dayanıyor. 60 Hz'e sabitlenmiş ölçümde oyun kodu kare başına 7,5 ms işlemci harcıyor; D3DX çalışmasından önce bu değer 10,9–12,3 ms'ydi. Çözünürlük hızı pek etkilemiyor: 1280x960 ile 2448x1836 aynı hızda, 4K'da kare süresi %5 artıyor.</p>
+  </div>
+</section>
+
+<section id="gorseller">
+  <h2>Görseller</h2>
+  <p class="sub">Geliştirme sırasında alınan karelerden seçmeler. 192 görüntünün tamamı proje klasöründe <code>sunum_ss/</code> altında.</p>
+  <div class="gal">
+    <figure><img src="img/05-ters-acilis.jpg" alt="Baş aşağı çizilmiş açılış ekranı ve kırmızı EVENT HANDLER yazısı" loading="lazy"><figcaption><b>25 Ağu</b>Açılış ekranı baş aşağı. Kırmızı yazı, oyunun gerçek donanımda görünmeyen tanı katmanıydı.</figcaption></figure>
+    <figure><img src="img/06-magenta.jpg" alt="Tamamen macenta renkli ekran" loading="lazy"><figcaption><b>26 Ağu</b>Test amaçlı macenta temizleme rengi: çizilmeyen her şey görünür hale geliyor.</figcaption></figure>
+    <figure><img src="img/08-ilk-yaris.jpg" alt="Need for Speed Underground 2 başlık ekranı" loading="lazy"><figcaption><b>26 Ağu</b>x87 hatası düzeltilince başlık ekranı ve menü akışı çalıştı.</figcaption></figure>
+    <figure><img src="img/13-mozaik.jpg" alt="Yarış ekranında kareler halinde bozulmuş görüntü" loading="lazy"><figcaption><b>27 Ağu</b>Mozaik: yeniden kullanılan çizim kayıtlarında eski alanlar sızıyordu.</figcaption></figure>
+    <figure><img src="img/14-beyaz-gok.jpg" alt="Gökyüzü tamamen beyaz yarış ekranı" loading="lazy"><figcaption><b>27 Ağu</b>Aşırı parlaklık: eşlenmemiş karışım kipi yüzünden sahne kendine ekleniyordu.</figcaption></figure>
+    <figure><img src="img/17-gecis-boyama.jpg" alt="Her shader geçişinin farklı düz renge boyandığı yarış sahnesi" loading="lazy"><figcaption><b>28 Ağu</b>Tanı aracı: her shader kendi rengine boyanınca hangi geçişin hatalı olduğu görünüyor.</figcaption></figure>
+    <figure><img src="img/20-araba-yakin.jpg" alt="Mavi Peugeot'nun arkadan yakın plan görüntüsü" loading="lazy"><figcaption><b>28 Ağu</b>Oyunun kendi shader'ları GPU'da: boya, farlar ve plaka.</figcaption></figure>
+    <figure><img src="img/26-duvar-arkasi.jpg" alt="Sarı Ford Focus ile otoyol, solda duvar üstünde ışık parlamaları" loading="lazy"><figcaption><b>24 Eyl</b>Kullanıcının ekran görüntüsü: soldaki duvarın üstünde, arkadaki lambaların parlamaları.</figcaption></figure>
+    <figure><img src="img/27-guncel-yaris.jpg" alt="Mavi Peugeot ile gece yarışı başlangıcı, HUD ve şehir" loading="lazy"><figcaption><b>24 Eyl</b>Güncel yarış karesi (2448x1836).</figcaption></figure>
+    <figure class="half"><img src="img/isik-once-sonra.jpg" alt="Üstte sütun üzerinde ışık parlamaları, altta aynı sahnede parlamalar yok" loading="lazy" style="aspect-ratio:auto;object-fit:contain"><figcaption><b>24 Eyl · önce / sonra</b>Üstte eski katman: parlamalar beton sütunun önünde. Altta derinlik yüzeyleri düzeltildikten sonra; açıktaki sokak lambaları duruyor.</figcaption></figure>
+    <figure class="wide"><img src="img/tam-ekran.jpg" alt="Tam ekran geniş açılı yarış karesi, 62 MPH" loading="lazy"><figcaption><b>24 Eyl · tam ekran</b>3024x1898 piksel, geniş ekran. Görüş açısı yanlara genişliyor, göstergeler ortadaki 4:3 alanda kalıyor.</figcaption></figure>
+  </div>
+</section>
+
+<section id="acik">
+  <h2>Açık konular ve sınırlamalar</h2>
+  <p class="sub">Bilinen eksikler. Bunları saklamak yerine belgelemek tercih edildi.</p>
+  <div class="cols">
+    <div class="list">
+      <h3>Oyun içinde</h3>
+      <ul>
+        <li>Giriş videoları (VP6 formatı) atlanıyor; kod çözücü yok. Not: arşivdeki Windows kopyasında da ilk videolar oynamıyor.</li>
+        <li>Referans olmadan karar verilemeyen dört görsel madde var: HUD satır dikişleri, kalabalık figürleri, TRAX ekranındaki hayalet dikdörtgen ve ışık çizgisi kaplamaları. Bunlar için nesnel bir ölçüm yok; aynı sahnenin Windows görüntüsü gerekiyor.</li>
+        <li>Ses gecikmesi yaklaşık 0,27 saniye. Bunun 0,26 saniyesi oyunun kendi tampon davranışından geliyor, Windows'ta da aynı.</li>
+      </ul>
+    </div>
+    <div class="list">
+      <h3>Proje olarak</h3>
+      <ul>
+        <li>Yalnızca tek bir oyunda (tek bir EXE sürümü) doğrulandı; genellenebilirlik henüz gösterilmedi.</li>
+        <li>Proje klasörü bir git deposu değil. Geçmiş, <code>PROJECT.md</code> (1.309 satır), <code>D3DX_HLE.md</code> ve 44 not dosyasında tutuldu.</li>
+        <li>Yalnızca M1 Pro ve macOS 26'da ölçüldü. Uygulama macOS 11 tabanıyla derlendi ama eski sistemde denenmedi. Notarizasyon olmadığı için Gatekeeper uyarısı veriyor.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="tez">
+  <h2>Tez için sonraki adımlar</h2>
+  <p class="sub">12 Eylül'deki değerlendirmeden çıkan öneriler. Önümüzdeki dönemde ek özellik, hata düzeltme ve yazım için plan.</p>
+  <div class="cols">
+    <div class="list">
+      <h3>Araştırma tarafı</h3>
+      <ul>
+        <li><strong>Katkıyı netleştirmek:</strong> "Statik rekompilasyon ve shader çevirisiyle x86 masaüstü oyunu ARM64'te yerel hıza yakın çalıştırılabilir" iddiasının ampirik kanıtı; x86 ve D3D9'un hangi davranışlarının statik çeviriye en çok direndiğinin sınıflandırılması.</li>
+        <li><strong>Literatür:</strong> ikili çeviri (static/dynamic binary translation), API çevirisi (DXVK benzeri) ve Rosetta 2 ile karşılaştırma.</li>
+        <li><strong>Genellenebilirlik:</strong> ikinci, farklı bir Direct3D 9 oyununda kısmi doğrulama. "Tek oyuna özel" eleştirisine en güçlü cevap bu.</li>
+      </ul>
+    </div>
+    <div class="list">
+      <h3>Süreç tarafı</h3>
+      <ul>
+        <li>Git ile sürüm geçmişi tutmaya başlamak (tekrarlanabilirlik).</li>
+        <li>Hukuki ve etik bölüm: yalnızca dönüştürücüyü paylaşma, emsal kararlar, marka ve DRM notları.</li>
+        <li><strong>Çalışma biçimi beyanı:</strong> geliştirme, proje sahibinin yönlendirmesiyle bir yapay zekâ kodlama asistanı (Claude Code) kullanılarak yürütüldü. Hedef ve kısıtlar, öncelikler, oyunu oynayarak yapılan gözlemler, Windows referansları (ekran görüntüleri, apitrace izi) ve D3DX HLE gibi yön kararları proje sahibinden geldi; uygulama, ölçüm ve hata ayıklama asistanla birlikte yapıldı. Bölümün yapay zekâ kullanım politikası danışmanla netleştirilmeli.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<p class="foot">Kaynaklar: altı geliştirme oturumunun kayıtları (24 Ağustos – 27 Eylül 2026), <code>PROJECT.md</code>, <code>D3DX_HLE.md</code>, proje not dosyaları ve 192 ekran görüntüsü. Tüm sayılar o oturumlarda yapılan ölçümlerden alındı.</p>
+</main>
+</div>
+</div>

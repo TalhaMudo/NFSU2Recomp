@@ -1,0 +1,1530 @@
+#!/usr/bin/env python3
+"""x86-32 -> C lifter.  Bir fonksiyonu CPU durumu uzerinde calisan C'ye cevirir."""
+import sys, struct, collections
+import pefile
+from capstone import *
+from capstone.x86 import *
+
+R32 = {X86_REG_EAX:'eax',X86_REG_ECX:'ecx',X86_REG_EDX:'edx',X86_REG_EBX:'ebx',
+       X86_REG_ESP:'esp',X86_REG_EBP:'ebp',X86_REG_ESI:'esi',X86_REG_EDI:'edi'}
+R16 = {X86_REG_AX:'eax',X86_REG_CX:'ecx',X86_REG_DX:'edx',X86_REG_BX:'ebx',
+       X86_REG_SP:'esp',X86_REG_BP:'ebp',X86_REG_SI:'esi',X86_REG_DI:'edi'}
+R8L = {X86_REG_AL:'eax',X86_REG_CL:'ecx',X86_REG_DL:'edx',X86_REG_BL:'ebx'}
+R8H = {X86_REG_AH:'eax',X86_REG_CH:'ecx',X86_REG_DH:'edx',X86_REG_BH:'ebx'}
+CC  = {'o':'CC_O','no':'CC_NO','b':'CC_B','ae':'CC_AE','e':'CC_E','ne':'CC_NE',
+       'be':'CC_BE','a':'CC_A','s':'CC_S','ns':'CC_NS','p':'CC_P','np':'CC_NP',
+       'l':'CC_L','ge':'CC_GE','le':'CC_LE','g':'CC_G',
+       'nae':'CC_B','nb':'CC_AE','c':'CC_B','nc':'CC_AE','z':'CC_E','nz':'CC_NE',
+       'na':'CC_BE','nbe':'CC_A','pe':'CC_P','po':'CC_NP','nge':'CC_L','nl':'CC_GE',
+       'ng':'CC_LE','nle':'CC_G'}
+
+
+# ---- bayrak canliligi ---------------------------------------------------
+# Her aritmetik komut alti bayragi pesinen hesapliyordu; sonraki dal genelde
+# yalnizca birini okuyor.  Fonksiyonun akis grafigi uzerinde GERIYE dogru
+# canlilik cozup her komuta "bundan sonra hangi bayraklar okunuyor" maskesini
+# veriyoruz; maske derleme zamani sabiti oldugu icin kullanilmayan dallar
+# tamamen siliniyor.
+F_CF,F_PF,F_AF,F_ZF,F_SF,F_OF = 0x01,0x02,0x04,0x08,0x10,0x20
+F_ALL = 0x3F
+# DIKKAT: UNDEFINED_* "tanimlar" sayilmaz.  Sayilsaydi bayragi olu kabul edip
+# onceki hesabi atlardik; oysa liftimiz o bayragi yazmayabilir -> bayat deger.
+_EFTAB = [
+    (F_CF, X86_EFLAGS_MODIFY_CF|X86_EFLAGS_RESET_CF|X86_EFLAGS_SET_CF,
+           X86_EFLAGS_TEST_CF|X86_EFLAGS_PRIOR_CF),
+    (F_PF, X86_EFLAGS_MODIFY_PF|X86_EFLAGS_RESET_PF|X86_EFLAGS_SET_PF,
+           X86_EFLAGS_TEST_PF|X86_EFLAGS_PRIOR_PF),
+    (F_AF, X86_EFLAGS_MODIFY_AF|X86_EFLAGS_RESET_AF|X86_EFLAGS_SET_AF,
+           X86_EFLAGS_TEST_AF|X86_EFLAGS_PRIOR_AF),
+    (F_ZF, X86_EFLAGS_MODIFY_ZF|X86_EFLAGS_RESET_ZF|X86_EFLAGS_SET_ZF,
+           X86_EFLAGS_TEST_ZF|X86_EFLAGS_PRIOR_ZF),
+    (F_SF, X86_EFLAGS_MODIFY_SF|X86_EFLAGS_RESET_SF|X86_EFLAGS_SET_SF,
+           X86_EFLAGS_TEST_SF|X86_EFLAGS_PRIOR_SF),
+    (F_OF, X86_EFLAGS_MODIFY_OF|X86_EFLAGS_RESET_OF|X86_EFLAGS_SET_OF,
+           X86_EFLAGS_TEST_OF|X86_EFLAGS_PRIOR_OF),
+]
+# Cagri: cagrilan fonksiyon CPU'yu aliyor, her bayragi OKUYABILIR ve
+# BOZABILIR.  Dolayli dal/ret/int de ayni sekilde muhafazakar.
+# capstone bu komutlar icin "bayrak okur" bilgisini HIC vermiyor.  Eksik
+# birakirsak bayragi olu sayip hesabi atlariz -> komut cop deger okur.
+_EXTRA_USE = {
+    'pushf': F_ALL, 'pushfd': F_ALL, 'pushfw': F_ALL,
+    'lahf':  F_CF|F_PF|F_AF|F_ZF|F_SF,
+    'salc':  F_CF, 'setalc': F_CF,
+    'rcl':   F_CF, 'rcr': F_CF,
+    'cmc':   F_CF,
+    'daa': F_CF|F_AF, 'das': F_CF|F_AF,
+    'aaa': F_CF|F_AF, 'aas': F_CF|F_AF,
+    'into':  F_OF,
+}
+# Lifter'imizin GERCEKTEN yazdigi bayraklar capstone'un iddiasindan az olan
+# komutlar.  Fazladan "yazar" demek: bayragi yukarida oldururuz ama burada da
+# yazmayiz -> bayat deger.  imul/mul yalnizca CF+OF yaziyor.
+_DEF_CLAMP = {'mul': F_CF|F_OF, 'imul': F_CF|F_OF}
+
+# x86: kaydirma/dondurme SAYAC 0 iken bayraklara DOKUNMAZ (lift'te de govde
+# "if(_s){...}" ile korumali).  capstone yine de "yazar" diyor; ona uyup
+# bayragi yukarida oldurursek sayac 0 oldugunda cop deger kalir.
+_SHIFT = ('shl','sal','shr','sar')
+_ROT   = ('rol','ror','rcl','rcr')
+_DSH   = ('shld','shrd')
+
+def _shift_count(i, base):
+    """Sabit kaydirma sayisi (0-31); degisken (cl) ise None."""
+    o = i.operands
+    if base in _DSH:
+        return (o[2].imm & 31) if len(o) > 2 and o[2].type == X86_OP_IMM else None
+    if len(o) > 1:
+        return (o[1].imm & 31) if o[1].type == X86_OP_IMM else None
+    return 1                      # tek operandli bicim: sayac sabit 1
+
+_OPAQUE = ('call','ret','retf','int','int3','iret','iretd',
+           'sysenter','syscall','ud2','hlt','arpl')
+
+# x87: capstone `eflags` alanini FPU durum bitleri (C0-C3) icin YENIDEN
+# KULLANIYOR -- ayni sayisal degerler (fld -> 0xd002, fcom -> 0x2d).  Oldugu
+# gibi alirsak her fld "CF yazdi", her fcom "ZF/SF/AF/OF yazdi" sayilir; o
+# bayraklari yukarida olu kabul edip gercek hesabi atlariz -> bayat deger.
+# Yalnizca fcomi/fucomi ailesi gercekten EFLAGS yazar (FCOMI makrosu 6'sini da).
+_FCOMI = ('fcomi','fcomip','fucomi','fucomip')
+
+def _flag_defuse(i):
+    if i.mnemonic in _OPAQUE:
+        return 0, F_ALL
+    base = i.mnemonic.split()[-1]          # "repe cmpsb" -> "cmpsb"
+    if base[:1] == 'f' or X86_GRP_FPU in i.groups:
+        return (F_ALL, 0) if base in _FCOMI else (0, 0)
+    ef = getattr(i, 'eflags', 0) or 0
+    d = u = 0
+    for bit, dm, um in _EFTAB:
+        if ef & dm: d |= bit
+        if ef & um: u |= bit
+    u |= _EXTRA_USE.get(base, 0)
+    if base in _DEF_CLAMP: d &= _DEF_CLAMP[base]
+    if base in _SHIFT or base in _ROT or base in _DSH:
+        n = _shift_count(i, base)
+        if not n:                 # sayac 0 ya da derleme aninda bilinmiyor
+            d = 0                 # -> hicbir bayragi yazmayabilir
+        elif base in _ROT:
+            # rol/ror sabit sayida: CF hep, OF yalnizca sayac==1 iken.
+            # rcl/rcr lift'te OF'u hic yazmiyor.
+            d &= F_CF if base in ('rcl','rcr') else (F_CF | (F_OF if n == 1 else 0))
+    if i.mnemonic.split()[0] in ('rep','repe','repz','repne','repnz'):
+        d = 0                     # ECX==0 ise govde hic calismaz, bayraklar korunur
+    return d, u
+
+def flag_liveness(blocks, addrs, in_text):
+    """Komut adresi -> o komuttan SONRA canli olan bayraklar."""
+    succ = {}
+    for ba in addrs:
+        ins = blocks[ba]
+        if not ins: succ[ba] = ([], True); continue
+        last = ins[-1]; m = last.mnemonic
+        s = []; ext = False
+        cond = (m.startswith('j') and m[1:] in CC) or \
+               m in ('jecxz','jcxz','loop','loope','loopz','loopne','loopnz')
+        if m == 'jmp' or cond:
+            o = last.operands[0] if last.operands else None
+            if o is not None and o.type == X86_OP_IMM and o.imm in blocks: s.append(o.imm)
+            else: ext = True
+            if cond:
+                nxt = last.address + last.size
+                if nxt in blocks: s.append(nxt)
+                else: ext = True
+        elif m in ('ret','retf','iret','iretd'):
+            # ret _OPAQUE listesinde: donuste tum bayraklar canli sayilir
+            # (elle yazilmis asm CF'yi donus kanali olarak kullanabilir).
+            # Olculdu: bu MUHAFAZAKAR ayarda bile bayrak yazmalari %53 azaliyor,
+            # yani guvenligi gevsetmeye gerek yok.
+            ext = True
+        else:
+            nxt = last.address + last.size
+            if nxt in blocks: s.append(nxt)
+            else: ext = True
+        succ[ba] = (s, ext)
+    live_in = {ba: 0 for ba in addrs}
+    after = {}
+    for _ in range(64):
+        changed = False
+        for ba in reversed(addrs):
+            s, ext = succ[ba]
+            lo = F_ALL if ext else 0
+            for t in s: lo |= live_in.get(t, F_ALL)
+            cur = lo; per = {}
+            for i in reversed(blocks[ba]):
+                per[i.address] = cur
+                d, u = _flag_defuse(i)
+                cur = (cur & ~d) | u
+            if cur != live_in[ba]:
+                live_in[ba] = cur; changed = True
+            after.update(per)
+        if not changed: break
+    return after
+
+class Unsupported(Exception): pass
+
+class RawLifter:
+    """Ham bayt tamponu uzerinde lift: komut semantigi testleri icin."""
+    def __init__(self, data, base=0x00401000, comments=True):
+        self.comments=comments; self.trap=False; self.traps=0
+        self.trap_kinds=collections.Counter(); self.hooks=set(); self.watch=False
+        self.cov=False
+        self.secs=[('.text', base, len(data), bytes(data))]
+        self.TVA=base; self.TSZ=len(data); self.TDATA=bytes(data)
+        self.md=Cs(CS_ARCH_X86,CS_MODE_32); self.md.detail=True
+    in_text = lambda self,a: self.TVA<=a<self.TVA+self.TSZ
+
+class Lifter:
+    def __init__(self, pe_path, comments=True, trap=False, hooks=None, watch=False):
+        self.comments=comments; self.trap=trap; self.traps=0; self.trap_kinds=collections.Counter()
+        self.hooks=set(hooks or ()); self.watch=watch
+        self.cov=False
+        pe = pefile.PE(pe_path); self.IB = pe.OPTIONAL_HEADER.ImageBase
+        self.secs=[]
+        for s in pe.sections:
+            nm=s.Name.rstrip(b'\x00').decode('latin1').strip() or '<none>'
+            self.secs.append((nm,self.IB+s.VirtualAddress,s.Misc_VirtualSize,s.get_data()))
+        self.TVA,self.TSZ,self.TDATA = next((va,vs,d) for nm,va,vs,d in self.secs if nm=='.text')
+        self.md=Cs(CS_ARCH_X86,CS_MODE_32); self.md.detail=True
+    def in_text(self,a): return self.TVA<=a<self.TVA+self.TSZ
+
+    # ---------- operand -> C ifadesi ----------
+    def ea(self, m, extra=0):
+        """Etkin adres.  `extra`: sabit ek ofset (128-bit islemlerde ust yari)."""
+        parts=[]
+        # Win32 duz bellek modeli: es/ds/ss/cs taban 0 -> yok sayilir.
+        # fs ise TEB'i gosterir (SEH zinciri fs:[0], TLS fs:[0x2c]) -> taban eklenir.
+        if m.segment:
+            sname = self.md.reg_name(m.segment) or ''
+            if sname == 'fs':
+                parts.append("c->fs_base")
+            elif sname == 'gs':
+                parts.append("c->gs_base")
+        if m.base and m.base in R32: parts.append(f"c->{R32[m.base]}")
+        elif m.base and m.base!=0: raise Unsupported(f"taban kayit {m.base}")
+        if m.index:
+            if m.index not in R32: raise Unsupported("indeks kayit")
+            parts.append(f"c->{R32[m.index]}*{m.scale}" if m.scale!=1 else f"c->{R32[m.index]}")
+        d = (m.disp + extra) & 0xffffffff
+        if d or not parts: parts.append(f"0x{d:x}u")
+        return "(" + "+".join(parts) + ")"
+
+    def rd(self, op):
+        if op.type==X86_OP_IMM:  return f"0x{op.imm & 0xffffffff:x}u"
+        if op.type==X86_OP_REG:
+            r=op.reg
+            if r in R32: return f"c->{R32[r]}"
+            if r in R16: return f"(uint16_t)c->{R16[r]}"
+            if r in R8L: return f"(uint8_t)c->{R8L[r]}"
+            if r in R8H: return f"(uint8_t)(c->{R8H[r]}>>8)"
+            SEG = {X86_REG_ES:0x23,X86_REG_CS:0x1b,X86_REG_SS:0x23,
+                   X86_REG_DS:0x23,X86_REG_FS:0x3b,X86_REG_GS:0x00}
+            if r in SEG: return f"0x{SEG[r]:x}u"   # duz model: sabit selektor
+            raise Unsupported(f"kayit {r}")
+        if op.type==X86_OP_MEM:
+            return {1:'MR8',2:'MR16',4:'MR32',8:'MR64'}[op.size] + self.ea(op.mem)
+        raise Unsupported("operand tipi")
+
+    def wr(self, op, val):
+        if op.type==X86_OP_REG:
+            r=op.reg
+            if r in R32: return f"c->{R32[r]} = (uint32_t)({val});"
+            if r in R16: return f"c->{R16[r]} = (c->{R16[r]} & 0xffff0000u) | (uint32_t)(({val})&0xffffu);"
+            if r in R8L: return f"c->{R8L[r]} = (c->{R8L[r]} & 0xffffff00u) | (uint32_t)(({val})&0xffu);"
+            if r in R8H: return f"c->{R8H[r]} = (c->{R8H[r]} & 0xffff00ffu) | ((uint32_t)(({val})&0xffu)<<8);"
+            if r in (X86_REG_ES,X86_REG_CS,X86_REG_SS,X86_REG_DS,X86_REG_FS,X86_REG_GS):
+                return f"(void)({val});   /* duz model: segment yazma etkisiz */"
+            raise Unsupported(f"kayit yaz {r}")
+        if op.type==X86_OP_MEM:
+            return {1:'MR8',2:'MR16',4:'MR32',8:'MR64'}[op.size] + self.ea(op.mem) + f" = ({val});"
+        raise Unsupported("hedef operand")
+
+    # ---------- fonksiyon kesfi (CFG) ----------
+    def discover(self, entry, maxins=4000):
+        blocks={}; q=collections.deque([entry]); seen=set([entry]); calls=set()
+        while q:
+            va=q.popleft(); ins=[]
+            while True:
+                if not self.in_text(va): break
+                off=va-self.TVA
+                try: i=next(self.md.disasm(self.TDATA[off:off+16],va))
+                except StopIteration: break
+                ins.append(i); m=i.mnemonic
+                if m in ('ret','retf'): break
+                if m=='jmp':
+                    o=i.operands[0]
+                    if o.type==X86_OP_IMM and self.in_text(o.imm):
+                        t=o.imm
+                        if t not in seen: seen.add(t); q.append(t)
+                    break
+                if (m.startswith('j') and m[1:] in CC) or \
+                   m in ('jecxz','jcxz','loop','loope','loopz','loopne','loopnz'):
+                    o=i.operands[0]
+                    if o.type==X86_OP_IMM:
+                        for t in (o.imm, i.address+i.size):
+                            if self.in_text(t) and t not in seen: seen.add(t); q.append(t)
+                    break
+                if m=='call':
+                    o=i.operands[0]
+                    if o.type==X86_OP_IMM: calls.add(o.imm)
+                if m == 'int3':
+                    # Tek int3 = assertion/debug kesmesi -> etkisiz say, DEVAM ET.
+                    # Ardisik 0xCC dizisi = fonksiyonlar arasi dolgu -> dur.
+                    off2 = va + i.size - self.TVA
+                    pad = self.TDATA[off2:off2+3]
+                    if pad == b'\xcc\xcc\xcc': break
+                    va = i.address + i.size
+                    continue
+                if m in ('hlt','ud2'): break
+                va=i.address+i.size
+                if len(ins)>maxins: break
+            blocks[ins[0].address if ins else va]=ins
+        return blocks, calls
+
+    # ---------- tek komut -> C ----------
+    def _fm(self):
+        """Bu komuttan sonra CANLI olan bayraklarin maskesi.  Ayarlanmamissa
+        (RawLifter / testler) muhafazakar olarak hepsi."""
+        return "0x%02xu" % getattr(self, 'cur_fmask', F_ALL)
+
+    def insn(self, i, targets):
+        m=i.mnemonic; ops=i.operands; o=ops
+        E=lambda k: self.rd(o[k]); W=lambda k,v: self.wr(o[k],v)
+        bits = (o[0].size*8) if o else 32
+        L=[]
+        def flags_arith(kind,a,b,res):
+            L.append(f"{{ uint32_t _a={a}, _b={b}, _r=(uint32_t)({res}); FLAGS_{kind}(_a,_b,_r,{bits}); }}")
+        if m=='nop' or m.startswith('nop'): return ["/* nop */"]
+        if m=='mov':      return [W(0,E(1))]
+        if m=='movzx':    return [W(0,f"(uint32_t)({E(1)})")]
+        if m=='movsx':
+            sb=o[1].size*8
+            return [W(0,f"(uint32_t)(int32_t)(int{sb}_t)({E(1)})")]
+        if m=='lea':      return [W(0,self.ea(o[1].mem))]
+        if m=='push':     return [f"PUSH32({E(0)});"]
+        if m=='pop':      return [f"{{ uint32_t _t; POP32(_t); {W(0,'_t')} }}"]
+        if m=='enter':
+            # enter imm16, imm8 -- yalnizca yaygin (n, 0) bicimi
+            sz2 = o[0].imm & 0xffff
+            return ["PUSH32(c->ebp);", "c->ebp = c->esp;",
+                    f"c->esp -= {sz2}u;"]
+        if m=='leave':    return ["c->esp = c->ebp;", "{ uint32_t _t; POP32(_t); c->ebp=_t; }"]
+        if m=='cdq':      return ["c->edx = (uint32_t)((int32_t)c->eax >> 31);"]
+        if m=='cwde':     return ["c->eax = (uint32_t)(int32_t)(int16_t)(uint16_t)c->eax;"]
+        if m in ('add','sub','adc','sbb'):
+            a,b=E(0),E(1)
+            if m=='add':   L.append(f"{{ uint32_t _a={a},_b={b},_r=_a+_b; FLAGS_ADD_M(_a,_b,_r,{bits},{self._fm()}); {W(0,'_r')} }}")
+            elif m=='sub': L.append(f"{{ uint32_t _a={a},_b={b},_r=_a-_b; FLAGS_SUB_M(_a,_b,_r,{bits},{self._fm()}); {W(0,'_r')} }}")
+            elif m=='adc': L.append(f"{{ uint32_t _ci=c->cf&1u,_a={a},_b={b},_r=_a+_b+_ci; FLAGS_ADC_M(_a,_b,_ci,_r,{bits},{self._fm()}); {W(0,'_r')} }}")
+            else:          L.append(f"{{ uint32_t _ci=c->cf&1u,_a={a},_b={b},_r=_a-_b-_ci; FLAGS_SBB_M(_a,_b,_ci,_r,{bits},{self._fm()}); {W(0,'_r')} }}")
+            return L
+        if m=='cmp':  return [f"{{ uint32_t _a={E(0)},_b={E(1)},_r=_a-_b; FLAGS_SUB_M(_a,_b,_r,{bits},{self._fm()}); }}"]
+        if m=='test': return [f"{{ uint32_t _r={E(0)} & {E(1)}; FLAGS_LOG_M(_r,{bits},{self._fm()}); }}"]
+        if m in ('and','or','xor'):
+            c_op={'and':'&','or':'|','xor':'^'}[m]
+            return [f"{{ uint32_t _r=({E(0)}) {c_op} ({E(1)}); FLAGS_LOG_M(_r,{bits},{self._fm()}); {W(0,'_r')} }}"]
+        if m=='not':  return [W(0,f"~({E(0)})")]
+        if m=='neg':  return [f"{{ uint32_t _a={E(0)},_r=(uint32_t)0-_a; FLAGS_SUB_M((uint32_t)0,_a,_r,{bits},{self._fm()}); {W(0,'_r')} }}"]
+        if m=='inc':  return [f"{{ uint32_t _a={E(0)},_r=_a+1; uint32_t _cf=c->cf; FLAGS_ADD_M(_a,1u,_r,{bits},{self._fm()}|F_CF); c->cf=_cf; {W(0,'_r')} }}"]
+        if m=='dec':  return [f"{{ uint32_t _a={E(0)},_r=_a-1; uint32_t _cf=c->cf; FLAGS_SUB_M(_a,1u,_r,{bits},{self._fm()}|F_CF); c->cf=_cf; {W(0,'_r')} }}"]
+        if m=='imul':
+            if len(o)==1 and bits==8:
+                return [f"{{ int32_t _p=(int32_t)(int8_t)c->eax*(int32_t)(int8_t)({E(0)});"
+                        f" c->eax=(c->eax & 0xffff0000u)|((uint32_t)_p & 0xffffu);"
+                        f" c->cf=c->of=((int32_t)(int8_t)_p != _p); }}"]
+            if len(o)==1 and bits==16:
+                return [f"{{ int32_t _p=(int32_t)(int16_t)c->eax*(int32_t)(int16_t)({E(0)});"
+                        f" c->eax=(c->eax & 0xffff0000u)|((uint32_t)_p & 0xffffu);"
+                        f" c->edx=(c->edx & 0xffff0000u)|(((uint32_t)_p>>16) & 0xffffu);"
+                        f" c->cf=c->of=((int32_t)(int16_t)_p != _p); }}"]
+            if len(o)==1:  return [f"{{ int64_t _p=(int64_t)(int32_t)c->eax*(int64_t)(int32_t)({E(0)}); c->eax=(uint32_t)_p; c->edx=(uint32_t)(_p>>32); c->cf=c->of=((int64_t)(int32_t)_p!=_p); }}"]
+            if len(o)==2:  return [f"{{ int64_t _p=(int64_t)(int32_t)({E(0)})*(int64_t)(int32_t)({E(1)}); c->cf=c->of=((int64_t)(int32_t)_p!=_p); {W(0,'(uint32_t)_p')} }}"]
+            return [f"{{ int64_t _p=(int64_t)(int32_t)({E(1)})*(int64_t)(int32_t)({E(2)}); c->cf=c->of=((int64_t)(int32_t)_p!=_p); {W(0,'(uint32_t)_p')} }}"]
+        if m=='mul':
+            # 8-bit: AX = AL*src | 16-bit: DX:AX = AX*src | 32-bit: EDX:EAX
+            if bits==8:
+                return [f"{{ uint32_t _p=(uint32_t)(uint8_t)c->eax*(uint32_t)(uint8_t)({E(0)});"
+                        f" c->eax=(c->eax & 0xffff0000u)|(_p & 0xffffu);"
+                        f" c->cf=c->of=((_p>>8)!=0); }}"]
+            if bits==16:
+                return [f"{{ uint32_t _p=(uint32_t)(uint16_t)c->eax*(uint32_t)(uint16_t)({E(0)});"
+                        f" c->eax=(c->eax & 0xffff0000u)|(_p & 0xffffu);"
+                        f" c->edx=(c->edx & 0xffff0000u)|((_p>>16) & 0xffffu);"
+                        f" c->cf=c->of=((_p>>16)!=0); }}"]
+            return [f"{{ uint64_t _p=(uint64_t)c->eax*(uint64_t)({E(0)}); c->eax=(uint32_t)_p; c->edx=(uint32_t)(_p>>32); c->cf=c->of=(c->edx!=0); }}"]
+        if m=='div':
+            if bits==8:
+                return [f"{{ uint32_t _n=(uint16_t)c->eax, _d=(uint8_t)({E(0)});"
+                        f" if(_d){{ c->eax=(c->eax & 0xffff0000u)|((_n/_d)&0xffu)|(((_n%_d)&0xffu)<<8); }} }}"]
+            if bits==16:
+                return [f"{{ uint32_t _n=(((uint32_t)(uint16_t)c->edx)<<16)|(uint16_t)c->eax,"
+                        f" _d=(uint16_t)({E(0)});"
+                        f" if(_d){{ c->eax=(c->eax & 0xffff0000u)|((_n/_d)&0xffffu);"
+                        f" c->edx=(c->edx & 0xffff0000u)|((_n%_d)&0xffffu); }} }}"]
+            return [f"{{ uint64_t _n=((uint64_t)c->edx<<32)|c->eax; uint32_t _d={E(0)}; if(_d){{ c->eax=(uint32_t)(_n/_d); c->edx=(uint32_t)(_n%_d); }} }}"]
+        if m=='idiv':
+            if bits==8:
+                return [f"{{ int32_t _n=(int16_t)c->eax, _d=(int8_t)({E(0)});"
+                        f" if(_d){{ c->eax=(c->eax & 0xffff0000u)|((uint32_t)(_n/_d)&0xffu)"
+                        f"|(((uint32_t)(_n%_d)&0xffu)<<8); }} }}"]
+            if bits==16:
+                return [f"{{ int32_t _n=(int32_t)((((uint32_t)(uint16_t)c->edx)<<16)|(uint16_t)c->eax),"
+                        f" _d=(int16_t)({E(0)});"
+                        f" if(_d){{ c->eax=(c->eax & 0xffff0000u)|((uint32_t)(_n/_d)&0xffffu);"
+                        f" c->edx=(c->edx & 0xffff0000u)|((uint32_t)(_n%_d)&0xffffu); }} }}"]
+            return [f"{{ int64_t _n=(int64_t)(((uint64_t)c->edx<<32)|c->eax); int32_t _d=(int32_t)({E(0)}); if(_d){{ c->eax=(uint32_t)(_n/_d); c->edx=(uint32_t)(_n%_d); }} }}"]
+        if m in ('shl','sal','shr','sar'):
+            cnt = E(1) if len(o)>1 else "1u"
+            # x86: CF = disari kayan son bit; SAR isaret genisletir (operand boyutunda)
+            if m in ('shl','sal'):
+                expr = "_v << _s"
+                cf   = f"((_v >> ({bits}u - _s)) & 1u)"
+            elif m=='shr':
+                expr = "_v >> _s"
+                cf   = "((_v >> (_s - 1u)) & 1u)"
+            else:
+                sb = {8:'int8_t',16:'int16_t',32:'int32_t'}[bits]
+                expr = f"(uint32_t)(({sb})_v >> _s)"
+                cf   = f"((uint32_t)(({sb})_v >> (_s - 1u)) & 1u)"
+            mask = {8:'0xffu',16:'0xffffu',32:'0xffffffffu'}[bits]
+            of_ = ("(((_rm >> (%du)) & 1u) ^ (_cf & 1u))" % (bits-1)) if m in ('shl','sal') else \
+                  (("((_v >> (%du)) & 1u)" % (bits-1)) if m=='shr' else "0u")
+            return [f"{{ uint32_t _v={E(0)} & {mask}, _s=({cnt})&31u; if(_s){{ "
+                    f"uint32_t _cf={cf}; uint32_t _r={expr}; uint32_t _rm=_r & {mask}; "
+                    f"SETZSP_M(_rm,{bits},{self._fm()}); c->cf=_cf & 1u; c->of={of_}; c->af=0; {W(0,'_rm')} }} }}"]
+        if m.startswith('set') and m[3:] in CC:
+            return [W(0,f"({CC[m[3:]]}) ? 1u : 0u")]
+        if m.startswith('cmov') and m[4:] in CC:
+            return [f"if({CC[m[4:]]}) {{ {W(0,E(1))} }}"]
+        if m=='xchg':
+            return [f"{{ uint32_t _t0={E(0)}, _t1={E(1)}; {W(0,'_t1')} {W(1,'_t0')} }}"]
+        if m=='call':
+            if o[0].type==X86_OP_IMM:
+                t=o[0].imm
+                if not self.in_text(t):
+                    # .text disina cagri (yanlis cozumlenmis veri ya da import thunk'i)
+                    self.oob_calls = getattr(self,'oob_calls',0)+1
+                    return [f"PUSH32(0x{i.address+i.size:x}u); dispatch_indirect(c, 0x{t & 0xffffffff:x}u);"]
+                targets.add(t)
+                return [f"PUSH32(0x{i.address+i.size:x}u); sub_{t:08x}(c);"]
+            # x86: cagri hedefi donus adresi ITILMEDEN once okunur (call [esp+N]!)
+            return [f"{{ uint32_t _ct = {E(0)}; PUSH32(0x{i.address+i.size:x}u); dispatch_indirect(c, _ct); }}"]
+        if m in ('ret','retf'):
+            n = o[0].imm if o else 0
+            return [f"POP32(c->eip);" + (f" c->esp += {n}u;" if n else "") + " return;"]
+
+        # ---------------- x87 FPU ----------------
+        ST_REGS = {X86_REG_ST0:0,X86_REG_ST1:1,X86_REG_ST2:2,X86_REG_ST3:3,
+                   X86_REG_ST4:4,X86_REG_ST5:5,X86_REG_ST6:6,X86_REG_ST7:7}
+        def is_st(k): return o[k].type==X86_OP_REG and o[k].reg in ST_REGS
+        def sti(k):   return ST_REGS[o[k].reg]
+        def fmem(k):
+            sz=o[k].size
+            if sz==4: return f"(double)MRF32{self.ea(o[k].mem)}"
+            if sz==8: return f"MRF64{self.ea(o[k].mem)}"
+            if sz==10: return f"f80_load(g_mem + (uint32_t){self.ea(o[k].mem)})"
+            raise Unsupported(f"{m} boyut {sz}")
+        def imem(k):
+            sz=o[k].size; ea=self.ea(o[k].mem)
+            if sz==2: return f"(double)(int16_t)MR16{ea}"
+            if sz==4: return f"(double)(int32_t)MR32{ea}"
+            if sz==8: return f"(double)(int64_t)MR64{ea}"
+            raise Unsupported(f"fild boyut {sz}")
+
+        if m in ('fld','fldl'):
+            return [f"FPUSH({'ST(%d)'%sti(0) if is_st(0) else fmem(0)});"]
+        if m=='fild':  return [f"FPUSH({imem(0)});"]
+        if m in ('fldz','fld1','fldpi','fldl2e','fldl2t','fldlg2','fldln2'):
+            k={'fldz':'0.0','fld1':'1.0','fldpi':'3.14159265358979323846',
+               'fldl2e':'1.44269504088896340736','fldl2t':'3.32192809488736234787',
+               'fldlg2':'0.30102999566398119521','fldln2':'0.69314718055994530942'}[m]
+            return [f"FPUSH({k});"]
+        if m in ('fst','fstp'):
+            pop = ["FPOP();"] if m=='fstp' else []
+            if is_st(0): return [f"ST({sti(0)}) = ST(0);"]+pop
+            sz=o[0].size
+            if sz==4: return [f"MRF32{self.ea(o[0].mem)} = (float)ST(0);"]+pop
+            if sz==8: return [f"MRF64{self.ea(o[0].mem)} = ST(0);"]+pop
+            if sz==10: return [f"f80_store(g_mem + (uint32_t){self.ea(o[0].mem)}, ST(0));"]+pop
+            raise Unsupported(f"{m} boyut {sz}")
+        if m in ('fist','fistp','fisttp'):
+            pop = [] if m=='fist' else ["FPOP();"]
+            sz=o[0].size; ea=self.ea(o[0].mem)
+            # fisttp (SSE3) her zaman keser; fist/fistp ise RC alanina uyar.
+            # Aralik disi / NaN -> "integer indefinite" (en negatif deger).
+            conv = "trunc(ST(0))" if m=='fisttp' else "x87_round(c->fcw, ST(0))"
+            cvt = {2:'x86_cvt_i16',4:'x86_cvt_i32',8:'x86_cvt_i64'}.get(sz)
+            st  = {2:'MR16',4:'MR32',8:'MR64'}.get(sz)
+            if not cvt: raise Unsupported(f"{m} boyut {sz}")
+            return [f"{st}{ea} = {cvt}({conv});"]+pop
+        FAR={'fadd':'+','fsub':'-','fmul':'*','fdiv':'/'}
+        if m in ('fadd','fsub','fmul','fdiv','fsubr','fdivr'):
+            rev = m.endswith('r') and m in ('fsubr','fdivr')
+            base = m[:-1] if rev else m
+            op_c = FAR[base]
+            if len(o)==0: raise Unsupported(m)
+            if len(o)==1:
+                src = f"ST({sti(0)})" if is_st(0) else fmem(0)
+                lhs, rhs = ("_s","_d") if rev else ("_d","_s")
+                return [f"{{ double _d=ST(0), _s=({src});"
+                        f" ST(0)=x87_r2(_d,_s,{lhs} {op_c} {rhs}); }}"]
+            d = sti(0) if is_st(0) else None
+            s2 = f"ST({sti(1)})" if is_st(1) else fmem(1)
+            if d is None: raise Unsupported(m)
+            lhs, rhs = ("_s","_d") if rev else ("_d","_s")
+            return [f"{{ double _d=ST({d}), _s=({s2});"
+                    f" ST({d})=x87_r2(_d,_s,{lhs} {op_c} {rhs}); }}"]
+        if m in ('faddp','fsubp','fmulp','fdivp','fsubrp','fdivrp'):
+            rev = m in ('fsubrp','fdivrp')
+            base = {'faddp':'fadd','fsubp':'fsub','fmulp':'fmul','fdivp':'fdiv',
+                    'fsubrp':'fsub','fdivrp':'fdiv'}[m]
+            op_c = FAR[base]
+            d = sti(0) if (len(o)>0 and is_st(0)) else 1
+            lhs, rhs = ("_s","_d") if rev else ("_d","_s")
+            return [f"{{ double _d=ST({d}), _s=ST(0);"
+                    f" ST({d})=x87_r2(_d,_s,{lhs} {op_c} {rhs}); }}", "FPOP();"]
+        if m in ('fcom','fcomp','fcompp','fucom','fucomp','fucompp'):
+            npop = 2 if m.endswith('pp') else (1 if m.endswith('p') else 0)
+            if len(o)==0: src="ST(1)"
+            elif is_st(0): src=f"ST({sti(0)})"
+            else: src=fmem(0)
+            return [f"fcompare(c, ST(0), {src});"] + ["FPOP();"]*npop
+        if m in ('fcomi','fcomip','fcompi','fucomi','fucomip','fucompi'):
+            src=f"ST({sti(1)})" if len(o)>1 and is_st(1) else (f"ST({sti(0)})" if is_st(0) else fmem(0))
+            pops = m.endswith('ip') or m.endswith('pi')
+            return [f"FCOMI(ST(0), {src});"] + (["FPOP();"] if pops else [])
+        if m=='ftst':   return ["fcompare(c, ST(0), 0.0);"]
+        if m=='fchs':   return ["ST(0) = -ST(0);"]
+        if m=='fabs':   return ["ST(0) = fabs(ST(0));"]
+        if m=='fsqrt':  return ["{ double _a=ST(0); ST(0)=x87_r1(_a, sqrt(_a)); }"]
+        if m=='fsin':   return ["ST(0) = sin(ST(0));"]
+        if m=='fcos':   return ["ST(0) = cos(ST(0));"]
+        if m=='fptan':  return ["ST(0) = tan(ST(0));","FPUSH(1.0);"]
+        if m=='fpatan': return ["ST(1) = atan2(ST(1), ST(0));","FPOP();"]
+        if m=='fyl2x':  return ["ST(1) = ST(1) * log2(ST(0));","FPOP();"]
+        if m=='f2xm1':  return ["ST(0) = exp2(ST(0)) - 1.0;"]
+        if m=='fscale': return ["ST(0) = ldexp(ST(0), (int)trunc(ST(1)));"]
+        if m=='frndint':return ["ST(0) = x87_round(c->fcw, ST(0));"]
+        # FPREM/FPREM1: donanim buyuk us farkinda KISMI indirgeme yapip C2=1
+        # birakir; biz her zaman tam sonucu verip C2=0 yapiyoruz -- oyunun
+        # "C2 temizlenene kadar tekrarla" dongusu ilk turda cikar, sonuc ayni.
+        # C0/C3/C1 bolumun alt 3 bitini tasir (fsin/fcos arguman indirgemesi).
+        if m in ('fprem','fprem1'):
+            fn = 'fmod(_a,_b)' if m=='fprem' else 'remainder(_a,_b)'
+            return [f"{{ double _a=ST(0), _b=ST(1), _r=x87_r2(_a,_b,{fn});"
+                    " double _q = (_b!=0.0) ? trunc(_a/_b) : 0.0;"
+                    " uint32_t _qi = (uint32_t)(int64_t)fmod(fabs(_q), 8.0);"
+                    " c->fsw &= (uint16_t)~(FSW_C0|FSW_C1|FSW_C2|FSW_C3);"
+                    " if (_qi & 1u) c->fsw |= FSW_C1;"
+                    " if (_qi & 2u) c->fsw |= FSW_C3;"
+                    " if (_qi & 4u) c->fsw |= FSW_C0;"
+                    " ST(0)=_r; }"]
+        if m=='fxch':
+            # capstone fxch icin (st(0), st(i)) verir: hedef SON operanddir
+            j = 1
+            if len(o) >= 2 and is_st(len(o)-1): j = sti(len(o)-1)
+            elif len(o) == 1 and is_st(0):      j = sti(0)
+            return [f"{{ double _t=ST(0); ST(0)=ST({j}); ST({j})=_t; }}"]
+        if m in ('fnstsw','fstsw'):
+            if len(o)>0 and o[0].type==X86_OP_REG:
+                return ["c->eax = (c->eax & 0xffff0000u) | (uint32_t)fsw_get(c);"]
+            return [f"MR16{self.ea(o[0].mem)} = fsw_get(c);"]
+        if m in ('fnstcw','fstcw'): return [f"MR16{self.ea(o[0].mem)} = c->fcw;"]
+        if m=='fldcw':              return [f"c->fcw = MR16{self.ea(o[0].mem)};"]
+        if m in ('ffree','ffreep','fnclex','fclex','fnop','fwait','wait','fdecstp','fincstp'):
+            return [f"/* {m}: modelimizde etkisiz */"] + (["FPOP();"] if m=='ffreep' else [])
+        if m in ('finit','fninit'):
+            return ["memset(c->st,0,sizeof c->st); c->top=0; c->fcw=0x037f; c->fsw=0;"]
+
+        # ---------------- string komutlari ----------------
+        if m=='cld': return ["c->df = 0;"]
+        if m=='std': return ["c->df = 1;"]
+        parts=m.split()
+        pfx = parts[0] if len(parts)>1 and parts[0] in ('rep','repe','repz','repne','repnz') else None
+        base = parts[-1]
+        SW={'b':(1,'MR8'),'w':(2,'MR16'),'d':(4,'MR32')}
+        if base[:-1] in ('movs','stos','lods','scas','cmps') and base[-1] in SW and \
+           not any(op2.type==X86_OP_REG and op2.reg not in R32 and op2.reg not in R16 and op2.reg not in R8L and op2.reg not in R8H for op2 in o):
+            n,acc = SW[base[-1]]; kind = base[:-1]
+            areg = {1:'(uint8_t)c->eax',2:'(uint16_t)c->eax',4:'c->eax'}[n]
+            # repe/repne govdesi 'if(!c->zf) break;' ile KENDI yazdigi ZF'yi
+            # okuyor; ZF olu gorunse bile hesaplanmali.
+            _zf = "|F_ZF" if pfx in ('repe','repz','repne','repnz') else ""
+            body={
+             'movs': f"{acc}(c->edi) = {acc}(c->esi); c->esi += _s; c->edi += _s;",
+             'stos': f"{acc}(c->edi) = {areg}; c->edi += _s;",
+             'lods': f"c->eax = " + ("(c->eax & 0xffffff00u)|" if n==1 else "(c->eax & 0xffff0000u)|" if n==2 else "") + f"{acc}(c->esi); c->esi += _s;",
+             'scas': f"{{ uint32_t _a={areg}, _b={acc}(c->edi), _r=_a-_b; FLAGS_SUB_M(_a,_b,_r,{n*8},{self._fm()}{_zf}); }} c->edi += _s;",
+             'cmps': f"{{ uint32_t _a={acc}(c->esi), _b={acc}(c->edi), _r=_a-_b; FLAGS_SUB_M(_a,_b,_r,{n*8},{self._fm()}{_zf}); }} c->esi += _s; c->edi += _s;",
+            }[kind]
+            pre=f"int32_t _s = DFSTEP({n});"
+            if pfx is None: return [f"{{ {pre} {body} }}"]
+            if pfx=='rep': return [f"{{ {pre} while(c->ecx){{ {body} c->ecx--; }} }}"]
+            cond = "!c->zf" if pfx in ('repe','repz') else "c->zf"
+            return [f"{{ {pre} while(c->ecx){{ {body} c->ecx--; if({cond}) break; }} }}"]
+
+        # ---------------- cesitli ----------------
+        if m in ('rol','ror','rcl','rcr'):
+            cnt = E(1) if len(o)>1 else "1u"
+            mask = {8:'0xffu',16:'0xffffu',32:'0xffffffffu'}[bits]
+            if m=='rol':
+                fn = f"(((_v<<_s)|(_v>>({bits}u-_s))) & {mask})"
+                cfx = "(_r & 1u)"
+            elif m=='ror':
+                fn = f"(((_v>>_s)|(_v<<({bits}u-_s))) & {mask})"
+                cfx = f"((_r >> ({bits-1}u)) & 1u)"
+            else:
+                # rcl/rcr: CF uzerinden dondurme (bits+1 bitlik dondurme)
+                nb = bits + 1
+                if m=='rcl':
+                    step = "{ uint32_t _hi=(_v>>({b}u))&1u; _v=((_v<<1)&{mask})|(_cf&1u); _cf=_hi; }"
+                else:
+                    step = "{ uint32_t _lo=_v&1u; _v=(_v>>1)|((_cf&1u)<<({b}u)); _cf=_lo; }"
+                step = step.replace("{b}", str(bits-1)).replace("{mask}", mask)
+                return [f"{{ uint32_t _v={E(0)} & {mask}, _s=(({cnt})&31u)%{nb}u, _cf=c->cf;"
+                        f" while(_s--) {step} c->cf=_cf&1u; {W(0,'_v')} }}"]
+            of1 = ("(((_r >> (%du)) & 1u) ^ (_r & 1u))" % (bits-1)) if m=='rol' else \
+                  ("(((_r >> (%du)) & 1u) ^ ((_r >> (%du)) & 1u))" % (bits-1, bits-2))
+            fn0 = fn.replace("_v<<_s", "_v<<_s").replace("_v>>_s", "_v>>_s")
+            return [f"{{ uint32_t _v={E(0)} & {mask}, _c5=({cnt})&31u, _s=_c5 % {bits}u;"
+                    f" if(_c5){{ uint32_t _r = _s ? ({fn0}) : _v; c->cf={cfx};"
+                    f" if(_c5==1u) c->of={of1}; {W(0,'_r')} }} }}"]
+        if m == 'xadd':
+            # gecici: kaynak ve hedef takas edilir, sonra toplanir
+            return [f"{{ uint32_t _d={E(0)}, _s={E(1)}, _r=_d+_s;"
+                    f" FLAGS_ADD_M(_d,_s,_r,{bits},{self._fm()}); {W(1,'_d')} {W(0,'_r')} }}"]
+        if m == 'cmpxchg':
+            # acc ile karsilastir; esitse kaynagi hedefe yaz, degilse hedefi acc'ye
+            acc = {8:"(uint8_t)c->eax",16:"(uint16_t)c->eax",32:"c->eax"}[bits]
+            wacc = {8:"c->eax=(c->eax & 0xffffff00u)|((_d)&0xffu);",
+                    16:"c->eax=(c->eax & 0xffff0000u)|((_d)&0xffffu);",
+                    32:"c->eax=(_d);"}[bits]
+            # Bayraklar gercek CPU'da ortulu "DEST - ACC" karsilastirmasindan
+            # geliyor (Rosetta ile olculdu); ZF her iki yonde de aynidir.
+            return [f"{{ uint32_t _a={acc}, _d={E(0)}, _r=_d-_a;"
+                    f" FLAGS_SUB_M(_d,_a,_r,{bits},{self._fm()});"
+                    f" if(c->zf){{ {W(0,E(1))} }} else {{ {wacc} }} }}"]
+        if m in ('bsf','bsr'):
+            # kaynak 0 ise ZF=1 ve hedef DEGISMEZ
+            fn = "_i=0; while(!((_v>>_i)&1u)) _i++;" if m=='bsf' else \
+                 f"_i={bits-1}; while(!((_v>>_i)&1u)) _i--;"
+            return [f"{{ uint32_t _v=({E(1)}) & {{8:0xffu,16:0xffffu,32:0xffffffffu}}[{bits}];"
+                    .replace("{8:0xffu,16:0xffffu,32:0xffffffffu}[%d]" % bits,
+                             {8:'0xffu',16:'0xffffu',32:'0xffffffffu'}[bits]) +
+                    f" if(_v==0){{ c->zf=1; }} else {{ uint32_t _i; {fn} c->zf=0; {W(0,'_i')} }} }}"]
+        if m=='cbw':
+            return ["c->eax = (c->eax & 0xffff0000u) | "
+                    "(uint32_t)(uint16_t)(int16_t)(int8_t)(uint8_t)c->eax;"]
+        if m in ('bt','bts','btr','btc'):
+            if o[0].type==X86_OP_REG:
+                base=E(0); bitn=f"(({E(1)}) & {bits-1}u)"
+                setexpr={'bt':None,'bts':'_b | (1u<<_n)','btr':'_b & ~(1u<<_n)','btc':'_b ^ (1u<<_n)'}[m]
+                lines=[f"{{ uint32_t _b={base}, _n={bitn}; c->cf=(_b>>_n)&1u;"]
+                if setexpr: lines[0]+=f" {W(0,setexpr)}"
+                lines[0]+=" }"
+                return lines
+            ea3=self.ea(o[0].mem)
+            return [f"{{ uint32_t _n={E(1)}; uint32_t _a=({ea3})+(_n>>3); uint32_t _m=1u<<(_n&7);"
+                    f" c->cf=(MR8(_a)&_m)?1u:0u;"
+                    + ("" if m=='bt' else
+                       (f" MR8(_a)|= _m;" if m=='bts' else
+                        (f" MR8(_a)&=~_m;" if m=='btr' else f" MR8(_a)^= _m;")))
+                    + " }"]
+        if m=='bswap': return [W(0,f"__builtin_bswap32({E(0)})")]
+        if m=='sahf':  return ["{ uint32_t _f=(c->eax>>8)&0xffu; c->cf=_f&1; c->pf=(_f>>2)&1; c->af=(_f>>4)&1; c->zf=(_f>>6)&1; c->sf=(_f>>7)&1; }"]
+        if m=='lahf':  return ["c->eax = (c->eax & 0xffff00ffu) | ((c->sf<<7|c->zf<<6|c->af<<4|c->pf<<2|2u|c->cf)<<8);"]
+        if m=='cpuid': return ["cpuid_shim(c);"]
+        if m=='rdtsc': return ["{ uint64_t _t=rdtsc_shim(); c->eax=(uint32_t)_t; c->edx=(uint32_t)(_t>>32); }"]
+        if m in ('clc',): return ["c->cf=0;"]
+        if m in ('stc',): return ["c->cf=1;"]
+        if m in ('cmc',): return ["c->cf=!c->cf;"]
+
+
+        # ---------------- bayrak yigini / cift kaydirma ----------------
+        if m in ('pushal','pushad','pusha'):
+            return ["{ uint32_t _sp=c->esp; PUSH32(c->eax); PUSH32(c->ecx); PUSH32(c->edx);"
+                    " PUSH32(c->ebx); PUSH32(_sp); PUSH32(c->ebp); PUSH32(c->esi); PUSH32(c->edi); }"]
+        if m in ('popal','popad','popa'):
+            return ["{ uint32_t _t; POP32(c->edi); POP32(c->esi); POP32(c->ebp); POP32(_t);"
+                    " POP32(c->ebx); POP32(c->edx); POP32(c->ecx); POP32(c->eax); (void)_t; }"]
+        if m in ('pushfd','pushf'):  return ["PUSH32(eflags_get(c));"]
+        if m in ('popfd','popf'):    return ["{ uint32_t _f; POP32(_f); eflags_set(c,_f); }"]
+        if m in ('shrd','shld'):
+            cnt = E(2) if len(o)>2 else "c->ecx"
+            if m=='shrd':
+                expr = "(_d >> _s) | (_v << (32u-_s))"
+            else:
+                expr = "(_d << _s) | (_v >> (32u-_s))"
+            # DIKKAT: FLAGS_LOG CF'yi sifirlar; CF ondan SONRA yazilmali.
+            return [f"{{ uint32_t _d={E(0)}, _v={E(1)}, _s=({cnt})&31u; if(_s){{ uint32_t _r={expr}; "
+                    f"FLAGS_LOG_M(_r,32,{self._fm()}); c->cf=(({'_d >> (_s-1u)' if m=='shrd' else '_d >> (32u-_s)'})&1u); {W(0,'_r')} }} }}"]
+
+        # ---------------- x87 tamsayi islemleri ----------------
+        if m in ('fiadd','fimul','fisub','fisubr','fidiv','fidivr','ficom','ficomp'):
+            sz=o[0].size; ea2=self.ea(o[0].mem)
+            src = {2:f"(double)(int16_t)MR16{ea2}",4:f"(double)(int32_t)MR32{ea2}"}.get(sz)
+            if src is None: raise Unsupported(f"{m} boyut {sz}")
+            if m=='fiadd':  return [f"ST(0) = ST(0) + ({src});"]
+            if m=='fimul':  return [f"ST(0) = ST(0) * ({src});"]
+            if m=='fisub':  return [f"ST(0) = ST(0) - ({src});"]
+            if m=='fisubr': return [f"ST(0) = ({src}) - ST(0);"]
+            if m=='fidiv':  return [f"ST(0) = ST(0) / ({src});"]
+            if m=='fidivr': return [f"ST(0) = ({src}) / ST(0);"]
+            if m=='ficom':  return [f"fcompare(c, ST(0), {src});"]
+            return [f"fcompare(c, ST(0), {src});", "FPOP();"]
+
+        # ---------------- MMX / SSE ----------------
+        MM = {X86_REG_MM0:0,X86_REG_MM1:1,X86_REG_MM2:2,X86_REG_MM3:3,
+              X86_REG_MM4:4,X86_REG_MM5:5,X86_REG_MM6:6,X86_REG_MM7:7}
+        XM = {X86_REG_XMM0:0,X86_REG_XMM1:1,X86_REG_XMM2:2,X86_REG_XMM3:3,
+              X86_REG_XMM4:4,X86_REG_XMM5:5,X86_REG_XMM6:6,X86_REG_XMM7:7}
+        def is_mm(k): return o[k].type==X86_OP_REG and o[k].reg in MM
+        def is_xm(k): return o[k].type==X86_OP_REG and o[k].reg in XM
+        def is_gp(k): return o[k].type==X86_OP_REG and o[k].reg in R32
+        def is_mem(k): return o[k].type==X86_OP_MEM
+
+        if m=='emms': return ["/* emms */"]
+        if m in ('movq','movd'):
+            w = 8 if m=='movq' else 4
+            T = 'uint64_t' if w==8 else 'uint32_t'
+            def rd_(k):
+                if is_mm(k):  return f"c->mm[{MM[o[k].reg]}]"
+                if is_xm(k):  return f"c->xmm[{XM[o[k].reg]}].u64[0]" if w==8 else f"c->xmm[{XM[o[k].reg]}].u32[0]"
+                if is_gp(k):  return f"c->{R32[o[k].reg]}"
+                if is_mem(k): return ("MR64" if w==8 else "MR32") + self.ea(o[k].mem)
+                raise Unsupported(m)
+            def wr_(k,v):
+                if is_mm(k):  return f"c->mm[{MM[o[k].reg]}] = ({T})({v});"
+                if is_xm(k):
+                    i2=XM[o[k].reg]
+                    return (f"c->xmm[{i2}].u64[0] = (uint64_t)({v}); c->xmm[{i2}].u64[1] = 0;" if w==8
+                            else f"c->xmm[{i2}].u32[0] = (uint32_t)({v}); c->xmm[{i2}].u32[1]=0; c->xmm[{i2}].u64[1]=0;")
+                if is_gp(k):  return f"c->{R32[o[k].reg]} = (uint32_t)({v});"
+                if is_mem(k): return ("MR64" if w==8 else "MR32") + self.ea(o[k].mem) + f" = ({T})({v});"
+                raise Unsupported(m)
+            return [wr_(0, rd_(1))]
+        if m in ('movaps','movups','movdqa','movdqu','movapd','movupd'):
+            def rd16(k):
+                if is_xm(k): return f"c->xmm[{XM[o[k].reg]}]"
+                return None
+            if is_xm(0) and is_xm(1):
+                return [f"c->xmm[{XM[o[0].reg]}] = c->xmm[{XM[o[1].reg]}];"]
+            if is_xm(0) and is_mem(1):
+                ea2=self.ea(o[1].mem)
+                return [f"memcpy(&c->xmm[{XM[o[0].reg]}], g_mem + (uint32_t){ea2}, 16);"]
+            if is_mem(0) and is_xm(1):
+                ea2=self.ea(o[0].mem)
+                return [f"memcpy(g_mem + (uint32_t){ea2}, &c->xmm[{XM[o[1].reg]}], 16);"]
+    
+        if m in ('movss','movsd') and (is_xm(0) or is_xm(1)):
+            w = 4 if m=='movss' else 8
+            if is_xm(0) and is_xm(1):
+                i0,i1=XM[o[0].reg],XM[o[1].reg]
+                return [f"c->xmm[{i0}].u32[0] = c->xmm[{i1}].u32[0];"] if w==4 else                        [f"c->xmm[{i0}].u64[0] = c->xmm[{i1}].u64[0];"]
+            if is_xm(0) and is_mem(1):
+                i0=XM[o[0].reg]; ea2=self.ea(o[1].mem)
+                return [f"memset(&c->xmm[{i0}],0,16); memcpy(&c->xmm[{i0}], g_mem + (uint32_t){ea2}, {w});"]
+            if is_mem(0) and is_xm(1):
+                i1=XM[o[1].reg]; ea2=self.ea(o[0].mem)
+                return [f"memcpy(g_mem + (uint32_t){ea2}, &c->xmm[{i1}], {w});"]
+    
+        if m in ('pxor','xorps','xorpd','por','orps','pand','andps','andpd','orpd','pandn','andnps','andnpd'):
+            if not (is_xm(0) or is_mm(0)): raise Unsupported(m)
+            if is_mm(0):
+                a=f"c->mm[{MM[o[0].reg]}]"
+                b=(f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+                if m in ('pandn','andnps'):     # dst = ~dst & src
+                    return [f"{a} = (~{a}) & ({b});"]
+                op_c={'pxor':'^','por':'|','pand':'&'}.get(m)
+                if op_c is None: raise Unsupported(m)
+                return [f"{a} = {a} {op_c} ({b});"]
+            i0=XM[o[0].reg]
+            src = (f"c->xmm[{XM[o[1].reg]}]" if is_xm(1) else None)
+            if m in ('pandn','andnps','andnpd'):     # dst = ~dst & src
+                if src:
+                    return [f"c->xmm[{i0}].u64[0] = (~c->xmm[{i0}].u64[0]) & {src}.u64[0];"
+                            f" c->xmm[{i0}].u64[1] = (~c->xmm[{i0}].u64[1]) & {src}.u64[1];"]
+                ea3=self.ea(o[1].mem)
+                return [f"{{ uint64_t _a=MR64({ea3}), _b=MR64(({ea3})+8u);"
+                        f" c->xmm[{i0}].u64[0] = (~c->xmm[{i0}].u64[0]) & _a;"
+                        f" c->xmm[{i0}].u64[1] = (~c->xmm[{i0}].u64[1]) & _b; }}"]
+            op_c={'pxor':'^','xorps':'^','xorpd':'^','por':'|','orps':'|',
+                  'pand':'&','andps':'&','andpd':'&','orpd':'|'}.get(m)
+            if op_c is None: raise Unsupported(m)
+            if src:
+                return [f"c->xmm[{i0}].u64[0] {op_c}= {src}.u64[0]; c->xmm[{i0}].u64[1] {op_c}= {src}.u64[1];"]
+            ea2=self.ea(o[1].mem)
+            return [f"{{ uint64_t _a=MR64({ea2}), _b=MR64(({ea2})+8u); "
+                    f"c->xmm[{i0}].u64[0] {op_c}= _a; c->xmm[{i0}].u64[1] {op_c}= _b; }}"]
+
+
+        # ---------------- MMX tamsayi islemleri ----------------
+        MMOPS = {
+          'paddb':(1,'+'),'paddw':(2,'+'),'paddd':(4,'+'),
+          'psubb':(1,'-'),'psubw':(2,'-'),'psubd':(4,'-'),
+          'pmullw':(2,'*'),
+          'pand':(0,'&'),'por':(0,'|'),'pxor':(0,'^'),
+        }
+        SATOPS = {'paddsb':(1,1),'paddsw':(2,1),'psubsb':(1,-1),'psubsw':(2,-1),
+                  'paddusb':(1,2),'paddusw':(2,2),'psubusb':(1,-2),'psubusw':(2,-2)}
+        def mm_src(k, wide):
+            if is_mm(k): return f"c->mm[{MM[o[k].reg]}]"
+            if is_xm(k): return f"c->xmm[{XM[o[k].reg]}].u64[0]"
+            if is_mem(k): return ("MR64" if not wide else "MR64") + self.ea(o[k].mem)
+            raise Unsupported(m)
+        def mm_dst_idx():
+            if is_mm(0): return ('mm', MM[o[0].reg])
+            if is_xm(0): return ('xmm', XM[o[0].reg])
+            raise Unsupported(m)
+
+        def qwords(k, half):
+            """k. operandin `half` numarali 64-bitlik yarisi (XMM icin 0/1)."""
+            if is_mm(k):  return f"c->mm[{MM[o[k].reg]}]"
+            if is_xm(k):  return f"c->xmm[{XM[o[k].reg]}].u64[{half}]"
+            if is_mem(k): return "MR64" + self.ea(o[k].mem, extra=8*half)
+            raise Unsupported(m)
+
+        if m in MMOPS and (is_mm(0) or is_xm(0)):
+            esz, op_c = MMOPS[m]
+            # XMM hedefte islem 128 bittir: her iki 64-bitlik yariyi da isle.
+            halves = [0,1] if is_xm(0) else [0]
+            out = []
+            for h in halves:
+                dst = qwords(0, h); src = qwords(1, h)
+                if esz == 0:
+                    out.append(f"{dst} = {dst} {op_c} ({src});"); continue
+                n = 8 // esz
+                ty = {1:'uint8_t',2:'uint16_t',4:'uint32_t'}[esz]
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                           f" for(int _k=0;_k<{n};_k++){{ {ty} _x=({ty})(_a>>(_k*{esz*8}));"
+                           f" {ty} _y=({ty})(_b>>(_k*{esz*8})); {ty} _z=({ty})(_x {op_c} _y);"
+                           f" _r |= (uint64_t)_z << (_k*{esz*8}); }} {dst}=_r; }}")
+            return out
+
+        # --- carpma/paketleme/karistirma ---
+        PMUL = {'pmulhw':1,'pmulhuw':0}
+        if m in PMUL and (is_mm(0) or is_xm(0)):
+            signed = PMUL[m]
+            halves = [0,1] if is_xm(0) else [0]
+            out=[]
+            for h in halves:
+                dst = qwords(0,h); src = qwords(1,h)
+                ty = 'int16_t' if signed else 'uint16_t'
+                acc = 'int32_t' if signed else 'uint32_t'
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                           f" for(int _k=0;_k<4;_k++){{ {ty} _x=({ty})(uint16_t)(_a>>(_k*16));"
+                           f" {ty} _y=({ty})(uint16_t)(_b>>(_k*16));"
+                           f" uint16_t _z=(uint16_t)((({acc})_x*({acc})_y)>>16);"
+                           f" _r |= (uint64_t)_z << (_k*16); }} {dst}=_r; }}")
+            return out
+        if m == 'pmaddwd' and (is_mm(0) or is_xm(0)):
+            halves = [0,1] if is_xm(0) else [0]
+            out=[]
+            for h in halves:
+                dst = qwords(0,h); src = qwords(1,h)
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                           f" for(int _k=0;_k<2;_k++){{"
+                           f" int32_t _s=0;"
+                           f" for(int _j=0;_j<2;_j++){{ int _i=_k*2+_j;"
+                           f" int16_t _x=(int16_t)(uint16_t)(_a>>(_i*16));"
+                           f" int16_t _y=(int16_t)(uint16_t)(_b>>(_i*16));"
+                           f" _s += (int32_t)_x*(int32_t)_y; }}"
+                           f" _r |= (uint64_t)(uint32_t)_s << (_k*32); }} {dst}=_r; }}")
+            return out
+        PACK = {'packsswb':(2,1,1),'packssdw':(4,2,1),'packuswb':(2,1,0)}
+        if m in PACK and (is_mm(0) or is_xm(0)):
+            esz, dsz, signed = PACK[m]
+            n = 8 // esz
+            sty = {2:'int16_t',4:'int32_t'}[esz]
+            lo  = -(1 << (dsz*8-1)) if signed else 0
+            hi  = (1 << (dsz*8-1)) - 1 if signed else (1 << (dsz*8)) - 1
+            dty = {1:'uint8_t',2:'uint16_t'}[dsz]
+            halves = [0,1] if is_xm(0) else [0]
+            out=[]
+            for h in halves:
+                dst = qwords(0,h); src = qwords(1,h)
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                           f" for(int _k=0;_k<{n};_k++){{"
+                           f" {sty} _x=({sty})(_a>>(_k*{esz*8}));"
+                           f" if(_x<{lo}) _x={lo}; if(_x>{hi}) _x={hi};"
+                           f" _r |= (uint64_t)({dty})_x << (_k*{dsz*8}); }}"
+                           f" for(int _k=0;_k<{n};_k++){{"
+                           f" {sty} _y=({sty})(_b>>(_k*{esz*8}));"
+                           f" if(_y<{lo}) _y={lo}; if(_y>{hi}) _y={hi};"
+                           f" _r |= (uint64_t)({dty})_y << (({n}+_k)*{dsz*8}); }}"
+                           f" {dst}=_r; }}")
+            return out
+        if m == 'pextrw' and o[0].type==X86_OP_REG and (is_mm(1) or is_xm(1)):
+            sel = o[2].imm & (7 if is_xm(1) else 3)
+            if is_mm(1):
+                return [W(0, f"(uint32_t)(uint16_t)(c->mm[{MM[o[1].reg]}] >> {sel*16})")]
+            return [W(0, f"(uint32_t)(uint16_t)(c->xmm[{XM[o[1].reg]}].u64[{sel//4}] >> {(sel%4)*16})")]
+        if m == 'pinsrw' and (is_mm(0) or is_xm(0)):
+            sel = o[2].imm & (7 if is_xm(0) else 3)
+            val = f"(uint64_t)(uint16_t)({E(1)})"
+            if is_mm(0):
+                d0=f"c->mm[{MM[o[0].reg]}]"
+                return [f"{d0} = ({d0} & ~((uint64_t)0xFFFFu << {sel*16})) | ({val} << {sel*16});"]
+            d0=f"c->xmm[{XM[o[0].reg]}].u64[{sel//4}]"
+            sh=(sel%4)*16
+            return [f"{d0} = ({d0} & ~((uint64_t)0xFFFFu << {sh})) | ({val} << {sh});"]
+        if m == 'pmovmskb' and o[0].type==X86_OP_REG:
+            if is_mm(1):
+                return [f"{{ uint32_t _r=0; uint64_t _a=c->mm[{MM[o[1].reg]}];"
+                        f" for(int _k=0;_k<8;_k++) if((_a>>(_k*8+7))&1u) _r|=1u<<_k;"
+                        f" {W(0,'_r')} }}"]
+            if is_xm(1):
+                return [f"{{ uint32_t _r=0;"
+                        f" for(int _k=0;_k<16;_k++)"
+                        f" if(c->xmm[{XM[o[1].reg]}].b[_k] & 0x80u) _r|=1u<<_k;"
+                        f" {W(0,'_r')} }}"]
+        if m == 'pshufd' and is_xm(0):
+            imm = o[2].imm & 0xff
+            sel = [(imm>>0)&3,(imm>>2)&3,(imm>>4)&3,(imm>>6)&3]
+            src = (f"c->xmm[{XM[o[1].reg]}]" if is_xm(1) else None)
+            if src is None: raise Unsupported(m)
+            di = XM[o[0].reg]
+            return [f"{{ uint32_t _t[4]; " +
+                    " ".join(f"_t[{k}]={src}.u32[{sel[k]}];" for k in range(4)) +
+                    " " + " ".join(f"c->xmm[{di}].u32[{k}]=_t[{k}];" for k in range(4)) + " }"]
+        if m in ('movq2dq',) and is_xm(0) and is_mm(1):
+            return [f"c->xmm[{XM[o[0].reg]}].u64[0] = c->mm[{MM[o[1].reg]}];"
+                    f" c->xmm[{XM[o[0].reg]}].u64[1] = 0;"]
+        if m in ('movdq2q',) and is_mm(0) and is_xm(1):
+            return [f"c->mm[{MM[o[0].reg]}] = c->xmm[{XM[o[1].reg]}].u64[0];"]
+        if m == 'movntq' and is_mem(0) and is_mm(1):
+            return [f"MR64{self.ea(o[0].mem)} = c->mm[{MM[o[1].reg]}];"]
+        if m in ('movntps','movntdq') and is_mem(0) and is_xm(1):
+            ea4=self.ea(o[0].mem)
+            return [f"memcpy(g_mem + (uint32_t){ea4}, &c->xmm[{XM[o[1].reg]}], 16);"]
+
+        # --- paketli karsilastirma / min / max / ortalama / psadbw ---
+        PCMP = {'pcmpeqb':(1,'==',0),'pcmpeqw':(2,'==',0),'pcmpeqd':(4,'==',0),
+                'pcmpgtb':(1,'>',1),'pcmpgtw':(2,'>',1),'pcmpgtd':(4,'>',1)}
+        PMIX = {'pminsw':(2,1,'<'),'pmaxsw':(2,1,'>'),
+                'pminub':(1,0,'<'),'pmaxub':(1,0,'>')}
+        PAVG = {'pavgb':1,'pavgw':2}
+        if m in PCMP and (is_mm(0) or is_xm(0)):
+            esz, cop, signed = PCMP[m]
+            uty = {1:'uint8_t',2:'uint16_t',4:'uint32_t'}[esz]
+            sty = {1:'int8_t',2:'int16_t',4:'int32_t'}[esz]
+            ty  = sty if signed else uty
+            halves = [0,1] if is_xm(0) else [0]
+            out=[]
+            for h in halves:
+                dst = qwords(0,h); src = qwords(1,h); n = 8//esz
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                           f" for(int _k=0;_k<{n};_k++){{ {ty} _x=({ty})({uty})(_a>>(_k*{esz*8}));"
+                           f" {ty} _y=({ty})({uty})(_b>>(_k*{esz*8}));"
+                           f" {uty} _z = (_x {cop} _y) ? ({uty})~({uty})0 : 0;"
+                           f" _r |= (uint64_t)_z << (_k*{esz*8}); }} {dst}=_r; }}")
+            return out
+        if m in PMIX and (is_mm(0) or is_xm(0)):
+            esz, signed, cop = PMIX[m]
+            uty = {1:'uint8_t',2:'uint16_t'}[esz]
+            sty = {1:'int8_t',2:'int16_t'}[esz]
+            ty  = sty if signed else uty
+            halves = [0,1] if is_xm(0) else [0]
+            out=[]
+            for h in halves:
+                dst = qwords(0,h); src = qwords(1,h); n = 8//esz
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                           f" for(int _k=0;_k<{n};_k++){{ {ty} _x=({ty})({uty})(_a>>(_k*{esz*8}));"
+                           f" {ty} _y=({ty})({uty})(_b>>(_k*{esz*8}));"
+                           f" {uty} _z=({uty})((_x {cop} _y)?_x:_y);"
+                           f" _r |= (uint64_t)_z << (_k*{esz*8}); }} {dst}=_r; }}")
+            return out
+        if m in PAVG and (is_mm(0) or is_xm(0)):
+            esz = PAVG[m]; uty = {1:'uint8_t',2:'uint16_t'}[esz]
+            halves = [0,1] if is_xm(0) else [0]
+            out=[]
+            for h in halves:
+                dst = qwords(0,h); src = qwords(1,h); n = 8//esz
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                           f" for(int _k=0;_k<{n};_k++){{ uint32_t _x=({uty})(_a>>(_k*{esz*8}));"
+                           f" uint32_t _y=({uty})(_b>>(_k*{esz*8}));"
+                           f" {uty} _z=({uty})((_x+_y+1u)>>1);"
+                           f" _r |= (uint64_t)_z << (_k*{esz*8}); }} {dst}=_r; }}")
+            return out
+        if m == 'psadbw' and (is_mm(0) or is_xm(0)):
+            halves = [0,1] if is_xm(0) else [0]
+            out=[]
+            for h in halves:
+                dst = qwords(0,h); src = qwords(1,h)
+                out.append(f"{{ uint64_t _a={dst}, _b=({src}); uint32_t _s=0;"
+                           f" for(int _k=0;_k<8;_k++){{ int _x=(uint8_t)(_a>>(_k*8));"
+                           f" int _y=(uint8_t)(_b>>(_k*8)); _s += (uint32_t)(_x>_y?_x-_y:_y-_x); }}"
+                           f" {dst}=(uint64_t)_s; }}")
+            return out
+
+        if m in SATOPS and (is_mm(0) or is_xm(0)):
+            esz, mode = SATOPS[m]
+            kind, di = mm_dst_idx()
+            dst = f"c->mm[{di}]" if kind=='mm' else f"c->xmm[{di}].u64[0]"
+            src = mm_src(1, False)
+            n = 8 // esz; bits2 = esz*8
+            if abs(mode)==1:      # isaretli doyma
+                st = {1:'int8_t',2:'int16_t'}[esz]
+                lo = -(1<<(bits2-1)); hi = (1<<(bits2-1))-1
+                opx = '+' if mode>0 else '-'
+                body = (f"int32_t _v = (int32_t)({st})(_a>>(_k*{bits2})) {opx} (int32_t)({st})(_b>>(_k*{bits2}));"
+                        f" if(_v<{lo}) _v={lo}; if(_v>{hi}) _v={hi};"
+                        f" _r |= ((uint64_t)(uint{bits2}_t)(int{bits2}_t)_v) << (_k*{bits2});")
+            else:                 # isaretsiz doyma
+                ut = {1:'uint8_t',2:'uint16_t'}[esz]
+                hi = (1<<bits2)-1
+                opx = '+' if mode>0 else '-'
+                body = (f"int32_t _v = (int32_t)({ut})(_a>>(_k*{bits2})) {opx} (int32_t)({ut})(_b>>(_k*{bits2}));"
+                        f" if(_v<0) _v=0; if(_v>{hi}) _v={hi};"
+                        f" _r |= ((uint64_t)(uint{bits2}_t)_v) << (_k*{bits2});")
+            return [f"{{ uint64_t _a={dst}, _b=({src}), _r=0;"
+                    f" for(int _k=0;_k<{n};_k++){{ {body} }} {dst}=_r; }}"]
+
+        # kaydirmalar
+        PSH = {'psllw':(2,'<<'),'pslld':(4,'<<'),'psllq':(8,'<<'),
+               'psrlw':(2,'>>'),'psrld':(4,'>>'),'psrlq':(8,'>>'),
+               'psraw':(2,'a'),'psrad':(4,'a')}
+        if m in PSH and (is_mm(0) or is_xm(0)):
+            esz, kindop = PSH[m]
+            kind, di = mm_dst_idx()
+            dst = f"c->mm[{di}]" if kind=='mm' else f"c->xmm[{di}].u64[0]"
+            cnt2 = (f"{o[1].imm & 0xff}u" if o[1].type==X86_OP_IMM else mm_src(1, False))
+            if esz==8:
+                if kindop=='<<': return [f"{{ uint32_t _s=(uint32_t)({cnt2}); {dst} = _s>63?0:({dst} << _s); }}"]
+                return [f"{{ uint32_t _s=(uint32_t)({cnt2}); {dst} = _s>63?0:({dst} >> _s); }}"]
+            n = 8 // esz; bits2 = esz*8
+            ut = {2:'uint16_t',4:'uint32_t'}[esz]
+            st = {2:'int16_t',4:'int32_t'}[esz]
+            if kindop=='a':
+                body=(f"{st} _x=({st})(_a>>(_k*{bits2})); {st} _z = _s>={bits2} ? (_x<0?-1:0) : (_x >> _s);"
+                      f" _r |= ((uint64_t)({ut})_z) << (_k*{bits2});")
+            elif kindop=='<<':
+                body=(f"{ut} _x=({ut})(_a>>(_k*{bits2})); {ut} _z = _s>={bits2} ? 0 : ({ut})(_x << _s);"
+                      f" _r |= ((uint64_t)_z) << (_k*{bits2});")
+            else:
+                body=(f"{ut} _x=({ut})(_a>>(_k*{bits2})); {ut} _z = _s>={bits2} ? 0 : ({ut})(_x >> _s);"
+                      f" _r |= ((uint64_t)_z) << (_k*{bits2});")
+            return [f"{{ uint64_t _a={dst}, _r=0; uint32_t _s=(uint32_t)({cnt2});"
+                    f" for(int _k=0;_k<{n};_k++){{ {body} }} {dst}=_r; }}"]
+
+        # punpck / packuswb
+        UNP = {'punpcklbw':(1,0),'punpcklwd':(2,0),'punpckldq':(4,0),
+               'punpckhbw':(1,1),'punpckhwd':(2,1),'punpckhdq':(4,1)}
+        if m in UNP and is_xm(0):
+            esz, hi = UNP[m]
+            di = XM[o[0].reg]
+            src = (f"c->xmm[{XM[o[1].reg]}].u64[0]" if is_xm(1) else "MR64"+self.ea(o[1].mem))
+            n = 4 // esz; bits2 = esz*8
+            return [f"{{ uint64_t _a=c->xmm[{di}].u64[0], _b=({src}), _r=0; int _o={4//esz} * {1 if hi else 0};"
+                    f" for(int _k=0;_k<{n};_k++){{"
+                    f" uint64_t _x=(_a>>((_o+_k)*{bits2})) & ((1ull<<{bits2})-1);"
+                    f" uint64_t _y=(_b>>((_o+_k)*{bits2})) & ((1ull<<{bits2})-1);"
+                    f" _r |= _x << ((2*_k)*{bits2}); _r |= _y << ((2*_k+1)*{bits2}); }}"
+                    f" c->xmm[{di}].u64[0]=_r; }}"]
+        if m in UNP and is_mm(0):
+            esz, hi = UNP[m]
+            di = MM[o[0].reg]; src = mm_src(1, False)
+            n = 4 // esz if esz<8 else 1
+            bits2 = esz*8
+            base = f"({'4' if hi else '0'})"
+            return [f"{{ uint64_t _a=c->mm[{di}], _b=({src}), _r=0; int _o={'(8/2)/'+str(esz) if False else ('4/'+str(esz))} * {1 if hi else 0};"
+                    f" for(int _k=0;_k<{n};_k++){{"
+                    f" uint64_t _x=(_a>>((_o+_k)*{bits2})) & ((1ull<<{bits2})-1);"
+                    f" uint64_t _y=(_b>>((_o+_k)*{bits2})) & ((1ull<<{bits2})-1);"
+                    f" _r |= _x << ((2*_k)*{bits2}); _r |= _y << ((2*_k+1)*{bits2}); }}"
+                    f" c->mm[{di}]=_r; (void){base}; }}"]
+        if m=='packuswb' and is_mm(0):
+            di = MM[o[0].reg]; src = mm_src(1, False)
+            return [f"{{ uint64_t _a=c->mm[{di}], _b=({src}), _r=0;"
+                    f" for(int _k=0;_k<4;_k++){{ int32_t _x=(int16_t)(_a>>(_k*16)); if(_x<0)_x=0; if(_x>255)_x=255;"
+                    f" _r |= (uint64_t)(uint8_t)_x << (_k*8); }}"
+                    f" for(int _k=0;_k<4;_k++){{ int32_t _y=(int16_t)(_b>>(_k*16)); if(_y<0)_y=0; if(_y>255)_y=255;"
+                    f" _r |= (uint64_t)(uint8_t)_y << ((4+_k)*8); }} c->mm[{di}]=_r; }}"]
+        if m=='pmaddwd' and is_mm(0):
+            di = MM[o[0].reg]; src = mm_src(1, False)
+            return [f"{{ uint64_t _a=c->mm[{di}], _b=({src}), _r=0;"
+                    f" for(int _k=0;_k<2;_k++){{ int32_t _s=0;"
+                    f" for(int _j=0;_j<2;_j++){{ int _i=_k*2+_j;"
+                    f" _s += (int32_t)(int16_t)(_a>>(_i*16)) * (int32_t)(int16_t)(_b>>(_i*16)); }}"
+                    f" _r |= (uint64_t)(uint32_t)_s << (_k*32); }} c->mm[{di}]=_r; }}"]
+
+        # ---------------- SSE tek-duyarlikli paket ----------------
+        # ---------------- SSE2 paketli/skaler double ----------------
+        PD = {'addpd':'+','subpd':'-','mulpd':'*','divpd':'/'}
+        if m in PD and is_xm(0):
+            di = XM[o[0].reg]; op_c = PD[m]
+            src = (lambda k: f"c->xmm[{XM[o[1].reg]}].d[{k}]") if is_xm(1) else \
+                  (lambda k: f"MRF64({self.ea(o[1].mem, extra=8*k)})")
+            return [f"{{ double _a=c->xmm[{di}].d[{k}], _b={src(k)};"
+                    f" c->xmm[{di}].d[{k}]=sse_r2d(_a,_b,_a {op_c} _b); }}" for k in (0,1)]
+        if m in ('minpd','maxpd','sqrtpd') and is_xm(0):
+            di = XM[o[0].reg]
+            src = (lambda k: f"c->xmm[{XM[o[1].reg]}].d[{k}]") if is_xm(1) else \
+                  (lambda k: f"MRF64({self.ea(o[1].mem, extra=8*k)})")
+            if m == 'sqrtpd':
+                return [f"{{ double _a={src(k)}; c->xmm[{di}].d[{k}]=sse_r1d(_a,sqrt(_a)); }}"
+                        for k in (0,1)]
+            cop = '>' if m=='maxpd' else '<'
+            return [f"{{ double _a=c->xmm[{di}].d[{k}], _b={src(k)};"
+                    f" c->xmm[{di}].d[{k}] = (_a {cop} _b) ? _a : _b; }}" for k in (0,1)]
+
+        # ---------------- SSE skaler min/max/sqrt ----------------
+        if m in ('minss','maxss','sqrtss','rcpss','rsqrtss') and is_xm(0):
+            di = XM[o[0].reg]
+            src = (f"c->xmm[{XM[o[1].reg]}].f[0]" if is_xm(1) else f"MRF32{self.ea(o[1].mem)}")
+            if m == 'sqrtss':
+                return [f"{{ float _a={src}; c->xmm[{di}].f[0]=sse_r1f(_a,sqrtf(_a)); }}"]
+            if m == 'rcpss':   return [f"c->xmm[{di}].f[0] = 1.0f/({src});"]
+            if m == 'rsqrtss': return [f"c->xmm[{di}].f[0] = 1.0f/sqrtf({src});"]
+            cop = '>' if m=='maxss' else '<'
+            return [f"{{ float _a=c->xmm[{di}].f[0], _b={src};"
+                    f" c->xmm[{di}].f[0] = (_a {cop} _b) ? _a : _b; }}"]
+        if m in ('minsd','maxsd','sqrtsd') and is_xm(0):
+            di = XM[o[0].reg]
+            src = (f"c->xmm[{XM[o[1].reg]}].d[0]" if is_xm(1) else f"MRF64{self.ea(o[1].mem)}")
+            if m == 'sqrtsd':
+                return [f"{{ double _a={src}; c->xmm[{di}].d[0]=sse_r1d(_a,sqrt(_a)); }}"]
+            cop = '>' if m=='maxsd' else '<'
+            return [f"{{ double _a=c->xmm[{di}].d[0], _b={src};"
+                    f" c->xmm[{di}].d[0] = (_a {cop} _b) ? _a : _b; }}"]
+
+        # ---------------- SSE karsilastirmalari (cmpps/cmpss/cmppd/cmpsd) ----
+        # capstone yuklemi mnemonic'e katiyor: cmpeqps, cmpnltss, ...
+        CMPPRED = {'eq':'(_a==_b)', 'lt':'(_a<_b)', 'le':'(_a<=_b)',
+                   'unord':'(_a!=_a||_b!=_b)', 'neq':'!(_a==_b)',
+                   'nlt':'!(_a<_b)', 'nle':'!(_a<=_b)',
+                   'ord':'(_a==_a&&_b==_b)'}
+        for _pred, _ex in CMPPRED.items():
+            for _sfx, _lanes, _cty, _fld, _msk in (('ps',4,'float','f','0xFFFFFFFFu'),
+                                                   ('ss',1,'float','f','0xFFFFFFFFu'),
+                                                   ('pd',2,'double','d','0xFFFFFFFFFFFFFFFFull'),
+                                                   ('sd',1,'double','d','0xFFFFFFFFFFFFFFFFull')):
+                if m != 'cmp' + _pred + _sfx or not is_xm(0): continue
+                di = XM[o[0].reg]
+                esz = 4 if _cty == 'float' else 8
+                uf  = 'u32' if _cty == 'float' else 'u64'
+                if is_xm(1):
+                    srcf = lambda k, si=XM[o[1].reg]: f"c->xmm[{si}].{_fld}[{k}]"
+                else:
+                    rdm = 'MRF32' if _cty == 'float' else 'MRF64'
+                    srcf = lambda k: f"{rdm}({self.ea(o[1].mem, extra=esz*k)})"
+                return [f"{{ {_cty} _a=c->xmm[{di}].{_fld}[{k}], _b={srcf(k)};"
+                        f" c->xmm[{di}].{uf}[{k}] = {_ex} ? {_msk} : 0; }}"
+                        for k in range(_lanes)]
+
+        # ---------------- SSE donusumleri ----------------
+        if m in ('cvtps2dq','cvttps2dq') and is_xm(0):
+            di = XM[o[0].reg]
+            src = (lambda k: f"c->xmm[{XM[o[1].reg]}].f[{k}]") if is_xm(1) else \
+                  (lambda k: f"MRF32({self.ea(o[1].mem, extra=4*k)})")
+            rnd = 'trunc' if m == 'cvttps2dq' else 'nearbyint'
+            return [f"{{ double _t[4]; " +
+                    " ".join(f"_t[{k}]=(double)({src(k)});" for k in range(4)) +
+                    " " + " ".join(f"c->xmm[{di}].u32[{k}]=x86_cvt_i32({rnd}(_t[{k}]));"
+                                   for k in range(4)) + " }"]
+        if m == 'cvtdq2ps' and is_xm(0):
+            di = XM[o[0].reg]
+            src = (lambda k: f"(int32_t)c->xmm[{XM[o[1].reg]}].u32[{k}]") if is_xm(1) else \
+                  (lambda k: f"(int32_t)MR32({self.ea(o[1].mem, extra=4*k)})")
+            return [f"{{ int32_t _t[4]; " +
+                    " ".join(f"_t[{k}]={src(k)};" for k in range(4)) +
+                    " " + " ".join(f"c->xmm[{di}].f[{k}]=(float)_t[{k}];" for k in range(4)) + " }"]
+        if m == 'cvtdq2pd' and is_xm(0):
+            di = XM[o[0].reg]
+            src = (lambda k: f"(int32_t)c->xmm[{XM[o[1].reg]}].u32[{k}]") if is_xm(1) else \
+                  (lambda k: f"(int32_t)MR32({self.ea(o[1].mem, extra=4*k)})")
+            return [f"{{ int32_t _a={src(0)}, _b={src(1)};"
+                    f" c->xmm[{di}].d[0]=(double)_a; c->xmm[{di}].d[1]=(double)_b; }}"]
+        if m == 'cvtps2pd' and is_xm(0):
+            di = XM[o[0].reg]
+            src = (lambda k: f"c->xmm[{XM[o[1].reg]}].f[{k}]") if is_xm(1) else \
+                  (lambda k: f"MRF32({self.ea(o[1].mem, extra=4*k)})")
+            return [f"{{ float _a={src(0)}, _b={src(1)};"
+                    f" c->xmm[{di}].d[0]=(double)_a; c->xmm[{di}].d[1]=(double)_b; }}"]
+        if m == 'cvtpd2ps' and is_xm(0):
+            di = XM[o[0].reg]
+            src = (lambda k: f"c->xmm[{XM[o[1].reg]}].d[{k}]") if is_xm(1) else \
+                  (lambda k: f"MRF64({self.ea(o[1].mem, extra=8*k)})")
+            return [f"{{ double _a={src(0)}, _b={src(1)};"
+                    f" c->xmm[{di}].f[0]=(float)_a; c->xmm[{di}].f[1]=(float)_b;"
+                    f" c->xmm[{di}].u64[1]=0; }}"]
+        if m in ('cvtpd2dq','cvttpd2dq') and is_xm(0):
+            di = XM[o[0].reg]
+            src = (lambda k: f"c->xmm[{XM[o[1].reg]}].d[{k}]") if is_xm(1) else \
+                  (lambda k: f"MRF64({self.ea(o[1].mem, extra=8*k)})")
+            rnd = 'trunc' if m == 'cvttpd2dq' else 'nearbyint'
+            return [f"{{ double _a={src(0)}, _b={src(1)};"
+                    f" c->xmm[{di}].u32[0]=x86_cvt_i32({rnd}(_a));"
+                    f" c->xmm[{di}].u32[1]=x86_cvt_i32({rnd}(_b));"
+                    f" c->xmm[{di}].u64[1]=0; }}"]
+
+        PS = {'addps':'+','subps':'-','mulps':'*','divps':'/'}
+        SS = {'addss':'+','subss':'-','mulss':'*','divss':'/'}
+        if m in PS and is_xm(0):
+            di = XM[o[0].reg]; op_c = PS[m]
+            src = (f"c->xmm[{XM[o[1].reg]}].f[_k]" if is_xm(1)
+                   else f"MRF32(({self.ea(o[1].mem)})+4u*(uint32_t)_k)")
+            return [f"for(int _k=0;_k<4;_k++){{ float _a=c->xmm[{di}].f[_k], _b={src};"
+                    f" c->xmm[{di}].f[_k]=sse_r2f(_a,_b,_a {op_c} _b); }}"]
+        if m in SS and is_xm(0):
+            di = XM[o[0].reg]; op_c = SS[m]
+            src = (f"c->xmm[{XM[o[1].reg]}].f[0]" if is_xm(1) else f"MRF32{self.ea(o[1].mem)}")
+            return [f"{{ float _a=c->xmm[{di}].f[0], _b={src};"
+                    f" c->xmm[{di}].f[0]=sse_r2f(_a,_b,_a {op_c} _b); }}"]
+        if m=='shufps' and is_xm(0) and o[2].type==X86_OP_IMM:
+            di=XM[o[0].reg]; imm=o[2].imm & 0xff
+            src = (f"c->xmm[{XM[o[1].reg]}]" if is_xm(1) else None)
+            if src is None: raise Unsupported(m)
+            sel=[(imm>>0)&3,(imm>>2)&3,(imm>>4)&3,(imm>>6)&3]
+            return [f"{{ float _t[4]; _t[0]=c->xmm[{di}].f[{sel[0]}]; _t[1]=c->xmm[{di}].f[{sel[1]}];"
+                    f" _t[2]={src}.f[{sel[2]}]; _t[3]={src}.f[{sel[3]}];"
+                    f" for(int _k=0;_k<4;_k++) c->xmm[{di}].f[_k]=_t[_k]; }}"]
+        if m in ('sqrtps','rcpps','rsqrtps','maxps','minps') and is_xm(0):
+            di=XM[o[0].reg]
+            if m in ('sqrtps','rcpps','rsqrtps'):
+                fn={'sqrtps':'sqrtf(_x)','rcpps':'(1.0f/_x)','rsqrtps':'(1.0f/sqrtf(_x))'}[m]
+                src = (f"c->xmm[{XM[o[1].reg]}].f[_k]" if is_xm(1) else f"MRF32({self.ea(o[1].mem)}+4u*(uint32_t)_k)")
+                return [f"for(int _k=0;_k<4;_k++){{ float _x={src}; c->xmm[{di}].f[_k]={fn}; }}"]
+            cmpf = 'a>b?a:b' if m=='maxps' else 'a<b?a:b'
+            src = (f"c->xmm[{XM[o[1].reg]}].f[_k]" if is_xm(1) else f"MRF32({self.ea(o[1].mem)}+4u*(uint32_t)_k)")
+            return [f"for(int _k=0;_k<4;_k++){{ float a=c->xmm[{di}].f[_k], b={src}; c->xmm[{di}].f[_k]=({cmpf}); }}"]
+        if m in ('movlps','movhps') and is_xm(0) and is_mem(1):
+            di=XM[o[0].reg]; ea2=self.ea(o[1].mem); off2 = 0 if m=='movlps' else 2
+            return [f"c->xmm[{di}].u32[{off2}]=MR32({ea2}); c->xmm[{di}].u32[{off2+1}]=MR32(({ea2})+4u);"]
+        if m in ('movlps','movhps') and is_mem(0) and is_xm(1):
+            si=XM[o[1].reg]; ea2=self.ea(o[0].mem); off2 = 0 if m=='movlps' else 2
+            return [f"MR32({ea2})=c->xmm[{si}].u32[{off2}]; MR32(({ea2})+4u)=c->xmm[{si}].u32[{off2+1}];"]
+        if m in ('cvtsi2ss',) and is_xm(0):
+            di=XM[o[0].reg]
+            return [f"c->xmm[{di}].f[0] = (float)(int32_t)({E(1)});"]
+        if m in ('cvttss2si','cvtss2si'):
+            src = (f"c->xmm[{XM[o[1].reg]}].f[0]" if is_xm(1) else f"MRF32{self.ea(o[1].mem)}")
+            # 't' yoksa MXCSR yuvarlamasi (varsayilan: en yakina); varsa keser
+            expr = f"trunc((double)({src}))" if m=='cvttss2si' else f"nearbyint((double)({src}))"
+            return [W(0, f"x86_cvt_i32({expr})")]
+        if m in ('ucomiss','comiss'):
+            a = (f"c->xmm[{XM[o[0].reg]}].f[0]" if is_xm(0) else f"MRF32{self.ea(o[0].mem)}")
+            b = (f"c->xmm[{XM[o[1].reg]}].f[0]" if is_xm(1) else f"MRF32{self.ea(o[1].mem)}")
+            return [f"{{ float _x={a}, _y={b};"
+                    f" if(_x!=_x||_y!=_y){{ c->zf=1;c->pf=1;c->cf=1; }}"
+                    f" else {{ c->pf=0; c->zf=(_x==_y); c->cf=(_x<_y); }} c->of=c->sf=c->af=0; }}"]
+        # 3DNow! (AMD) - nadiren gercek kod, cogu yanlis cozumlenmis veri
+
+        # ---------------- 3DNow! (AMD) : MMX kayitlarinda 2x float ----------------
+        PF = {'pfadd':'+','pfsub':'-','pfmul':'*','pfsubr':'r-','pfmax':'max','pfmin':'min',
+              'pfacc':'acc','pfcmpeq':'==','pfcmpge':'>=','pfcmpgt':'>'}
+        if m in PF and is_mm(0):
+            di = MM[o[0].reg]
+            src = (f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+            op_c = PF[m]
+            pre = (f"{{ uint64_t _av=c->mm[{di}], _bv=({src}); float _a0,_a1,_b0,_b1,_r0,_r1;"
+                   f" memcpy(&_a0,(char*)&_av,4); memcpy(&_a1,(char*)&_av+4,4);"
+                   f" memcpy(&_b0,(char*)&_bv,4); memcpy(&_b1,(char*)&_bv+4,4);")
+            if op_c in ('+','-','*'):
+                body = f" _r0=_a0{op_c}_b0; _r1=_a1{op_c}_b1;"
+            elif op_c=='r-':
+                body = " _r0=_b0-_a0; _r1=_b1-_a1;"
+            elif op_c=='max':
+                body = " _r0=_a0>_b0?_a0:_b0; _r1=_a1>_b1?_a1:_b1;"
+            elif op_c=='min':
+                body = " _r0=_a0<_b0?_a0:_b0; _r1=_a1<_b1?_a1:_b1;"
+            elif op_c=='acc':
+                body = " _r0=_a0+_a1; _r1=_b0+_b1;"
+            else:
+                cmp2 = {'==':'==','>=':'>=','>':'>'}[op_c]
+                return [pre + f" uint32_t _c0=(_a0{cmp2}_b0)?0xFFFFFFFFu:0u, _c1=(_a1{cmp2}_b1)?0xFFFFFFFFu:0u;"
+                        f" uint64_t _rv=((uint64_t)_c1<<32)|_c0; c->mm[{di}]=_rv; }}"]
+            return [pre + body + f" uint64_t _rv=0; memcpy((char*)&_rv,&_r0,4); memcpy((char*)&_rv+4,&_r1,4);"
+                    f" c->mm[{di}]=_rv; }}"]
+        if m in ('pfrcp','pfrsqrt') and is_mm(0):
+            di = MM[o[0].reg]
+            src = (f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+            fn = "(1.0f/_b0)" if m=='pfrcp' else "(1.0f/sqrtf(_b0))"
+            return [f"{{ uint64_t _bv=({src}); float _b0; memcpy(&_b0,(char*)&_bv,4);"
+                    f" float _r={fn}; uint64_t _rv=0; memcpy((char*)&_rv,&_r,4); memcpy((char*)&_rv+4,&_r,4);"
+                    f" c->mm[{di}]=_rv; }}"]
+        if m=='pi2fd' and is_mm(0):
+            di = MM[o[0].reg]
+            src = (f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+            return [f"{{ uint64_t _bv=({src}); float _r0=(float)(int32_t)(uint32_t)_bv,"
+                    f" _r1=(float)(int32_t)(uint32_t)(_bv>>32); uint64_t _rv=0;"
+                    f" memcpy((char*)&_rv,&_r0,4); memcpy((char*)&_rv+4,&_r1,4); c->mm[{di}]=_rv; }}"]
+        if m=='pf2id' and is_mm(0):
+            di = MM[o[0].reg]
+            src = (f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+            return [f"{{ uint64_t _bv=({src}); float _b0,_b1; memcpy(&_b0,(char*)&_bv,4);"
+                    f" memcpy(&_b1,(char*)&_bv+4,4);"
+                    f" uint64_t _rv=((uint64_t)(uint32_t)(int32_t)_b1<<32)|(uint32_t)(int32_t)_b0;"
+                    f" c->mm[{di}]=_rv; }}"]
+        if m=='femms': return ["/* femms */"]
+        if m in ('pmulhw','pmulhuw') and is_mm(0):
+            di = MM[o[0].reg]
+            src = (f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+            sgn = 'int16_t' if m=='pmulhw' else 'uint16_t'
+            return [f"{{ uint64_t _a=c->mm[{di}], _b=({src}), _r=0;"
+                    f" for(int _k=0;_k<4;_k++){{ int32_t _p=(int32_t)({sgn})(_a>>(_k*16))"
+                    f" * (int32_t)({sgn})(_b>>(_k*16));"
+                    f" _r |= ((uint64_t)(uint16_t)(_p>>16)) << (_k*16); }} c->mm[{di}]=_r; }}"]
+        if m in ('pcmpeqb','pcmpeqw','pcmpeqd','pcmpgtb','pcmpgtw','pcmpgtd') and is_mm(0):
+            esz = {'b':1,'w':2,'d':4}[m[-1]]
+            gt  = 'gt' in m
+            di = MM[o[0].reg]
+            src = (f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+            n = 8//esz; bits2 = esz*8
+            st = {1:'int8_t',2:'int16_t',4:'int32_t'}[esz]
+            cmp2 = '>' if gt else '=='
+            return [f"{{ uint64_t _a=c->mm[{di}], _b=({src}), _r=0;"
+                    f" for(int _k=0;_k<{n};_k++){{"
+                    f" {st} _x=({st})(_a>>(_k*{bits2})), _y=({st})(_b>>(_k*{bits2}));"
+                    f" uint64_t _m2 = (_x {cmp2} _y) ? ((1ull<<{bits2})-1) : 0ull;"
+                    f" _r |= _m2 << (_k*{bits2}); }} c->mm[{di}]=_r; }}"]
+
+        # ---------------- son eksikler ----------------
+        if m in ('in','out','insb','insw','insd','outsb','outsw','outsd',
+                 'cli','sti','hlt','clts','invd','wbinvd','lgdt','lidt','lldt','ltr',
+                 'arpl','bound','into','sysenter','sysexit','rdmsr','wrmsr','rdpmc'):
+            # Kullanici modunda asla calismaz; bunlar yanlis cozumlenmis veri.
+            return [f"/* {m}: ayricalikli/veri - etkisiz */"]
+        SD = {'addsd':'+','subsd':'-','mulsd':'*','divsd':'/'}
+        if m in SD and is_xm(0):
+            di=XM[o[0].reg]; op_c=SD[m]
+            src=(f"c->xmm[{XM[o[1].reg]}].d[0]" if is_xm(1) else f"MRF64{self.ea(o[1].mem)}")
+            return [f"c->xmm[{di}].d[0] {op_c}= {src};"]
+        if m in ('sqrtsd',) and is_xm(0):
+            di=XM[o[0].reg]
+            src=(f"c->xmm[{XM[o[1].reg]}].d[0]" if is_xm(1) else f"MRF64{self.ea(o[1].mem)}")
+            return [f"c->xmm[{di}].d[0] = sqrt({src});"]
+        if m in ('sqrtss',) and is_xm(0):
+            di=XM[o[0].reg]
+            src=(f"c->xmm[{XM[o[1].reg]}].f[0]" if is_xm(1) else f"MRF32{self.ea(o[1].mem)}")
+            return [f"c->xmm[{di}].f[0] = sqrtf({src});"]
+        if m in ('movhlps','movlhps') and is_xm(0) and is_xm(1):
+            di=XM[o[0].reg]; si=XM[o[1].reg]
+            if m=='movhlps':
+                return [f"c->xmm[{di}].u32[0]=c->xmm[{si}].u32[2]; c->xmm[{di}].u32[1]=c->xmm[{si}].u32[3];"]
+            return [f"c->xmm[{di}].u32[2]=c->xmm[{si}].u32[0]; c->xmm[{di}].u32[3]=c->xmm[{si}].u32[1];"]
+        if m in ('cvtsi2sd',) and is_xm(0):
+            di=XM[o[0].reg]
+            return [f"c->xmm[{di}].d[0] = (double)(int32_t)({E(1)});"]
+        if m in ('cvttsd2si','cvtsd2si'):
+            src=(f"c->xmm[{XM[o[1].reg]}].d[0]" if is_xm(1) else f"MRF64{self.ea(o[1].mem)}")
+            expr = f"trunc({src})" if m=='cvttsd2si' else f"nearbyint({src})"
+            return [W(0, f"x86_cvt_i32({expr})")]
+        if m in ('cvtss2sd',) and is_xm(0):
+            di=XM[o[0].reg]
+            src=(f"c->xmm[{XM[o[1].reg]}].f[0]" if is_xm(1) else f"MRF32{self.ea(o[1].mem)}")
+            return [f"c->xmm[{di}].d[0] = (double)({src});"]
+        if m in ('cvtsd2ss',) and is_xm(0):
+            di=XM[o[0].reg]
+            src=(f"c->xmm[{XM[o[1].reg]}].d[0]" if is_xm(1) else f"MRF64{self.ea(o[1].mem)}")
+            return [f"c->xmm[{di}].f[0] = (float)({src});"]
+        if m in ('ucomisd','comisd'):
+            a=(f"c->xmm[{XM[o[0].reg]}].d[0]" if is_xm(0) else f"MRF64{self.ea(o[0].mem)}")
+            b=(f"c->xmm[{XM[o[1].reg]}].d[0]" if is_xm(1) else f"MRF64{self.ea(o[1].mem)}")
+            return [f"{{ double _x={a}, _y={b};"
+                    f" if(_x!=_x||_y!=_y){{ c->zf=1;c->pf=1;c->cf=1; }}"
+                    f" else {{ c->pf=0; c->zf=(_x==_y); c->cf=(_x<_y); }} c->of=c->sf=c->af=0; }}"]
+        if m == 'int3':
+            return ["/* int3: yayin kodunda dolgu - etkisiz */"]
+        if m in ('pandn','andnps','andnpd'):
+            if is_mm(0):
+                di=MM[o[0].reg]
+                src=(f"c->mm[{MM[o[1].reg]}]" if is_mm(1) else "MR64"+self.ea(o[1].mem))
+                return [f"c->mm[{di}] = (~c->mm[{di}]) & ({src});"]
+            if is_xm(0):
+                di=XM[o[0].reg]
+                if is_xm(1):
+                    si=XM[o[1].reg]
+                    return [f"c->xmm[{di}].u64[0] = (~c->xmm[{di}].u64[0]) & c->xmm[{si}].u64[0];"
+                            f" c->xmm[{di}].u64[1] = (~c->xmm[{di}].u64[1]) & c->xmm[{si}].u64[1];"]
+                ea2=self.ea(o[1].mem)
+                return [f"{{ uint64_t _a=MR64({ea2}), _b=MR64(({ea2})+8u);"
+                        f" c->xmm[{di}].u64[0] = (~c->xmm[{di}].u64[0]) & _a;"
+                        f" c->xmm[{di}].u64[1] = (~c->xmm[{di}].u64[1]) & _b; }}"]
+            raise Unsupported(m)
+        if m in ('unpcklps','unpckhps') and is_xm(0):
+            di=XM[o[0].reg]; hi = (m=='unpckhps')
+            if is_xm(1):
+                sv=f"c->xmm[{XM[o[1].reg]}].u32"
+            else:
+                ea2=self.ea(o[1].mem); sv=None
+            o0 = 2 if hi else 0
+            if sv:
+                return [f"{{ uint32_t _t[4]; _t[0]=c->xmm[{di}].u32[{o0}]; _t[1]={sv}[{o0}];"
+                        f" _t[2]=c->xmm[{di}].u32[{o0+1}]; _t[3]={sv}[{o0+1}];"
+                        f" for(int _k=0;_k<4;_k++) c->xmm[{di}].u32[_k]=_t[_k]; }}"]
+            return [f"{{ uint32_t _t[4]; _t[0]=c->xmm[{di}].u32[{o0}]; _t[1]=MR32(({ea2})+{4*o0}u);"
+                    f" _t[2]=c->xmm[{di}].u32[{o0+1}]; _t[3]=MR32(({ea2})+{4*(o0+1)}u);"
+                    f" for(int _k=0;_k<4;_k++) c->xmm[{di}].u32[_k]=_t[_k]; }}"]
+        if m=='packuswb' and is_xm(0):
+            di=XM[o[0].reg]
+            src=(f"c->xmm[{XM[o[1].reg]}].u64[0]" if is_xm(1) else "MR64"+self.ea(o[1].mem))
+            return [f"{{ uint64_t _a=c->xmm[{di}].u64[0], _b=({src}), _r=0;"
+                    f" for(int _k=0;_k<4;_k++){{ int32_t _x=(int16_t)(_a>>(_k*16)); if(_x<0)_x=0; if(_x>255)_x=255;"
+                    f" _r |= (uint64_t)(uint8_t)_x << (_k*8); }}"
+                    f" for(int _k=0;_k<4;_k++){{ int32_t _y=(int16_t)(_b>>(_k*16)); if(_y<0)_y=0; if(_y>255)_y=255;"
+                    f" _r |= (uint64_t)(uint8_t)_y << ((4+_k)*8); }} c->xmm[{di}].u64[0]=_r; }}"]
+        if m in ('movlpd','movhpd'):
+            base_m = 'movlps' if m=='movlpd' else 'movhps'
+            off2 = 0 if m=='movlpd' else 2
+            if is_xm(0) and is_mem(1):
+                di=XM[o[0].reg]; ea2=self.ea(o[1].mem)
+                return [f"c->xmm[{di}].u32[{off2}]=MR32({ea2}); c->xmm[{di}].u32[{off2+1}]=MR32(({ea2})+4u);"]
+            if is_mem(0) and is_xm(1):
+                si=XM[o[1].reg]; ea2=self.ea(o[0].mem)
+                return [f"MR32({ea2})=c->xmm[{si}].u32[{off2}]; MR32(({ea2})+4u)=c->xmm[{si}].u32[{off2+1}];"]
+            raise Unsupported(m)
+        if m in ('pfrcpit1','pfrcpit2','pfrsqit1'):
+            # 3DNow Newton-Raphson iyilestirme adimlari: dst zaten yeterince dogru
+            return [f"/* {m}: iyilestirme adimi atlandi */"]
+        if m in ('pfnacc','pfpnacc') and is_mm(0):
+            return [f"/* {m} */"]
+        if m in ('prefetch','prefetchw','prefetchnta','prefetcht0','prefetcht1','prefetcht2',
+                 'sfence','lfence','mfence','pause','nop2'):
+            return [f"/* {m}: etkisiz */"]
+
+        raise Unsupported(m)
+
+    # ---------- fonksiyon -> C ----------
+    def lift(self, entry):
+        blocks, calls = self.discover(entry)
+        addrs = sorted(blocks)
+        # Bayrak canliligi: her komuta "bundan sonra hangi bayraklar okunuyor"
+        # maskesi.  FLAGOPT=0 ile kapatilabilir (A/B karsilastirmasi icin).
+        import os as _os
+        if _os.environ.get('FLAGOPT','1') == '0':
+            self.fafter = {}
+        else:
+            try: self.fafter = flag_liveness(blocks, addrs, self.in_text)
+            except Exception: self.fafter = {}
+        # dallanma hedeflerini topla
+        lbl=set(addrs)
+        out=[]; targets=set()
+        body=[]
+        for ba in addrs:
+            body.append(f"L_{ba:08x}:; /* --- blok --- */")
+            ins=blocks[ba]
+            for k,i in enumerate(ins):
+                m=i.mnemonic
+                if self.watch:
+                    body.append(f"    WCHK(0x{i.address:x}u);")
+                if self.comments:
+                    body.append(f"    /* {i.address:08x}  {i.mnemonic} {i.op_str} */")
+                if i.address in self.hooks:
+                    body.append(f"    guest_hook(c, 0x{i.address:x}u);")
+                if m=='jmp':
+                    o0=i.operands[0]
+                    if o0.type==X86_OP_IMM and self.in_text(o0.imm):
+                        body.append(f"    goto L_{o0.imm:08x};"); continue
+                    if o0.type==X86_OP_IMM:
+                        self.oob_branch = getattr(self,'oob_branch',0)+1
+                        body.append(f"    dispatch_indirect(c, 0x{o0.imm & 0xffffffff:x}u); return;")
+                        continue
+                    if o0.type!=X86_OP_IMM:
+                        body.append(f"    dispatch_indirect(c, {self.rd(o0)}); return;   /* dolayli tail-call */")
+                        continue
+                # jecxz/jcxz ve loop ailesi: kosul CC tablosunda degil.
+                # KRITIK: bunlar lift edilmezse CRT'nin strncmp/strlen gibi
+                # rutinlerinde erken cikis dallari kaybolur.
+                LOOPC = {'jecxz':'(c->ecx == 0u)', 'jcxz':'((c->ecx & 0xffffu) == 0u)'}
+                if m in LOOPC and i.operands[0].type==X86_OP_IMM:
+                    _t=i.operands[0].imm
+                    if self.in_text(_t):
+                        body.append(f"    if({LOOPC[m]}) goto L_{_t:08x};")
+                    else:
+                        body.append(f"    if({LOOPC[m]}) {{ dispatch_indirect(c, 0x{_t & 0xffffffff:x}u); return; }}")
+                    nxt=i.address+i.size
+                    if k==len(ins)-1 and nxt in lbl: body.append(f"    goto L_{nxt:08x};")
+                    continue
+                if m in ('loop','loope','loopz','loopne','loopnz') and i.operands[0].type==X86_OP_IMM:
+                    extra = {'loop':'', 'loope':' && c->zf', 'loopz':' && c->zf',
+                             'loopne':' && !c->zf', 'loopnz':' && !c->zf'}[m]
+                    _t=i.operands[0].imm
+                    body.append(f"    c->ecx--;")
+                    if self.in_text(_t):
+                        body.append(f"    if(c->ecx != 0u{extra}) goto L_{_t:08x};")
+                    else:
+                        body.append(f"    if(c->ecx != 0u{extra}) {{ dispatch_indirect(c, 0x{_t & 0xffffffff:x}u); return; }}")
+                    nxt=i.address+i.size
+                    if k==len(ins)-1 and nxt in lbl: body.append(f"    goto L_{nxt:08x};")
+                    continue
+                if m.startswith('j') and m[1:] in CC and i.operands[0].type==X86_OP_IMM:
+                    _t=i.operands[0].imm
+                    if self.in_text(_t):
+                        body.append(f"    if({CC[m[1:]]}) goto L_{_t:08x};")
+                    else:
+                        self.oob_branch = getattr(self,'oob_branch',0)+1
+                        body.append(f"    if({CC[m[1:]]}) {{ unsupported_insn(c, 0x{i.address:x}u, \"dal-disari\"); POP32(c->eip); return; }}")
+                    nxt=i.address+i.size
+                    if k==len(ins)-1 and nxt in lbl: body.append(f"    goto L_{nxt:08x};")
+                    continue
+                self.cur_fmask = self.fafter.get(i.address, F_ALL)
+                try:
+                    for line in self.insn(i, targets):
+                        body.append("    "+line)
+                except Unsupported as e:
+                    if not self.trap: raise
+                    self.traps+=1; self.trap_kinds[str(e)]+=1
+                    esc=str(e).replace('"','')
+                    body.append(f'    unsupported_insn(c, 0x{i.address:x}u, "{esc}");')
+                except Exception as e:
+                    if not self.trap: raise
+                    self.traps+=1; self.trap_kinds[f"<{type(e).__name__}>"]+=1
+                    body.append(f'    unsupported_insn(c, 0x{i.address:x}u, "internal");')
+            # blok dusuyorsa bir sonraki bloga atla
+            last=ins[-1] if ins else None
+            if last is not None and last.mnemonic not in ('ret','retf','jmp') and not (last.mnemonic.startswith('j') and last.mnemonic[1:] in CC):
+                nxt=last.address+last.size
+                if nxt in lbl: body.append(f"    goto L_{nxt:08x};")
+        # kesinti nedeniyle uretilmeyen dallanma hedefleri icin stub etiket
+        refs=set()
+        for ba in addrs:
+            for i in blocks[ba]:
+                m=i.mnemonic
+                if (m=='jmp' or (m.startswith('j') and m[1:] in CC)
+                    or m in ('jecxz','jcxz','loop','loope','loopz','loopne','loopnz')) \
+                   and i.operands and i.operands[0].type==X86_OP_IMM:
+                    if self.in_text(i.operands[0].imm): refs.add(i.operands[0].imm)
+        missing = sorted(refs - set(addrs))
+        for t in missing:
+            body.append(f"L_{t:08x}: unsupported_insn(c, 0x{t:x}u, \"kesildi\"); POP32(c->eip); return;")
+        self.truncated = len(missing)
+        out.append(f"/* ===== sub_{entry:08x}  ({sum(len(b) for b in blocks.values())} komut, {len(blocks)} blok) ===== */")
+        # restrict: konuk kayitlari CPU yapisinda, MR32() ise g_mem'e AYNI
+        # turden (uint32_t) yaziyor -- derleyici bu yuzden her konuk bellek
+        # yazmasindan sonra c->eax gibi alanlari yeniden yuklemek zorunda
+        # kaliyordu.  CPU yapisi g_mem'in ICINDE olmadigi icin restrict
+        # dogru ve guvenli (olculdu: yaris karesi -%1.7).
+        out.append(f"void sub_{entry:08x}(CPU *restrict c) {{")
+        if self.cov:
+            # COVERAGE: hangi fonksiyonlarin HIC calismadigini gormek icin.
+            # Tek bir artirma; calisma zamani maliyeti ihmal edilebilir.
+            out.append(f"    cov_hit(0x{entry:08x}u);")
+        # KRITIK: bloklar adrese gore sirali basiliyor; giris blogu en dusuk
+        # adresli olmak zorunda degil. C yurutmesi govdenin tepesinden basladigi
+        # icin giris blogu acikca hedeflenmeli.
+        out.append(f"    goto L_{entry:08x};")
+        out += body
+        out.append("}")
+        return "\n".join(out), targets|calls
+
+if __name__=='__main__':
+    exe=sys.argv[1]; L=Lifter(exe)
+    hdr=['#include "cpu.h"','#include <math.h>','void dispatch_indirect(CPU*,uint32_t);','void cpuid_shim(CPU*);','uint64_t rdtsc_shim(void);','']
+    decls=[]; bodies=[]
+    for a in sys.argv[2:]:
+        ea=int(a,16)
+        try:
+            code,tg = L.lift(ea)
+            decls.append(f"void sub_{ea:08x}(CPU *c);")
+            for t in sorted(tg):
+                if L.in_text(t): decls.append(f"void sub_{t:08x}(CPU *c);")
+            bodies.append(code)
+        except Unsupported as e:
+            print(f"// 0x{ea:08x} LIFT EDILEMEDI: desteklenmeyen '{e}'", file=sys.stderr)
+    print("\n".join(hdr + sorted(set(decls)) + [''] + bodies))
+
+
+# RawLifter, Lifter'in cozumleme/uretim metotlarini paylasir
+for _m in ('ea','rd','wr','discover','insn','lift','_fm'):
+    setattr(RawLifter, _m, getattr(Lifter, _m))

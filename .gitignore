@@ -1,0 +1,24 @@
+# --- Oyunun kendisi ve ondan tureyen her sey: ASLA repoya girmez ---
+# Oyun verisi + SPEED2.EXE (EA'nin telifli icerigi)
+/Need for Speed Underground 2*/
+# Lift edilmis C kaynagi: SPEED2.EXE'nin makine kodunun cevirisi (turev eser).
+# tools/reloc2.py + tools/genall.py + tools/argcount.py ile birebir yeniden uretilir.
+/gen/
+# Derlenmis ikililer, .app paketleri, dagitim zip'i, gomulu oyun verisi
+/out/
+
+# --- Kisisel / oturum kayitlari ---
+/session.jsonl
+/Claude outputs/
+# Ham oturum ekran goruntuleri (secme/ ve rapor/ haric)
+/sunum_ss/*
+!/sunum_ss/secme/
+!/sunum_ss/rapor/
+
+# --- Ortam / gecici ---
+/.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.o
+*.log

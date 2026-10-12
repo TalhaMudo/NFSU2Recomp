@@ -1,0 +1,8 @@
+# Lifter + analiz araclari (tools/*.py)
+# capstone 5.x'e sabit: lifter 5.x'in mnemonik/operand/eflags bicimine gore
+# yazildi; ciktinin birebir yeniden uretimi 5.0.9 ile dogrulandi.
+capstone>=5.0.6,<6
+pefile>=2023.2.7
+
+# Yalnizca tools/mkicon.py (pack.sh'in uygulama simgesi) icin
+Pillow>=10
