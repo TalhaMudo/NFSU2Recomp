@@ -547,11 +547,85 @@ static pthread_cond_t  g_qcond = PTHREAD_COND_INITIALIZER;
  * bosa bekliyordu.  Artik uyandirma aninda. */
 static pthread_cond_t  g_rcond = PTHREAD_COND_INITIALIZER;
 static _Atomic long    g_frames_dropped = 0;
+/* Ana thread'in su an KODLADIGI tampon (-1 = yok).  metal_present zaman
+ * asimina ugrasa bile bu tampona takas YAPAMAZ: ana thread g_dbuf[rb]'yi
+ * kilitsiz geziyor; konuk ayni tampona yeni karenin cizimlerini yazarsa
+ * kare yarim kalir ya da yeni cizimler eski kose verisiyle cizilir. */
+static int g_enc_rb = -1;
+static _Atomic unsigned long g_enc_late = 0;       /* 60 ms dolarken kodlama suruyordu */
+static long g_enc_late_f[8];                       /* ilk birkacinin kare numarasi */
 
 static id<MTLRenderPipelineState> g_pso;
 static id<MTLLibrary>             g_lib;
 static MTLVertexDescriptor       *g_vdesc;
 static id<MTLBuffer>              g_mtlvb;
+/* --- kare basina tampon halkasi ----------------------------------------
+ * g_mtlvb / g_mtlrvb / g_mtlkb eskiden TEK'ti: her karenin kose ve sabit
+ * verisi ayni paylasimli tampona kopyalaniyordu.  [cb commit] GPU'yu
+ * BEKLEMEZ; sonraki karenin memcpy'si GPU onceki karenin kose asamasini
+ * calistirmadan gelirse, o karenin cizimleri (first/rawoff/koff ESKI
+ * yerlesime gore) YENI karenin baytlarini okur.  Karenin sonunda cizilen
+ * ekran-uzayi isler (son islem + HUD) ilk kurban: ekrani kaplayan dev
+ * ucgenler, ustlerinde font atlasi; dunya saglam (kullanici fotograflari,
+ * 2026-10-13).  Olculdu: yarista 9000 karenin 6472'sinde tampon, onceki
+ * kare GPU'da bitmeden eziliyordu; 1046'sinda yerlesim de kaymisti.
+ * Artik her kare GPU'su BITMIS bir takim alir; tamamlanma isleyicisi geri
+ * verir.  Dogruluk takim SAYISINA degil semafora bagli: hepsi ucustaysa
+ * fb_acquire GPU'yu bekler.  Uc takim olcume dayaniyor: yarista 8000 kare,
+ * iki kosu, 0 bekleme (2+ kare ayni anda ucusta: gorunur pencerede 6/9000,
+ * saydam test penceresinde 2292/7600 -- ucuncu takim bunu karsiliyor).
+ * Tek istisna makine uykudayken (kapak kapali, DarkWake): GPU durdugu icin
+ * 7600 karede 3138 bekleme goruldu; o kosularin zamanlamasi gecersiz. */
+#define NFB 3
+static id<MTLBuffer>         g_fb_vb[NFB], g_fb_rvb[NFB], g_fb_kb[NFB];
+static _Atomic int           g_fb_busy[NFB];
+static dispatch_semaphore_t  g_fb_sem;
+static _Atomic unsigned long g_fb_overlap = 0, g_fb_wait = 0;
+static _Atomic unsigned long long g_fb_wait_ns = 0;
+static int fb_acquire(void){
+    if (dispatch_semaphore_wait(g_fb_sem, DISPATCH_TIME_NOW) != 0){
+        struct timespec w0, w1; clock_gettime(CLOCK_MONOTONIC, &w0);
+        atomic_fetch_add(&g_fb_wait, 1ul);          /* hepsi GPU'da: biri bitene kadar bekle */
+        dispatch_semaphore_wait(g_fb_sem, DISPATCH_TIME_FOREVER);
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        atomic_fetch_add(&g_fb_wait_ns, (unsigned long long)(w1.tv_sec - w0.tv_sec) * 1000000000ull
+                         + (unsigned long long)w1.tv_nsec - (unsigned long long)w0.tv_nsec);
+    }
+    int got = 0, any = 0;
+    for (int i = 0; i < NFB; i++){
+        if (!got){ int z = 0;
+            if (atomic_compare_exchange_strong(&g_fb_busy[i], &z, 1)){ got = i + 1; continue; } }
+        if (atomic_load(&g_fb_busy[i])) any = 1;
+    }
+    if (any) atomic_fetch_add(&g_fb_overlap, 1ul);  /* eskiden bu karede tampon ezilirdi */
+    return got - 1;                                 /* semafor en az bir bos takim garanti eder */
+}
+static void fb_release(int i){
+    atomic_store(&g_fb_busy[i], 0);
+    dispatch_semaphore_signal(g_fb_sem);
+}
+/* Takim tamponlari sabit MAXV/MAXRV/MAXKB boyunda DEGIL, karenin ihtiyacina
+ * gore buyur.  Paylasimli tampon GPU'da bir kez kullanildi mi TAMAMI ayak
+ * izine yazilir (olculdu: 3 x 28 MB tamponun yalnizca 64 KB'i doluyken
+ * +85 MB); sabit boyda uc takim 147 MB tutuyordu, oysa CPU kose yolu yarista
+ * kare basina ~400 kose (45 KB) tasiyor.  Takim fb_acquire'dan BOS geldigi
+ * icin eski tampon hicbir komut tamponunda degil; degistirmek guvenli. */
+#define FB_STEP (256u * 1024u)
+static _Atomic unsigned long g_fb_grow = 0;
+static id<MTLBuffer> fb_fit(id<MTLBuffer> b, NSUInteger need, NSUInteger maxlen){
+    if (b && b.length >= need) return b;
+    NSUInteger cap = need + need / 4;               /* pay: her karede yeniden yaratma */
+    cap = (cap + FB_STEP - 1) / FB_STEP * FB_STEP;
+    if (cap < FB_STEP) cap = FB_STEP;
+    if (cap > maxlen) cap = maxlen;
+    id<MTLBuffer> nb = [g_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
+    if (!nb) return b;                              /* fb_put eskisine sigdigi kadar yazar */
+    if (b) atomic_fetch_add(&g_fb_grow, 1ul);
+    return nb;
+}
+static void fb_put(id<MTLBuffer> b, const void *src, NSUInteger n){
+    if (b && n) memcpy([b contents], src, n < b.length ? n : b.length);
+}
 static id<MTLBuffer>              g_blitvb;   /* StretchRect icin tam ekran dortgen */
 static id<MTLSamplerState>        g_samp;
 
@@ -2985,8 +3059,19 @@ void metal_present(void){
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 60L * 1000000L;             /* en fazla 60 ms */
         if (ts.tv_nsec >= 1000000000L){ ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        int late = 0;
         while (g_ready >= 0){
+            /* Sure doldu ama ana thread onceki kareyi hala KODLUYOR: birakma,
+             * bekle.  Takas g_cur'u onun okudugu tampona cevirirdi (bkz.
+             * g_enc_rb).  Kodlama biter bitmez sinyal gelir. */
+            if (late && g_enc_rb >= 0){ pthread_cond_wait(&g_qcond, &g_qlock); continue; }
             if (pthread_cond_timedwait(&g_qcond, &g_qlock, &ts) != 0){
+                if (g_enc_rb >= 0){
+                    if (!late){ late = 1;
+                        unsigned long n = atomic_fetch_add(&g_enc_late, 1ul);
+                        if (n < 8) g_enc_late_f[n] = atomic_load(&g_frames_drawn) + 1; }
+                    continue;
+                }
                 atomic_fetch_add(&g_frames_dropped, 1);
                 break;                             /* takilmayalim */
             }
@@ -3037,8 +3122,13 @@ void metal_early_init(void){
     @autoreleasepool {
         g_vbuf[0] = malloc(sizeof(MVert)*MAXV); g_vbuf[1] = malloc(sizeof(MVert)*MAXV);
         g_dbuf[0] = malloc(sizeof(MDraw)*MAXD); g_dbuf[1] = malloc(sizeof(MDraw)*MAXD);
-        g_mtlvb = [g_dev newBufferWithLength:sizeof(MVert)*MAXV
-                                     options:MTLResourceStorageModeShared];
+        for (int i = 0; i < NFB; i++){           /* bkz. "kare basina tampon halkasi" */
+            g_fb_vb[i]  = fb_fit(nil, 0, sizeof(MVert)*MAXV);
+            g_fb_rvb[i] = fb_fit(nil, 0, MAXRV);
+            g_fb_kb[i]  = fb_fit(nil, 0, MAXKB);
+        }
+        g_fb_sem = dispatch_semaphore_create(NFB);
+        g_mtlvb = g_fb_vb[0]; g_mtlrvb = g_fb_rvb[0]; g_mtlkb = g_fb_kb[0];
         /* StretchRect kopyalari icin sabit tam ekran dortgen. */
         g_blitvb = [g_dev newBufferWithLength:sizeof(MVert)*6
                                       options:MTLResourceStorageModeShared];
@@ -3058,10 +3148,6 @@ void metal_early_init(void){
         }
         g_rvbuf[0] = malloc(MAXRV); g_rvbuf[1] = malloc(MAXRV);
         g_kbuf[0]  = malloc(MAXKB); g_kbuf[1]  = malloc(MAXKB);
-        g_mtlrvb = [g_dev newBufferWithLength:MAXRV
-                                      options:MTLResourceStorageModeShared];
-        g_mtlkb  = [g_dev newBufferWithLength:MAXKB
-                                      options:MTLResourceStorageModeShared];
         NSError *err = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:kShaderSrc options:nil error:&err];
         g_lib = lib;
@@ -3495,7 +3581,15 @@ void metal_run_main_loop(void){
         [g_win setAcceptsMouseMovedEvents:YES];
         /* NOFOCUS=1: arka planda ac, kullanicinin calistigi uygulamadan
          * odagi ALMA (otomatik test/olcum kosulari icin). */
-        if (ENVC("NOFOCUS") && ENVC("NOFOCUS")[0] != '0') [g_win orderBack:nil];
+        if (ENVC("NOFOCUS") && ENVC("NOFOCUS")[0] != '0'){
+            /* NOFOCUS=2: pencere HIC gorunmesin (tam saydam, fareyi yutmaz).
+             * Pencere sunucusu acisindan ekranda kaldigi icin drawable akisi
+             * ve DUMPFRAME aynen calisir; =1'de pencere arkada ama gorunurdu. */
+            if (ENVC("NOFOCUS")[0] == '2'){ [g_win setAlphaValue:0.0];
+                                            [g_win setIgnoresMouseEvents:YES];
+                                            [g_win setHasShadow:NO]; }
+            [g_win orderBack:nil];
+        }
         else { [g_win makeKeyAndOrderFront:nil];
                [NSApp activateIgnoringOtherApps:YES]; }
         if (fs_pref_load()) [g_win toggleFullScreen:nil];
@@ -3752,24 +3846,33 @@ void metal_run_main_loop(void){
                         int ab_count = 0;
                         g_ab_mode = ab_frame(atomic_load(&g_frames_drawn) + 1, &ab_count);
                         int ab_mode = g_ab_mode;
+                        /* GPU'nun hala okuyor olabilecegi tamponun ustune yazma:
+                         * bu kare icin bos bir takim al (kilidi tutmadan bekle). */
+                        int fbi = fb_acquire();
                         pthread_mutex_lock(&g_qlock);
                         int rb = g_ready;
-                        if (rb >= 0 && g_vn[rb])
-                            memcpy([g_mtlvb contents], g_vbuf[rb], sizeof(MVert)*g_vn[rb]);
-                        if (rb >= 0 && g_rvn[rb] && g_mtlrvb)
-                            memcpy([g_mtlrvb contents], g_rvbuf[rb], g_rvn[rb]);
-                        if (rb >= 0 && g_kn[rb] && g_mtlkb)
-                            memcpy([g_mtlkb contents], g_kbuf[rb], g_kn[rb]);
+                        g_enc_rb = rb;
                         /* Kilidi BURADA birak.  Eskiden tum kare kodlamasi
-                         * boyunca (0.4-2 ms) tutuluyordu; metal_draw_raw
-                         * cizim basina ayni kilidi istedigi icin konuk thread
-                         * o pencerede her cizimde blokluyordu -- cift
-                         * tamponlamanin amaci tam da bu ortusmeydi.
-                         * Guvenli: ana thread YALNIZCA rb tamponunu okuyor,
-                         * konuk ise hep digerine (g_cur) yaziyor; metal_present
-                         * g_ready<0 olana kadar takas yapmadigi icin ikisi
-                         * asla ayni tampona dokunmuyor. */
+                         * boyunca (0.4-2 ms), sonra da kose kopyasi boyunca
+                         * tutuluyordu; metal_draw_raw cizim basina ayni kilidi
+                         * istedigi icin konuk thread o pencerede her cizimde
+                         * blokluyordu -- cift tamponlamanin amaci tam da bu
+                         * ortusmeydi.  Guvenli: g_enc_rb kuruldugu andan
+                         * itibaren rb yalnizca ana thread'in; konuk hep
+                         * digerine (g_cur) yaziyor ve metal_present g_enc_rb
+                         * >= 0 iken (zaman asiminda bile) takas yapmiyor. */
                         pthread_mutex_unlock(&g_qlock);
+                        if (rb >= 0){
+                            g_fb_vb[fbi]  = fb_fit(g_fb_vb[fbi],  sizeof(MVert)*(NSUInteger)g_vn[rb], sizeof(MVert)*MAXV);
+                            g_fb_rvb[fbi] = fb_fit(g_fb_rvb[fbi], g_rvn[rb], MAXRV);
+                            g_fb_kb[fbi]  = fb_fit(g_fb_kb[fbi],  g_kn[rb],  MAXKB);
+                        }
+                        g_mtlvb = g_fb_vb[fbi]; g_mtlrvb = g_fb_rvb[fbi]; g_mtlkb = g_fb_kb[fbi];
+                        if (rb >= 0){
+                            fb_put(g_mtlvb,  g_vbuf[rb],  sizeof(MVert)*(NSUInteger)g_vn[rb]);
+                            fb_put(g_mtlrvb, g_rvbuf[rb], g_rvn[rb]);
+                            fb_put(g_mtlkb,  g_kbuf[rb],  g_kn[rb]);
+                        }
 
                         /* Cizimler hedeflerine gore siraya dizili; hedef
                          * degistikce yeni bir render gecisi acilir. */
@@ -4635,7 +4738,7 @@ void metal_run_main_loop(void){
                             [e2 endEncoding];
                         }
                         pthread_mutex_lock(&g_qlock);
-                        g_ready = -1;
+                        g_ready = -1; g_enc_rb = -1;
                         pthread_cond_signal(&g_qcond);
                         pthread_mutex_unlock(&g_qlock);
                         /* TESTFILL: yakalama yolunu dogrulamak icin bilinen
@@ -4689,6 +4792,7 @@ void metal_run_main_loop(void){
                         int in_win = gpuw_in(fno_pre);
                         pp_end(cb);
                         [cb addCompletedHandler:^(id<MTLCommandBuffer> b2){
+                            fb_release(fbi);        /* GPU bitti: takim yeniden kullanilabilir */
                             double g = (b2.GPUEndTime - b2.GPUStartTime) * 1e9;
                             if (g > 0.0 && g < 1e9){
                                 unsigned long long ns = (unsigned long long)g;
@@ -4751,6 +4855,18 @@ void metal_run_main_loop(void){
             }
         }
         fprintf(stderr, "metal: bos kare atlandi = %ld\n", g_skip_empty);
+        fprintf(stderr, "metal: tampon halkasi: %lu karede onceki kare hala GPU'daydi "
+                "(tek tamponla ezilirdi), %lu kez bos takim beklendi (toplam %.1f ms)\n",
+                atomic_load(&g_fb_overlap), atomic_load(&g_fb_wait),
+                (double)atomic_load(&g_fb_wait_ns) / 1e6);
+        { NSUInteger v = 0, r = 0, k = 0;
+          for (int i = 0; i < NFB; i++){ v += g_fb_vb[i].length; r += g_fb_rvb[i].length; k += g_fb_kb[i].length; }
+          fprintf(stderr, "metal: tampon halkasi boyu (%d takim toplami): kose %.1f MB + ham kose %.1f MB + sabit %.1f MB, %lu kez buyudu\n",
+                  NFB, v / 1048576.0, r / 1048576.0, k / 1048576.0, atomic_load(&g_fb_grow)); }
+        { unsigned long n = atomic_load(&g_enc_late);
+          fprintf(stderr, "metal: kodlama 60 ms'yi asti (eskiden kodlanan tampona takas olurdu): %lu kez", n);
+          for (unsigned long q = 0; q < n && q < 8; q++) fprintf(stderr, "%s%ld", q ? "," : "  kareler: ", g_enc_late_f[q]);
+          fprintf(stderr, "\n"); }
         fprintf(stderr, "metal: Reset sonrasi birakilan render hedefi: %lu (sonradan kullanilan: doku %lu, hedef %lu)\n",
                 g_rt_freed, g_freed_use_smp, g_freed_use_tgt);
         fprintf(stderr, "metal: Z yuzeyi: %llu gecis Z'siz, %llu gecis boyut uyumsuz (karalama)\n",
