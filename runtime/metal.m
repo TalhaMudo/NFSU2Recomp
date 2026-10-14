@@ -284,12 +284,19 @@ typedef TVert MVert;   /* kirpma uzayi + iki renk + 4x4 doku koordinati */
 #define PSC_N 32
 typedef struct { unsigned first, count, tex, target, clear_argb, is_clear;
                  unsigned blend; float alpha_ref; unsigned depth;
-                 unsigned tex1, tex2, tex3; int ps; float psc[PSC_N][4];
+                 unsigned tex1, tex2, tex3; int ps;
+                 /* ps sabitleri karenin havuzunda (g_pscb[b][psci]); c0 ayrica
+                  * (HD isin izleme malzemesi yalnizca onu okuyor) */
+                 unsigned psci; float c0[4];
                  int vsid; unsigned rawoff, koff; float proj[4];
                  unsigned smp[4];
                  unsigned is_blit, blit_src; unsigned bcol; unsigned cull;
                  float fogv[4];
-                 unsigned clr_flags; float clr_z; unsigned ksz; } MDraw;
+                 unsigned clr_flags; float clr_z; unsigned ksz;
+                 /* indisli cizim (bkz. KALICI KOSE / INDIS HAVUZU): ix_isz 2/4 ise
+                  * rawoff havuzdaki 0. kosenin ofseti, ix_ib ilk indisin ofseti;
+                  * count indis sayisi.  gh: geometri kimligi (0 = icerikten ozet). */
+                 unsigned ix_isz, ix_ib; int ix_base; unsigned long long gh; } MDraw;
 
 #define MAXV  (256*1024)
 #define MAXD  (16*1024)
@@ -489,6 +496,21 @@ static unsigned g_cur_zid    = 1;       /* 1 = cihazin ortuk Z yuzeyi */
 static unsigned g_cur_tex1 = 0, g_cur_tex2 = 0, g_cur_tex3 = 0;
 static int      g_cur_ps = 0;              /* etkin piksel gölgelendirici */
 static float    g_cur_psc[PSC_N][4];       /* ps sabitleri c0..c(PSC_N-1) */
+/* Kare basina ps sabiti havuzu.  Eskiden her cizim kaydi 32 sabitin tamamini
+ * (512 bayt) tasiyordu: kopya + sifirlama + kodlamada bir kopya ve karsilastirma
+ * daha, cizim basina ~2 KB.  Olculdu: cizimlerin %92'si bir oncekiyle AYNI
+ * sabitleri kullaniyor (oyun en fazla c3 yaziyor).  Artik sabitler yalnizca
+ * degistiginde havuza eklenir, kayit sira numarasini tasir. */
+static float    (*g_pscb[2])[PSC_N][4];
+static unsigned g_pscn[2], g_psc_last[2], g_psc_lastver[2];
+static unsigned g_psc_ver = 1;              /* g_cur_psc her degistiginde artar */
+static unsigned psc_put(int b){              /* g_qlock altinda */
+    if (g_pscn[b] && g_psc_lastver[b] == g_psc_ver) return g_psc_last[b];
+    if (g_pscn[b] >= MAXD) return g_psc_last[b];
+    memcpy(g_pscb[b][g_pscn[b]], g_cur_psc, sizeof g_cur_psc);
+    g_psc_last[b] = g_pscn[b]++; g_psc_lastver[b] = g_psc_ver;
+    return g_psc_last[b];
+}
 /* Asama basina projeksiyon kipi: 0 = yok, 3 = xy/z, 4 = xy/w.
  * D3DTSS_TEXTURETRANSFORMFLAGS | D3DTTFF_PROJECTED. */
 static float    g_cur_proj[4];
@@ -552,6 +574,7 @@ static _Atomic long    g_frames_dropped = 0;
  * kilitsiz geziyor; konuk ayni tampona yeni karenin cizimlerini yazarsa
  * kare yarim kalir ya da yeni cizimler eski kose verisiyle cizilir. */
 static int g_enc_rb = -1;
+static _Atomic unsigned long g_cb_err = 0;         /* GPU'da hatayla biten kare */
 static _Atomic unsigned long g_enc_late = 0;       /* 60 ms dolarken kodlama suruyordu */
 static long g_enc_late_f[8];                       /* ilk birkacinin kare numarasi */
 
@@ -625,6 +648,114 @@ static id<MTLBuffer> fb_fit(id<MTLBuffer> b, NSUInteger need, NSUInteger maxlen)
 }
 static void fb_put(id<MTLBuffer> b, const void *src, NSUInteger n){
     if (b && n) memcpy([b contents], src, n < b.length ? n : b.length);
+}
+/* --- KALICI KOSE / INDIS HAVUZU -------------------------------------------
+ * Oyunun duragan (kilitlenmeyen) kose ve indis tamponlari GPU'da BIR KEZ
+ * yansitilir; indisli cizimler oradan drawIndexedPrimitives ile cizilir.
+ * Eskiden her karede indisler konuk tarafinda acilip (ara dizi), arenaya,
+ * sonra Metal tamponuna kopyalaniyordu: 3 x 2.7 MB/kare, ~1 ms CPU; koseler
+ * x2.1 cogaldigi icin GPU kose asamasi da (4K HD'de gecis suresinin ~%19'u)
+ * iki kat calisiyordu.  Olculdu (2026-10-14): kaynak VB'lerin %99.6'si 120+
+ * karedir kilitlenmemis.
+ * Havuz TEK tampon: HD yakalama cekirdegi tum kayitlari tek baglamayla
+ * okuyabilsin.  Yansilar yalnizca konuk thread'inde kurulur/dusurulur; ana
+ * thread karenin teslim anindaki havuz nesnesini baglar (buyume eskisini
+ * kopyalayip yenisine gecer, ofsetler degismez).  Bosalan bloklar ucustaki
+ * kareler bitsin diye PF_DELAY kare sonra yeniden kullanilir. */
+#define MIR_N     4096u             /* yansi tablosu (acik adresleme, 2^n) */
+#define MIR_TOMB  1u                /* silinmis yuva (konuk adresi asla 1 olmaz) */
+#define PF_N      4096
+#define PF_DELAY  8u                /* kare */
+#define MIR_IDLE  900u              /* bu kadar kare cizilmeyen yansi duser */
+#define POOL_MAX  (768u << 20)
+static id<MTLBuffer> g_pool;        /* guncel havuz (degisimi g_qlock altinda) */
+static id<MTLBuffer> g_pool_fr[2];  /* karenin teslim anindaki havuz */
+static uint32_t g_pool_top = 0;
+static struct { uint32_t key, gen, off, size, imax, used; } g_mir[MIR_N];
+static struct { uint32_t off, size, at; } g_pf[PF_N];
+static int g_pfn = 0;
+static uint32_t g_gframe = 0;       /* konuk kare sayaci (metal_present) */
+static unsigned long g_mir_build = 0, g_mir_drop = 0, g_mir_live = 0, g_mir_full = 0;
+static unsigned long long g_mir_bytes = 0;
+static int pool_reserve(uint32_t top){
+    NSUInteger cap = g_pool ? g_pool.length : 0;
+    if (top <= cap) return 1;
+    NSUInteger nc = cap ? cap : (4u << 20);
+    while (nc < top) nc += nc / 2;
+    if (nc > POOL_MAX) return 0;
+    id<MTLBuffer> nb = [g_dev newBufferWithLength:nc options:MTLResourceStorageModeShared];
+    if (!nb) return 0;
+    if (g_pool && g_pool_top) memcpy([nb contents], [g_pool contents], g_pool_top);
+    pthread_mutex_lock(&g_qlock); g_pool = nb; pthread_mutex_unlock(&g_qlock);
+    return 1;
+}
+static int pool_alloc(uint32_t want, uint32_t *off, uint32_t *size){
+    want = (want + 255u) & ~255u;
+    for (int i = 0; i < g_pfn; i++){
+        if (g_pf[i].size < want || g_gframe - g_pf[i].at < PF_DELAY) continue;
+        *off = g_pf[i].off;
+        if (g_pf[i].size - want >= 4096u){ *size = want; g_pf[i].off += want; g_pf[i].size -= want; }
+        else { *size = g_pf[i].size; g_pf[i] = g_pf[--g_pfn]; }
+        return 1;
+    }
+    if (!pool_reserve(g_pool_top + want)) return 0;
+    *off = g_pool_top; *size = want; g_pool_top += want;
+    return 1;
+}
+static void pool_free(uint32_t off, uint32_t size){
+    if (!size) return;
+    if (g_pfn < PF_N){ g_pf[g_pfn].off = off; g_pf[g_pfn].size = size; g_pf[g_pfn].at = g_gframe; g_pfn++; }
+}
+static void mir_sweep(void){                 /* uzun suredir cizilmeyen yansilari dusur */
+    for (unsigned i = 0; i < MIR_N; i++){
+        if (g_mir[i].key <= MIR_TOMB || g_gframe - g_mir[i].used < MIR_IDLE) continue;
+        pool_free(g_mir[i].off, g_mir[i].size);
+        g_mir[i].key = MIR_TOMB; g_mir_drop++; g_mir_live--;
+    }
+}
+/* Konuk: guest nesnesinin (key) bu uretiminin (gen) havuzdaki ofseti; yoksa
+ * ya da eskiyse simdi kurulur.  isz > 0 ise indis tamponudur ve *imax tum
+ * tampondaki en buyuk indis olur.  0 = kurulamadi (cagiran eski yola duser). */
+int metal_mirror(uint32_t key, uint32_t gen, const void *src, uint32_t size, unsigned isz,
+                 uint32_t *off, uint32_t *imax){
+    if (!g_dev || key <= MIR_TOMB || !size || size > (64u << 20)) return 0;
+    { static uint32_t last = 0; if (g_gframe - last >= 256u){ last = g_gframe; mir_sweep(); } }
+    unsigned h = (key * 2654435761u) & (MIR_N - 1u), slot = MIR_N, q;
+    for (q = 0; q < 64u; q++){
+        unsigned i = (h + q) & (MIR_N - 1u);
+        if (g_mir[i].key == key){ slot = i; break; }
+        if (g_mir[i].key <= MIR_TOMB && slot == MIR_N) slot = i;
+        if (!g_mir[i].key) break;
+    }
+    if (slot == MIR_N){ g_mir_full++; return 0; }
+    if (g_mir[slot].key == key && g_mir[slot].gen == gen && g_mir[slot].size >= size){
+        g_mir[slot].used = g_gframe;
+        *off = g_mir[slot].off; if (imax) *imax = g_mir[slot].imax;
+        return 1;
+    }
+    if (g_mir[slot].key == key){ pool_free(g_mir[slot].off, g_mir[slot].size); g_mir[slot].key = MIR_TOMB; g_mir_live--; }
+    uint32_t o, sz;
+    if (!pool_alloc(size, &o, &sz)) return 0;
+    uint8_t *dst = (uint8_t *)[g_pool contents] + o;
+    memcpy(dst, src, size);
+    uint32_t mx = 0;
+    if (isz == 2u){ const uint16_t *ix = (const uint16_t *)dst; for (uint32_t k = 0; k < size / 2u; k++) if (ix[k] > mx) mx = ix[k]; }
+    else if (isz == 4u){ const uint32_t *ix = (const uint32_t *)dst; for (uint32_t k = 0; k < size / 4u; k++) if (ix[k] > mx) mx = ix[k]; }
+    g_mir[slot].key = key; g_mir[slot].gen = gen; g_mir[slot].off = o; g_mir[slot].size = sz;
+    g_mir[slot].imax = mx; g_mir[slot].used = g_gframe;
+    g_mir_build++; g_mir_live++; g_mir_bytes += size;
+    *off = o; if (imax) *imax = mx;
+    return 1;
+}
+/* Konuk: havuzdaki yansinin CPU gorunumu (indis araligi taramasi icin). */
+const uint8_t *metal_pool_cpu(void){ return g_pool ? (const uint8_t *)[g_pool contents] : NULL; }
+/* Ana thread: cizimin j. kosesinin ham baytlari (HD isin izleme CPU okumalari). */
+static const uint8_t *dr_vtx(int rb, const MDraw *dr, unsigned j, unsigned stride){
+    if (!dr->ix_isz) return g_rvbuf[rb] + dr->rawoff + (size_t)j * stride;
+    const uint8_t *P = (const uint8_t *)[g_pool_fr[rb] contents];
+    uint32_t ix = dr->ix_isz == 4u ? ((const uint32_t *)(P + dr->ix_ib))[j]
+                                   : ((const uint16_t *)(P + dr->ix_ib))[j];
+    return P + dr->rawoff + (size_t)((int64_t)ix + dr->ix_base) * stride;
 }
 static id<MTLBuffer>              g_blitvb;   /* StretchRect icin tam ekran dortgen */
 static id<MTLSamplerState>        g_samp;
@@ -768,7 +899,42 @@ static int hd_is_road(unsigned t){ return t && t < MAXTEX && g_hd_road[t] && g_t
 static int g_hd_msn = -1;
 static id<MTLTexture> g_hd_mscol, g_hd_msdepth_scratch;
 static id<MTLTexture> g_hd_msz[64];
-static id<MTLRenderPipelineState> g_pso_ms;
+/* --- BELLEKSIZ MSAA EKLERI -------------------------------------------------
+ * Cok ornekli renk / G-tamponu / derinlik eskiden hep Private'ti: 4K'da
+ * ~930 MB (renk 133 + G 664 + Z 133).  Oysa olculen her karede TEK bir cok
+ * ornekli ekran gecisi var ve renk/G ornekleri hic bellege yazilmiyor,
+ * yalnizca tek ornekliye cozuluyor (hd_ms_end).  Apple GPU'sunda boyle bir
+ * ek MTLStorageModeMemoryless olabilir: karo bellekte yasar, hic bellek
+ * ayrilmaz.  Kosul: ek YUKLENMEZ (Clear/DontCare) ve SAKLANMAZ.  Gecis
+ * acilirken hd_ms_memless_ok ileriye bakarak karar verir; tutmayacaksa
+ * (bolunmus gecis, ekrana kopya) gecis Private ikizlerle acilir -- onlar
+ * artik yalnizca gerektiginde yaratilir.  Kapanista ongoru tutmadiysa
+ * sayilir ve belleksiz kip kalici olarak kapanir.  HD_MSMEMLESS=0 kapatir. */
+static id<MTLTexture> g_hd_mscol_ml, g_hd_msz_ml;
+static int g_hd_ml_off = 0;                    /* ongoru tutmadi: kalici kapali */
+static _Atomic unsigned long long g_hd_ml_pass, g_hd_ml_miss;
+/* MS derinligin saklanmasi kapanista kararlastirilir (hd_ms_end).  Bir Z'nin
+ * son cok ornekli gecisi saklamadiysa ornekleri kayiptir: temizlemeden
+ * yuklemek isteyen sonraki gecis temizlenerek acilir ve sayilir. */
+static uint8_t g_hd_msz_seen[64], g_hd_msz_kept[64];
+static _Atomic unsigned long long g_hd_mszst, g_hd_mszskip, g_hd_mszlost;
+/* acik cok ornekli ekran gecisi (yalnizca ana thread): dz = MS derinlik bagli
+ * ve saklamasi kapanista secilecek; zclr = derinlik temizlenerek acildi;
+ * res = tek ornekli ikize cozum bagli */
+static struct { int on, ml, dz, zclr, res; unsigned zid; } g_hd_msp;
+/* ekran kopyasini cok ornekli dokuya cizen boru hatti, log2(ornek) basina:
+ * tanim acilista saklanir, sayi degisince (COZUNURLUGE GORE MSAA) kurulur */
+static MTLRenderPipelineDescriptor *g_pso_ms_desc;
+static id<MTLRenderPipelineState>   g_pso_msn[4];
+static int hd_msaa_l2(void);
+static id<MTLRenderPipelineState> hd_pso_ms(void){
+    int l = hd_msaa_l2();
+    if (!l || !g_pso_ms_desc) return nil;
+    if (!g_pso_msn[l]){ NSError *e = nil;
+        g_pso_ms_desc.rasterSampleCount = (NSUInteger)1u << l;
+        g_pso_msn[l] = [g_dev newRenderPipelineStateWithDescriptor:g_pso_ms_desc error:&e]; }
+    return g_pso_msn[l];
+}
 static uint8_t g_hd_zms_used[64];             /* bu karede ekranda kullanildi */
 static uint8_t g_hd_zpend_ms[64];             /* ikizin bekleyen Clear(Z)'si */
 static float   g_hd_zpend_msv[64];
@@ -785,9 +951,30 @@ static int hd_msaa_n(void){
     }
     return g_hd_msn;
 }
+/* --- COZUNURLUGE GORE MSAA -------------------------------------------------
+ * 1440 satir ve ustunde 2x, altinda 4x (kullanici karari 2026-10-14: 1440p ve
+ * Mac'in kendi ekran cozunurlugunde).  Bu piksel yogunlugunda 4x'in kenar
+ * kazanci kucuk; bedeli cok ornekli sahne gecisinin karo bellegi ve cozumu
+ * (4K'da bu gecis GPU suresinin ~%44'u; ne kadari ornek sayisindan, olculmedi).
+ * Her kare ekran boyutuna bakilir;
+ * sayi degisince MS dokular (orneksayisi denetimi) ve boru hatlari (anahtarda
+ * log2(ornek)) kendiliginden yenilenir.  HD_MSAA verilirse sayi sabittir;
+ * HD_MSLAZY=0'da da (oradaki tekil boru hatlari acilista kuruluyor). */
+static int hd_mslazy(void);
+static int hd_msaa_l2(void){ int n = hd_msaa_n(); return n >= 8 ? 3 : n >= 4 ? 2 : n >= 2 ? 1 : 0; }
+static void hd_msaa_frame(NSUInteger w, NSUInteger h){
+    static int aut = -1;
+    if (aut < 0){ const char *e = ENVC("HD_MSAA"); aut = !(e && *e); }
+    if (!aut || hd_msaa_n() <= 1 || !hd_mslazy()) return;
+    int want = (h >= 1400u) ? 2 : 4;
+    if (want == g_hd_msn || ![g_dev supportsTextureSampleCount:(NSUInteger)want]) return;
+    g_hd_msn = want;
+    fprintf(stderr, "[HD] MSAA: %dx (cizim %lux%lu; 1440 satir ve ustu 2x)\n",
+            want, (unsigned long)w, (unsigned long)h);
+}
 static id<MTLTexture> hd_ms_tex(id<MTLTexture> old, MTLPixelFormat pf,
                                 NSUInteger w, NSUInteger h){
-    if (old && old.width == w && old.height == h) return old;
+    if (old && old.width == w && old.height == h && old.sampleCount == (NSUInteger)hd_msaa_n()) return old;
     MTLTextureDescriptor *td = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
     td.textureType = MTLTextureType2DMultisample;
@@ -795,6 +982,23 @@ static id<MTLTexture> hd_ms_tex(id<MTLTexture> old, MTLPixelFormat pf,
     td.usage = MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModePrivate;
     return [g_dev newTextureWithDescriptor:td];
+}
+static id<MTLTexture> hd_ms_tex_ml(id<MTLTexture> old, MTLPixelFormat pf,
+                                   NSUInteger w, NSUInteger h){   /* bkz. BELLEKSIZ MSAA EKLERI */
+    if (old && old.width == w && old.height == h && old.sampleCount == (NSUInteger)hd_msaa_n()) return old;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+    td.textureType = MTLTextureType2DMultisample;
+    td.sampleCount = (NSUInteger)hd_msaa_n();
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModeMemoryless;
+    return [g_dev newTextureWithDescriptor:td];
+}
+static int hd_ml_hw(void){                     /* belleksiz doku destegi + HD_MSMEMLESS */
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("HD_MSMEMLESS");
+        v = !(e && *e == '0') && g_dev && [g_dev supportsFamily:MTLGPUFamilyApple1]; }
+    return v;
 }
 
 /* HD: ana gorunumun kamerasi, KARE basina (guest yazar, ana thread okur).
@@ -823,10 +1027,64 @@ void metal_hd_set_camera(const float *m48, float k, const float *cube9){
  * Ileride R_yeni isin izlemeden gelecek; G-tamponu ve birlestirme ayni.
  * Ortam: HD_SSR=0 kapali, HD_SSR_STEPS=48, HD_SSR_MAXD=120 (metre). */
 static int g_hd_ssr = -1;
-#define HD_NG 3   /* G-tamponu: B+sinif (RGBA16F), R0 (RGBA8), yansima yonu (RGBA16F) */
-static const MTLPixelFormat kHdGFmt[HD_NG] = { MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA8Unorm,
+#define HD_NG 3   /* G-tamponu: uc hedef, bkz. G-TAMPONU PAKETLEME */
+/* --- G-TAMPONU PAKETLEME ---------------------------------------------------
+ * Eski duzen (HD_GPACK=0): B+sinif RGBA16F, R0 RGBA8, yon RGBA16F = 20 bayt.
+ * Paketli (varsayilan) 12 bayt, yine uc hedef ve hepsi MSAA'da cozulebilir:
+ *   G0 RGBA8Unorm   R0.rgb + sinif/4.  Sinif 8 bitte kaldigi icin kenar
+ *                   ortalamalari eskisi gibi ayiklanir (GB_ROAD/GB_CAR).
+ *   G1 RGB10A2Unorm B/4: 0..4 araligi, adim 0.004.  Yolda B = doku alfasi x
+ *                   kose alfasi <= 1 (GRAFIK_ARASTIRMA.md 8); araba boyasininki
+ *                   olculmedi.  4'u asarsa kirpilir: yansima zayiflar, bozulmaz.
+ *   G2 RGB10A2Unorm birim yon, kod = 512 + 511*d (512 = tam sifir).  Dogrusal
+ *                   kodlama cozumde ortalamayi korur: kenarda sifirla
+ *                   ortalanan yon kisalir ama ayni yonu gosterir (sekizyuzlu
+ *                   kodlama bunu bozardi).
+ * Olculdu (2026-10-14, oyunsuz GPU sinamasi: ayni rastgele ornekler iki duzene
+ * 2x ve 4x yazilip donanimla cozuldu, bu makrolarla okundu): sinif kararlari
+ * birebir ayni; B*(R_yeni - R0) farki eski duzene gore en cok 1 LSB (medyan
+ * 0.3); yon farki tekduze pikselde en cok 0.105 derece.
+ * Okuyucular ayni indislerle baglanir (G0 2, G1 3, G2 4); kod cozumu GB_*
+ * makrolarinda (hd_gb_src), yazan vsemu.c ps_to_msl_ex2.  Kazanc: cok
+ * ornekli karo bellegi renk + G ornek basina 24 -> 16 bayt; her karedeki
+ * cozum yazimi, birlestirme okumalari ve tek ornekli G dokulari %40 az
+ * (3024x1964'te 119 -> 71 MB). */
+static int hd_gpack(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("HD_GPACK"); v = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[HD] G-tamponu: %s\n", v ? "paketli (12 bayt/ornek)" : "eski (20 bayt/ornek)"); }
+    return v;
+}
+static MTLPixelFormat hd_gfmt(int gi){
+    static const MTLPixelFormat old[HD_NG] = { MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA8Unorm,
                                                MTLPixelFormatRGBA16Float };
-static id<MTLTexture> g_hd_g[HD_NG], g_hd_gms[HD_NG], g_hd_scenecopy;
+    static const MTLPixelFormat pk[HD_NG]  = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGB10A2Unorm,
+                                               MTLPixelFormatRGB10A2Unorm };
+    return hd_gpack() ? pk[gi] : old[gi];
+}
+/* G-tamponunu okuyan her gölgelendiricinin basina */
+static NSString *kGBDec = @
+"#if GB_PACK\n"
+"#define GB_CLS(g0)    ((g0).a * 4.0)\n"
+"#define GB_R0(g0, g1) ((g0).rgb)\n"
+"#define GB_B(g0, g1)  ((g1).rgb * 4.0)\n"
+"#define GB_DIR(g2)    (((g2).rgb * 1023.0 - 512.0) * (1.0 / 511.0))\n"
+/* 8 bitlik sinifin yuvarlamasi (<= 0.008) sinirdaki ortalamalari icine almasin */
+"#define GB_ROAD(c)    ((c) > 0.51 && (c) < 1.49)\n"
+"#define GB_CAR(c)     ((c) > 1.76 && (c) < 2.24)\n"
+"#else\n"
+"#define GB_CLS(g0)    ((g0).a)\n"
+"#define GB_R0(g0, g1) ((g1).rgb)\n"
+"#define GB_B(g0, g1)  ((g0).rgb)\n"
+"#define GB_DIR(g2)    ((g2).xyz)\n"
+"#define GB_ROAD(c)    ((c) > 0.5 && (c) < 1.5)\n"
+"#define GB_CAR(c)     ((c) > 1.75 && (c) < 2.25)\n"
+"#endif\n";
+static NSString *hd_gb_src(NSString *src){
+    return [[(hd_gpack() ? @"#define GB_PACK 1\n" : @"#define GB_PACK 0\n")
+             stringByAppendingString:kGBDec] stringByAppendingString:src];
+}
+static id<MTLTexture> g_hd_g[HD_NG], g_hd_gms[HD_NG], g_hd_gms_ml[HD_NG], g_hd_scenecopy;
 static id<MTLRenderPipelineState> g_hd_ssr_pso, g_hd_ssr_pso_ms;
 static uint8_t g_hd_vtried[MAXPS];
 static _Atomic unsigned long long g_hd_ssr_n, g_hd_refl_draws;
@@ -913,8 +1171,9 @@ static NSString *kSSRSrc = @
 "  float4 c = scene.read(px);\n"
 "  float4 gb = g1.read(px);\n"
 "  int dbg = int(S.cam.w) - 1;                             /* 0 normal, 1 isabet, 2 yon */\n"
-"  bool road = gb.a > 0.5 && gb.a < 1.5;\n"
-"  bool car  = gb.a > 1.75 && gb.a < 2.25;                 /* kenar ortalamalarini ele */\n"
+"  float cls = GB_CLS(gb);\n"
+"  bool road = GB_ROAD(cls);\n"
+"  bool car  = GB_CAR(cls);                                /* kenar ortalamalarini ele */\n"
 "  if (!road && !car) return dbg > 0 ? float4(c.rgb * 0.25, c.a) : c;\n"
 "  float d = dep.read(px);\n"
 "  if (d >= 1.0) return c;\n"
@@ -925,7 +1184,7 @@ static NSString *kSSRSrc = @
 "  float3 Rd; float maxd = S.prm.w; float lod = 0.0; float dt = 0.25;\n"
 "  if (road) Rd = reflect(V, float3(0.0, 0.0, 1.0));\n"
 "  else {\n"
-"    float3 gd = g3.read(px).xyz;\n"
+"    float3 gd = GB_DIR(g3.read(px));\n"
 "    if (dot(gd, gd) < 1e-6) return c;\n"
 "    Rd = normalize(gd.x * S.cb0.xyz + gd.y * S.cb1.xyz + gd.z * S.cb2.xyz);\n"
 "    if (dbg == 2) return float4(Rd * 0.5 + 0.5, 1.0);\n"
@@ -975,12 +1234,13 @@ static NSString *kSSRSrc = @
 "      break;\n"
 "    }\n"
 "  }\n"
-"  if (dbg == 1) return float4(road ? 0.3 + 0.7 * saturate(length(gb.rgb)) : 0.0, conf,\n"
+"  if (dbg == 1) return float4(road ? 0.3 + 0.7 * saturate(length(GB_B(gb, g2.read(px)))) : 0.0, conf,\n"
 "                              conf > 0.0 ? (road ? 0.0 : 1.0) : 0.6, 1.0);\n"
 "  if (conf <= 0.0) return c;\n"
-"  float3 R0 = g2.read(px).rgb;\n"
+"  float4 gv = g2.read(px);\n"
+"  float3 R0 = GB_R0(gb, gv);\n"
 "  float3 Rn = mix(R0, scene.sample(ls, huv, level(lod)).rgb, conf * S.prm.z);\n"
-"  return float4(c.rgb + gb.rgb * (Rn - R0), c.a);\n"
+"  return float4(c.rgb + GB_B(gb, gv) * (Rn - R0), c.a);\n"
 "}\n";
 /* ===== HD: ISIN IZLEME SURE OLCUMU (HD_RTPROBE=1, DUMPFRAME karesinde) =====
  * Soru: bu makinede sahneyi her karede isin izleme yapisina koyup yansima
@@ -1021,15 +1281,15 @@ static NSString *kRTSrc = @
 "    float4 w = S.ivp * float4(nd, 0.5, 1.0);\n"
 "    r.origin = S.cam.xyz; r.direction = normalize(w.xyz / w.w - S.cam.xyz);\n"
 "  } else {\n"
-"    float4 gb = g1.read(tid);\n"
-"    bool road = gb.a > 0.5 && gb.a < 1.5, car = gb.a > 1.75 && gb.a < 2.25;\n"
+"    float4 gb = g1.read(tid); float cls = GB_CLS(gb);\n"
+"    bool road = GB_ROAD(cls), car = GB_CAR(cls);\n"
 "    float d = dep.read(tid);\n"
 "    if ((!road && !car) || d >= 1.0) { outp.write(float4(0.0), tid); return; }\n"
 "    float4 w = S.ivp * float4(nd, d, 1.0);\n"
 "    float3 P = w.xyz / w.w; float3 V = normalize(P - S.cam.xyz); float3 N = float3(0.0, 0.0, 1.0);\n"
 "    float3 Rd;\n"
 "    if (road) Rd = reflect(V, N);\n"
-"    else { float3 gd = g3.read(tid).xyz;\n"
+"    else { float3 gd = GB_DIR(g3.read(tid));\n"
 "           Rd = normalize(gd.x * S.cb0.xyz + gd.y * S.cb1.xyz + gd.z * S.cb2.xyz); N = normalize(Rd - V); }\n"
 "    r.origin = P + N * 0.05; r.direction = Rd; tag = road ? 0.5 : 1.0;\n"
 "  }\n"
@@ -1088,9 +1348,9 @@ static void hd_rt_probe(int rb, id<MTLTexture> ref, long frame){
             double a = 0; for (int q = 0; q < 4; q++) a += (double)k[(cx + q) * 4 + r] * (double)ivp[q * 4 + c];
             W[r * 4 + c] = a; }
         if (nv + dr->count > cap){ while (nv + dr->count > cap) cap *= 2; V = (float *)realloc(V, cap * 12); }
-        const uint8_t *src = g_rvbuf[rb] + dr->rawoff + (unsigned)g_hd_vsi[dr->vsid].po;
+        unsigned po = (unsigned)g_hd_vsi[dr->vsid].po;
         for (unsigned j = 0; j < dr->count; j++){
-            float p[3]; memcpy(p, src + (size_t)j * stride, 12);
+            float p[3]; memcpy(p, dr_vtx(rb, dr, j, stride) + po, 12);
             double x = p[0]*W[0] + p[1]*W[4] + p[2]*W[8]  + W[12];
             double y = p[0]*W[1] + p[1]*W[5] + p[2]*W[9]  + W[13];
             double z = p[0]*W[2] + p[1]*W[6] + p[2]*W[10] + W[14];
@@ -1150,7 +1410,7 @@ static void hd_rt_probe(int rb, id<MTLTexture> ref, long frame){
     }
     /* --- 3) izleme --- */
     NSError *e = nil;
-    id<MTLLibrary> lib = [g_dev newLibraryWithSource:kRTSrc options:nil error:&e];
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:hd_gb_src(kRTSrc) options:nil error:&e];
     if (!lib){ fprintf(stderr, "[RT] cekirdek derlenemedi: %s\n", [[e localizedDescription] UTF8String]); return; }
     id<MTLComputePipelineState> cps = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"hd_rt_probe"] error:&e];
     if (!cps){ fprintf(stderr, "[RT] hesaplama boru hatti kurulamadi: %s\n", [[e localizedDescription] UTF8String]); return; }
@@ -1225,7 +1485,7 @@ static void hd_rt_probe(int rb, id<MTLTexture> ref, long frame){
 #define RT_SMAXE  8192u              /* sabit malzeme */
 #define RT_MAXREC 8192u
 #define RT_MAXTEX 512u
-typedef struct { uint32_t rawoff, koff, first, mat; } HDRecC;
+typedef struct { uint32_t rawoff, koff, first, mat, ib; int32_t base; uint32_t isz, pad; } HDRecC;
 typedef struct { uint32_t tex0, tex1, tex2, flags; float c0[4]; float fogc[4]; float prm[4]; float lw[16]; } HDMatC;
 static int g_rt = -1;
 static id<MTLComputePipelineState> g_hd_vsk[HD_MAXVSI];
@@ -1285,9 +1545,9 @@ static NSString *kRTFSrc = @
 "  uint sc = uint(max(S.cb0.w, 1.0));\n"
 "  uint2 px = tid * sc;\n"
 "  if (px.x >= uint(S.sz.x) || px.y >= uint(S.sz.y)) return;\n"
-"  float4 gb = g1.read(px);\n"
-"  bool road = gb.a > 0.5 && gb.a < 1.5;\n"
-"  bool car  = gb.a > 1.75 && gb.a < 2.25;\n"
+"  float4 gb = g1.read(px); float cls = GB_CLS(gb);\n"
+"  bool road = GB_ROAD(cls);\n"
+"  bool car  = GB_CAR(cls);\n"
 "  float d = dep.read(px);\n"
 "  if ((!road && !car) || d >= 1.0) { outp.write(float4(0.0), tid); return; }\n"
 "  float2 uv = (float2(px) + 0.5) / S.sz.xy;\n"
@@ -1297,7 +1557,7 @@ static NSString *kRTFSrc = @
 "  float3 Rd, N = float3(0.0, 0.0, 1.0);\n"
 "  if (road) { Rd = reflect(V, N); if (Rd.z <= 0.0) { outp.write(float4(0.0), tid); return; } }\n"
 "  else {\n"
-"    float3 gd = g3.read(px).xyz;\n"
+"    float3 gd = GB_DIR(g3.read(px));\n"
 "    if (dot(gd, gd) < 1e-6) { outp.write(float4(0.0), tid); return; }\n"
 "    Rd = normalize(gd.x * S.cb0.xyz + gd.y * S.cb1.xyz + gd.z * S.cb2.xyz);\n"
 "    N = normalize(Rd - V);\n"
@@ -1399,8 +1659,9 @@ static NSString *kRTFSrc = @
 "  float4 c = scene.read(px);\n"
 "  float4 gb = g1.read(px);\n"
 "  int dbg = int(S.cam.w) - 1;\n"
-"  bool road = gb.a > 0.5 && gb.a < 1.5;\n"
-"  bool car  = gb.a > 1.75 && gb.a < 2.25;\n"
+"  float cls = GB_CLS(gb);\n"
+"  bool road = GB_ROAD(cls);\n"
+"  bool car  = GB_CAR(cls);\n"
 "  if (!road && !car) return dbg > 0 ? float4(c.rgb * 0.25, c.a) : c;\n"
 "  float4 r;\n"
 "  uint sc = uint(max(S.cb0.w, 1.0));\n"
@@ -1413,7 +1674,7 @@ static NSString *kRTFSrc = @
 "    for (uint j = 0u; j < 4u; j++) {\n"
 "      uint2 o = uint2(j & 1u, j >> 1u); uint2 q = min(b0 + o, lim); uint2 qf = min(q * sc, fl);\n"
 "      float zq = S.prm.y / (dep.read(qf) - S.prm.x);\n"
-"      float same = abs(g1.read(qf).a - gb.a) < 0.3 ? 1.0 : 0.0;\n"
+"      float same = abs(GB_CLS(g1.read(qf)) - cls) < 0.3 ? 1.0 : 0.0;\n"
 "      float w = (o.x == 1u ? fr.x : 1.0 - fr.x) * (o.y == 1u ? fr.y : 1.0 - fr.y);\n"
 "      w = (w + 0.02) * same / (1.0 + 60.0 * abs(zq - zc) / max(zc, 0.5));\n"
 "      acc += rt.read(q) * w; ws += w; }\n"
@@ -1422,14 +1683,15 @@ static NSString *kRTFSrc = @
 "  if (dbg == 4) return float4(r.a > 0.0 ? r.rgb : float3(0.0, 0.0, 0.35), 1.0);\n"
 "  if (dbg == 1) return float4(road ? 0.5 : 0.0, r.a, r.a > 0.0 ? (road ? 0.0 : 1.0) : 0.6, 1.0);\n"
 "  if (r.a <= 0.0) return c;\n"
-"  float3 R0 = g2.read(px).rgb;\n"
+"  float4 gv = g2.read(px);\n"
+"  float3 R0 = GB_R0(gb, gv);\n"
 "  float3 Rn = mix(R0, r.rgb, r.a * S.prm.z);\n"
-"  return float4(c.rgb + gb.rgb * (Rn - R0), c.a);\n"
+"  return float4(c.rgb + GB_B(gb, gv) * (Rn - R0), c.a);\n"
 "}\n";
 static void hd_rt_init(void){
     if (!hd_rt_on() || g_rt_pso) return;
     NSError *e = nil;
-    id<MTLLibrary> lib = [g_dev newLibraryWithSource:kRTFSrc options:nil error:&e];
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:hd_gb_src(kRTFSrc) options:nil error:&e];
     if (!lib){ fprintf(stderr, "[HD] RT gölgelendiricisi derlenemedi: %s\n", [[e localizedDescription] UTF8String]); g_rt = 0; return; }
     id<MTLFunction> ff = [lib newFunctionWithName:@"hd_rtc_frag"];
     id<MTLFunction> kf = [lib newFunctionWithName:@"hd_rt_kern"];
@@ -1604,7 +1866,7 @@ static inline void rt_mat_of(const MDraw *dr, HDMatC *m){
     m->tex0 = dr->tex; m->tex1 = dr->tex1; m->tex2 = dr->tex2;        /* doku KIMLIKLERI */
     m->flags = (dr->alpha_ref > 0.f ? 1u : 0u) | (cube ? 2u : 0u) | ((b == 4 || b == 6) ? 4u : 0u)
              | ((((unsigned)(int)dr->proj[1] >> 4) & 3u) << 8) | ((((unsigned)(int)dr->proj[2] >> 4) & 3u) << 10);
-    memcpy(m->c0, dr->psc[0], 16); memcpy(m->fogc, dr->fogv, 16);
+    memcpy(m->c0, dr->c0, 16); memcpy(m->fogc, dr->fogv, 16);
     m->prm[0] = dr->alpha_ref;
 }
 /* Sabit girdinin malzemesini o anki cizimden yenile (sis rengi vb. guncel
@@ -1769,7 +2031,8 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
                 for (int c = 0; c < 3; c++)
                     W[r * 3 + c] = (float)(vx * iv[c] + vy * iv[4 + c] + vz * iv[8 + c] + (r == 3 ? (double)iv[12 + c] : 0.0));
             }
-            uint64_t gh = rt_rawhash(g_rvbuf[rb] + dr->rawoff, n * stride, n, stride);
+            /* indisli cizimde kimlik (VB/IB + uretim + aralik) konuk tarafinda hesaplandi */
+            uint64_t gh = dr->gh ? dr->gh : rt_rawhash(g_rvbuf[rb] + dr->rawoff, n * stride, n, stride);
             /* rk'de VS kimligi YOK: ayni parcanin far isigi alan ve almayan cizimi
              * (farkli VS, ayni konumlar) tek girdidir */
             uint64_t rk = (gh ^ ((uint64_t)dr->tex << 12)) * 0xD6E8FEB86659FD93ull;
@@ -1788,9 +2051,9 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
                     g_rt_scur + n <= RT_SMAXV - 30000u && (g_rt_mfree_n || g_rt_smn < RT_SMAXE - 64u)){
                     npromo++;
                     /* TERFI: sinir kuresi ham konumlardan */
-                    const uint8_t *src = g_rvbuf[rb] + dr->rawoff + (unsigned)(g_hd_vsi[dr->vsid].po < 0 ? 0 : g_hd_vsi[dr->vsid].po);
+                    unsigned po = (unsigned)(g_hd_vsi[dr->vsid].po < 0 ? 0 : g_hd_vsi[dr->vsid].po);
                     float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
-                    for (unsigned j = 0; j < n; j++){ float pv[3]; memcpy(pv, src + (size_t)j * stride, 12);
+                    for (unsigned j = 0; j < n; j++){ float pv[3]; memcpy(pv, dr_vtx(rb, dr, j, stride) + po, 12);
                         for (int a3 = 0; a3 < 3; a3++){ if (pv[a3] < mn[a3]) mn[a3] = pv[a3]; if (pv[a3] > mx[a3]) mx[a3] = pv[a3]; } }
                     float lc[3] = { 0.5f*(mn[0]+mx[0]), 0.5f*(mn[1]+mx[1]), 0.5f*(mn[2]+mx[2]) };
                     float hx = 0.5f*(mx[0]-mn[0]), hy = 0.5f*(mx[1]-mn[1]), hz = 0.5f*(mx[2]-mn[2]);
@@ -1844,6 +2107,7 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         *dm = m;
         dm->tex0 = hd_rt_slot(m.tex0, &nt); dm->tex1 = hd_rt_slot(m.tex1, &nt); dm->tex2 = hd_rt_slot(m.tex2, &nt);
         rec[ri].rawoff = dr->rawoff; rec[ri].koff = dr->koff; rec[ri].first = f; rec[ri].mat = midx;
+        rec[ri].ib = dr->ix_ib; rec[ri].base = dr->ix_base; rec[ri].isz = dr->ix_isz; rec[ri].pad = 0;
         for (unsigned q = 0; q < n; q++) item[f + q] = ri;
         ri++;
     }
@@ -1933,6 +2197,7 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         [ce setBuffer:g_rt_rec[ring] offset:0 atIndex:4];
         [ce setBuffer:g_rt_pos offset:0 atIndex:5];
         [ce setBuffer:g_rt_attr offset:0 atIndex:6];
+        [ce setBuffer:(g_pool_fr[rb] ? g_pool_fr[rb] : g_mtlrvb) offset:0 atIndex:8];   /* indisli kayitlar */
         for (int g = 1; g < HD_MAXVSI; g++){
             if (!cnt[g]) continue;
             struct { float invV[16]; float prm[4]; uint32_t first, count, p0, p1; } C;
@@ -2139,13 +2404,37 @@ static unsigned hd_ms_predict(int rb, unsigned i){
     }
     return 1u;                                                            /* kare sonu: sunum */
 }
+/* Bu cok ornekli ekran gecisi BELLEKSIZ eklerle acilabilir mi (yuklemeyi
+ * cagiran denetler)?  Gecis bittikten sonra, ekran okunmadan (birlestirme /
+ * son islem kopyasi) once ayni karede baska bir ekran gecisi ya da ekrana
+ * kopya yoksa hicbir ornegin saklanmasi gerekmez.  Govde tespiti
+ * hd_ms_predict ile ayni; kodlama dongusu de gecisi ayni yerlerde kapatir. */
+static int hd_ms_memless_ok(int rb, unsigned i){
+    unsigned n = g_dn[rb], zid = DEPTH_ZID(g_dbuf[rb][i].depth), j = i + 1;
+    for (; j < n; j++){ const MDraw *x = &g_dbuf[rb][j];                 /* gecisin sonu */
+        if (x->is_blit || x->target || DEPTH_ZID(x->depth) != zid) break;
+        if (x->is_clear && (x->clr_flags & 2u) && zid) break; }
+    for (; j < n; j++){ const MDraw *x = &g_dbuf[rb][j];
+        if (x->is_blit){
+            if (!x->blit_src) return 1;                                   /* ekran okunuyor: sonrasi tek ornekli */
+            if (!x->target) return 0;                                     /* ekrana kopya: MS renge saklanir */
+            continue; }
+        if (!x->target) return 0;                                         /* baska bir ekran gecisi: yukler */
+    }
+    return 1;                                                             /* kare sonu: yalnizca cozum */
+}
+static int hd_ms_memless(void){ return hd_ml_hw() && !g_hd_ml_off && hd_mslazy(); }
+static int hd_mszstore_all(void){              /* HD_MSZSTORE=1: MS derinlik hep saklanir (eski) */
+    static int v = -1; if (v < 0){ const char *e = ENVC("HD_MSZSTORE"); v = (e && *e == '1'); }
+    return v;
+}
 /* Gecis KAPANIRKEN: ornekler saklanmali mi?  Donus: acilista cozme baglanmadigi
  * halde cozum gerektiyse (tahmin tutmadi) bit0 renk / bit1 G: cagiran
  * hd_ms_fallback ile ayri bir cozme gecisi kodlar (sayaci raporda; 0 olmali). */
 static _Atomic unsigned long long g_hd_msfb;
 static int hd_ms_end(id<MTLRenderCommandEncoder> enc, int rb, unsigned k, int c_ms, int c_gb, unsigned att){
-    if (!c_ms || !hd_mslazy()) return 0;
-    unsigned n = g_dn[rb]; int store = 0, res = 0, reader = 0, pend = 0;
+    if (!c_ms || !hd_mslazy()){ g_hd_msp.on = 0; return 0; }
+    unsigned n = g_dn[rb], k0 = k; int store = 0, res = 0, reader = 0, pend = 0;
     for (; k < n; k++){ const MDraw *x = &g_dbuf[rb][k];
         if (x->is_blit){
             if (!x->blit_src){ res = 1; reader = 1; break; }
@@ -2154,6 +2443,17 @@ static int hd_ms_end(id<MTLRenderCommandEncoder> enc, int rb, unsigned k, int c_
         if (!x->target){ store = 1; break; }
     }
     if (k >= n) res = 1;
+    if (g_hd_msp.on && g_hd_msp.ml){
+        /* Belleksiz gecis: eylemler acilista kesinlesti (yalnizca cozum ya da
+         * DontCare; set*StoreAction yalnizca Unknown ile acilan gecise
+         * cagrilabilir).  Burada yalnizca ongorunun tuttugu denetlenir:
+         * tutmadiysa bu karede ornekler kaybolur (sonraki gecis temizlenmis
+         * acar), belleksiz kip kalici olarak kapanir. */
+        if (store || !(att & 1u) || (reader && c_gb && !(att & 2u))){
+            atomic_fetch_add(&g_hd_ml_miss, 1ull); g_hd_ml_off = 1; }
+        g_hd_msp.on = 0;
+        return 0;
+    }
     if (att & 1u) [enc setColorStoreAction:store ? MTLStoreActionStoreAndMultisampleResolve
                                                  : MTLStoreActionMultisampleResolve atIndex:0];
     else { [enc setColorStoreAction:(store || res) ? MTLStoreActionStore : MTLStoreActionDontCare atIndex:0];
@@ -2164,6 +2464,30 @@ static int hd_ms_end(id<MTLRenderCommandEncoder> enc, int rb, unsigned k, int c_
         else { g = (store || reader) ? MTLStoreActionStore : MTLStoreActionDontCare; if (reader) pend |= 2; }
         for (int gi = 0; gi < HD_NG; gi++) [enc setColorStoreAction:g atIndex:(NSUInteger)(1 + gi)];
     }
+    /* MS DERINLIK: eskiden kosulsuz Store -- 4K'da kare basina 133 MB bellek
+     * yazimi (~95 fps'te ~12 GB/s).  Bu ornekleri yalnizca ayni Z ile acilan
+     * sonraki bir cok ornekli ekran gecisi yukler; olculen karelerde boyle
+     * gecis yok ve oyun Z'yi her kare temizliyor.  Simdi: ayni karede yeniden
+     * kullanim varsa sakla; temizleniyorsa ya da ekran okundu / kare bitti
+     * ise saklama -- ancak gecis temizlemeden (yukleyerek) acildiysa oyun
+     * kaliciliga guveniyor demektir, sakla. */
+    if (g_hd_msp.on && g_hd_msp.dz){
+        unsigned zid = g_hd_msp.zid; int sd = -1;
+        for (unsigned q = k0; q < n && sd < 0; q++){ const MDraw *x = &g_dbuf[rb][q];
+            if (x->is_blit){ if (!x->blit_src) break; continue; }        /* ekran okundu: sonrasi tek ornekli */
+            if (DEPTH_ZID(x->depth) != zid) continue;
+            if (x->is_clear && (x->clr_flags & 2u)) sd = 0;               /* yeniden kullanimdan once temizleniyor */
+            else if (!x->target) sd = 1;                                  /* ayni Z ile yeni MS gecisi yukler */
+        }
+        if (sd < 0) sd = !g_hd_msp.zclr;
+        if (hd_mszstore_all()) sd = 1;
+        [enc setDepthStoreAction:g_hd_msp.res ? (sd ? MTLStoreActionStoreAndMultisampleResolve
+                                                    : MTLStoreActionMultisampleResolve)
+                                              : (sd ? MTLStoreActionStore : MTLStoreActionDontCare)];
+        if (zid < 64u) g_hd_msz_kept[zid] = (uint8_t)sd;
+        atomic_fetch_add(sd ? &g_hd_mszst : &g_hd_mszskip, 1ull);
+    }
+    g_hd_msp.on = 0;
     return pend;
 }
 static void hd_ms_fallback(id<MTLCommandBuffer> cb, id<MTLTexture> scr, int pend){
@@ -2426,11 +2750,11 @@ static NSString *kPrelude = @
 "struct PSPar { float aref; float usec; float pad0; float pad1;\n"
 "               float4 proj; float4 c[32]; float4 fog; };\n"
 #if NFS_ENHANCED
-/* HD: renk + G-tamponu (c1 = yansima agirligi B, sinif; c2 = orijinal R0) */
+/* HD: renk + G-tamponu (c1..c3 = G0..G2; icerik: bkz. G-TAMPONU PAKETLEME) */
 "struct PSOut { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]];\n"
 "               float4 c3 [[color(3)]]; };\n"
 /* isin izleme yakalamasi (vsemu.c vsk_N ile metal.m HDRecC/HDMatC ayni olmali) */
-"struct HDRec { uint rawoff; uint koff; uint first; uint mat; };\n"
+"struct HDRec { uint rawoff; uint koff; uint first; uint mat; uint ib; int base; uint isz; uint pad; };\n"
 "struct HDAttr { float4 col0; float4 uv1; float4 uv2; float2 uv0; float fog; float pad; };\n"
 "struct HDCap { float4x4 invV; float4 prm; uint first; uint count; uint p0; uint p1; };\n"
 #endif
@@ -2511,7 +2835,8 @@ void metal_draw_tv(const TVert *src, unsigned nverts, unsigned prim, unsigned te
         { unsigned tx4[4] = { tex, g_cur_tex1, g_cur_tex2, g_cur_tex3 };
           g_dbuf[b][g_dn[b]].ps = hd_refl_ps(g_dbuf[b][g_dn[b]].ps, g_cur_target, tx4); }
 #endif
-        memcpy(g_dbuf[b][g_dn[b]].psc, g_cur_psc, sizeof g_cur_psc);
+        g_dbuf[b][g_dn[b]].psci = psc_put(b);
+        memcpy(g_dbuf[b][g_dn[b]].c0, g_cur_psc[0], sizeof g_cur_psc[0]);
         g_dbuf[b][g_dn[b]].alpha_ref = g_cur_aref;
         memcpy(g_dbuf[b][g_dn[b]].fogv, g_cur_fog, sizeof g_cur_fog);
         memcpy(g_dbuf[b][g_dn[b]].proj, g_cur_proj, sizeof g_cur_proj);
@@ -2771,7 +3096,8 @@ void metal_set_stage_tex(unsigned t1, unsigned t2, unsigned t3){
 /* Guest'in etkin piksel gölgelendiricisi ve sabitleri. */
 void metal_set_ps(int psid, const float *c32){
     g_cur_ps = psid;
-    if (c32) memcpy(g_cur_psc, c32, sizeof g_cur_psc);
+    if (c32 && memcmp(g_cur_psc, c32, sizeof g_cur_psc)){
+        memcpy(g_cur_psc, c32, sizeof g_cur_psc); g_psc_ver++; }
 }
 void metal_set_texproj(const float p4[4]){ memcpy(g_cur_proj, p4, sizeof g_cur_proj); }
 /* --- GPU kose gölgelendiricileri ---------------------------------------
@@ -2815,22 +3141,12 @@ int metal_vs_ready(int vsid){
 
 /* Ham koseleri (donusturulmemis) + sabitleri kuyruga koy; kose islemini
  * GPU yapar.  kdata = c0..c[nk-1], nk = vs_kmax. */
-int metal_draw_raw(const void *src, unsigned nverts, unsigned stride,
-                   unsigned prim, unsigned tex, int vsid,
-                   const float *kdata, unsigned nk){
-    if (!g_rvbuf[0] || nverts < 3 || !stride || stride > 256u) return 0;
-    unsigned tris = (prim == 4) ? nverts/3 : nverts - 2;
-    if (!tris) return 0;
-    const uint8_t *S = (const uint8_t *)src;
-    unsigned need = tris * 3u * stride;
-    unsigned ksz  = 16u + nk * 16u;
-
-    pthread_mutex_lock(&g_qlock);
-    int b = g_cur;
-    unsigned roff = (g_rvn[b] + 255u) & ~255u;
-    if (roff + need > MAXRV){ g_ov_rv++; pthread_mutex_unlock(&g_qlock); return 0; }
-    if (g_dn[b] >= MAXD){ pthread_mutex_unlock(&g_qlock); return 0; }
-
+/* g_qlock altinda: sabit blogunu yerlestir (tekrarliysa yeniden kullan) ve
+ * cizim kaydini doldur.  Kose kaynagini (rawoff / indis alanlari, count)
+ * cagiran kurar ve g_dn'yi arttirir.  NULL = sabit arenasi doldu. */
+static MDraw *raw_rec(int b, unsigned stride, unsigned tex, int vsid,
+                      const float *kdata, unsigned nk){
+    unsigned ksz = 16u + nk * 16u;
     /* Sabit blogu tekrarlaniyorsa yeniden yukleme: oyun ayni nesnenin
      * parcalarini pes pese ciziyor, blok cogunlukla ayni. */
     static unsigned last_koff[2], last_ksz[2]; static int last_vs[2];
@@ -2848,12 +3164,47 @@ int metal_draw_raw(const void *src, unsigned nverts, unsigned stride,
         koff = last_koff[b];
     } else {
         koff = (g_kn[b] + 255u) & ~255u;
-        if (koff + ksz > MAXKB){ g_ov_kb++; pthread_mutex_unlock(&g_qlock); return 0; }
+        if (koff + ksz > MAXKB){ g_ov_kb++; return NULL; }
         memcpy(g_kbuf[b] + koff, hdr, 16);
         memcpy(g_kbuf[b] + koff + 16, kdata, nk * 16u);
         g_kn[b] = koff + ksz;
         last_koff[b] = koff; last_ksz[b] = ksz; last_vs[b] = vsid;
     }
+    MDraw *D = &g_dbuf[b][g_dn[b]];
+    memset(D, 0, sizeof *D);          /* yeniden kullanilan yuva: bkz. metal_draw_tv */
+    D->tex = tex; D->target = g_cur_target;
+    memcpy(D->smp, g_cur_smp, sizeof D->smp);
+    D->blend = g_cur_blend; D->depth = g_cur_depth; D->alpha_ref = g_cur_aref;
+    D->bcol  = g_cur_bcol; D->cull = g_cur_cull;
+    memcpy(D->fogv, g_cur_fog, sizeof D->fogv);
+    D->tex1 = g_cur_tex1; D->tex2 = g_cur_tex2; D->tex3 = g_cur_tex3;
+    D->ps = (g_cur_ps > 0 && g_cur_ps < PSCUBE && metal_tex_is_cube(tex))
+              ? g_cur_ps + PSCUBE : g_cur_ps;
+#if NFS_ENHANCED
+    { unsigned tx4[4] = { tex, g_cur_tex1, g_cur_tex2, g_cur_tex3 };
+      D->ps = hd_refl_ps(D->ps, g_cur_target, tx4); }
+#endif
+    D->psci = psc_put(b); memcpy(D->c0, g_cur_psc[0], sizeof D->c0);
+    memcpy(D->proj, g_cur_proj, sizeof D->proj);
+    D->vsid = vsid; D->koff = koff; D->ksz = ksz;
+    return D;
+}
+int metal_draw_raw(const void *src, unsigned nverts, unsigned stride,
+                   unsigned prim, unsigned tex, int vsid,
+                   const float *kdata, unsigned nk){
+    if (!g_rvbuf[0] || nverts < 3 || !stride || stride > 256u) return 0;
+    unsigned tris = (prim == 4) ? nverts/3 : nverts - 2;
+    if (!tris) return 0;
+    const uint8_t *S = (const uint8_t *)src;
+    unsigned need = tris * 3u * stride;
+
+    pthread_mutex_lock(&g_qlock);
+    int b = g_cur;
+    unsigned roff = (g_rvn[b] + 255u) & ~255u;
+    if (roff + need > MAXRV){ g_ov_rv++; pthread_mutex_unlock(&g_qlock); return 0; }
+    if (g_dn[b] >= MAXD){ pthread_mutex_unlock(&g_qlock); return 0; }
+    MDraw *D = raw_rec(b, stride, tex, vsid, kdata, nk);
+    if (!D){ pthread_mutex_unlock(&g_qlock); return 0; }
 
     uint8_t *dst = g_rvbuf[b] + roff;
     /* UCGEN LISTESI: kaynak zaten bitisik, tek blok kopya yeter.
@@ -2878,25 +3229,24 @@ int metal_draw_raw(const void *src, unsigned nverts, unsigned stride,
         }
     }
     g_rvn[b] = roff + need;
-
-    MDraw *D = &g_dbuf[b][g_dn[b]];
-    memset(D, 0, sizeof *D);          /* yeniden kullanilan yuva: bkz. metal_draw_tv */
-    D->first = 0; D->count = tris*3; D->tex = tex; D->target = g_cur_target;
-    D->clear_argb = 0; D->is_clear = 0;
-    memcpy(D->smp, g_cur_smp, sizeof D->smp);
-    D->blend = g_cur_blend; D->depth = g_cur_depth; D->alpha_ref = g_cur_aref;
-    D->bcol  = g_cur_bcol; D->cull = g_cur_cull;
-    memcpy(D->fogv, g_cur_fog, sizeof D->fogv);
-    D->tex1 = g_cur_tex1; D->tex2 = g_cur_tex2; D->tex3 = g_cur_tex3;
-    D->ps = (g_cur_ps > 0 && g_cur_ps < PSCUBE && metal_tex_is_cube(tex))
-              ? g_cur_ps + PSCUBE : g_cur_ps;
-#if NFS_ENHANCED
-    { unsigned tx4[4] = { tex, g_cur_tex1, g_cur_tex2, g_cur_tex3 };
-      D->ps = hd_refl_ps(D->ps, g_cur_target, tx4); }
-#endif
-    memcpy(D->psc, g_cur_psc, sizeof D->psc);
-    memcpy(D->proj, g_cur_proj, sizeof D->proj);
-    D->vsid = vsid; D->rawoff = roff; D->koff = koff; D->ksz = ksz;
+    D->first = 0; D->count = tris*3; D->rawoff = roff;
+    g_dn[b]++;
+    pthread_mutex_unlock(&g_qlock);
+    return 1;
+}
+/* Havuzdaki yansilardan indisli ucgen listesi (bkz. KALICI KOSE / INDIS
+ * HAVUZU).  vbo: 0. kosenin havuz ofseti, ibo: ilk indisin ofseti. */
+int metal_draw_ix(unsigned vbo, unsigned stride, unsigned ibo, unsigned isz, unsigned nidx,
+                  int base, unsigned tex, int vsid, const float *kdata, unsigned nk,
+                  unsigned long long gh){
+    if (!g_pool || nidx < 3 || !stride || stride > 256u || (isz != 2u && isz != 4u)) return 0;
+    pthread_mutex_lock(&g_qlock);
+    int b = g_cur;
+    if (g_dn[b] >= MAXD){ pthread_mutex_unlock(&g_qlock); return 0; }
+    MDraw *D = raw_rec(b, stride, tex, vsid, kdata, nk);
+    if (!D){ pthread_mutex_unlock(&g_qlock); return 0; }
+    D->count = nidx - nidx % 3u; D->rawoff = vbo;
+    D->ix_isz = isz; D->ix_ib = ibo; D->ix_base = base; D->gh = gh ? gh : 1ull;
     g_dn[b]++;
     pthread_mutex_unlock(&g_qlock);
     return 1;
@@ -3081,10 +3431,12 @@ void metal_present(void){
             (unsigned long long)(_w1.tv_sec-_w0.tv_sec)*1000000000ull
             + (unsigned long long)_w1.tv_nsec - (unsigned long long)_w0.tv_nsec); }
     }
+    g_pool_fr[g_cur] = g_pool;       /* bu karenin indisli cizimleri bu havuzda */
+    g_gframe++;
     g_ready = g_cur;                 /* ana thread bu tamponu cizsin */
     g_cur ^= 1;                      /* guest digerine yazmaya devam etsin */
     g_vn[g_cur] = 0; g_dn[g_cur] = 0;
-    g_rvn[g_cur] = 0; g_kn[g_cur] = 0;
+    g_rvn[g_cur] = 0; g_kn[g_cur] = 0; g_pscn[g_cur] = 0;
 #if NFS_ENHANCED
     g_hd_cam_ok[g_cur] = 0;
 #endif
@@ -3122,6 +3474,7 @@ void metal_early_init(void){
     @autoreleasepool {
         g_vbuf[0] = malloc(sizeof(MVert)*MAXV); g_vbuf[1] = malloc(sizeof(MVert)*MAXV);
         g_dbuf[0] = malloc(sizeof(MDraw)*MAXD); g_dbuf[1] = malloc(sizeof(MDraw)*MAXD);
+        g_pscb[0] = malloc(sizeof *g_pscb[0] * MAXD); g_pscb[1] = malloc(sizeof *g_pscb[1] * MAXD);
         for (int i = 0; i < NFB; i++){           /* bkz. "kare basina tampon halkasi" */
             g_fb_vb[i]  = fb_fit(nil, 0, sizeof(MVert)*MAXV);
             g_fb_rvb[i] = fb_fit(nil, 0, MAXRV);
@@ -3190,12 +3543,12 @@ void metal_early_init(void){
                                 [[e3 localizedDescription] UTF8String]);
 #if NFS_ENHANCED
             if (hd_msaa_n() > 1){
-                pd.rasterSampleCount = (NSUInteger)hd_msaa_n();
-                g_pso_ms = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e3];
+                g_pso_ms_desc = [pd copy];
+                (void)hd_pso_ms();                  /* acilistaki ornek sayisi icin simdiden */
             }
             if (hd_ssr_on()){
                 NSError *e4 = nil;
-                id<MTLLibrary> sl = [g_dev newLibraryWithSource:kSSRSrc options:nil error:&e4];
+                id<MTLLibrary> sl = [g_dev newLibraryWithSource:hd_gb_src(kSSRSrc) options:nil error:&e4];
                 if (!sl) fprintf(stderr, "[HD] SSR gölgelendiricisi derlenemedi: %s\n",
                                  [[e4 localizedDescription] UTF8String]);
                 else {
@@ -3291,7 +3644,7 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
         if (g_psocache[i].key == key) return g_psocache[i].pso;
     if (!g_lib || g_pson >= MAXPSO) return g_pso;
 
-    /* anahtar: karisim(0..19) | ps<<20 | vs<<32 | (HD) msaa<<48 */
+    /* anahtar: karisim(0..19) | ps<<20 | vs<<32 | (HD) msaa<<48 | G<<49 | log2(ornek)<<50 */
     int psid = (int)((key >> 20) & 0xFFFu);
     int vsid = (int)((key >> 32) & 0xFFFu);
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
@@ -3325,13 +3678,14 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
     if (mask & 8) cw |= MTLColorWriteMaskAlpha;
     pd.colorAttachments[0].writeMask = cw;
 #if NFS_ENHANCED
-    if ((key >> 48) & 1u) pd.rasterSampleCount = (NSUInteger)hd_msaa_n();
+    if ((key >> 48) & 1u) pd.rasterSampleCount = ((key >> 50) & 3u) ? (NSUInteger)1u << ((key >> 50) & 3u)
+                                                                    : (NSUInteger)hd_msaa_n();
     if ((key >> 49) & 1u){
         /* G-tamponu: karisimli cizimler ve sabit islevli gölgelendirici
          * (ps 0, tek cikisli) yazmaz -- altindaki yuzeyin verisi kalir. */
         MTLColorWriteMask gm = (en || psid == 0) ? MTLColorWriteMaskNone : MTLColorWriteMaskAll;
         for (int gi = 0; gi < HD_NG; gi++){
-            pd.colorAttachments[1 + gi].pixelFormat = kHdGFmt[gi];
+            pd.colorAttachments[1 + gi].pixelFormat = hd_gfmt(gi);
             pd.colorAttachments[1 + gi].writeMask = gm; }
     }
 #endif
@@ -3874,6 +4228,9 @@ void metal_run_main_loop(void){
                             fb_put(g_mtlkb,  g_kbuf[rb],  g_kn[rb]);
                         }
 
+#if NFS_ENHANCED
+                        hd_msaa_frame(d.texture.width, d.texture.height);   /* bkz. COZUNURLUGE GORE MSAA */
+#endif
                         /* Cizimler hedeflerine gore siraya dizili; hedef
                          * degistikce yeni bir render gecisi acilir. */
                         id<MTLRenderCommandEncoder> enc = nil;
@@ -3907,6 +4264,7 @@ void metal_run_main_loop(void){
 #endif
                         struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } c_fp;
                         int c_fp_valid = 0;
+                        unsigned c_psci = ~0u;          /* c_fp'nin ps sabiti havuz sirasi */
                         unsigned char touched[MAXTEX + 1];   /* (doku*8 + yuz) bit'i */
                         memset(touched, 0, sizeof touched);
                         int screen_touched = 0;
@@ -4044,8 +4402,8 @@ void metal_run_main_loop(void){
                             for (unsigned di = 0; di < g_dn[rb]; di++){
                                 MDraw *dr = &g_dbuf[rb][di];
                                 uint64_t hp = 1469598103934665603ull, hk = 1469598103934665603ull;
-                                const uint8_t *pp = (const uint8_t *)dr->psc;
-                                for (size_t q = 0; q < sizeof dr->psc; q++){ hp ^= pp[q]; hp *= 1099511628211ull; }
+                                const uint8_t *pp = (const uint8_t *)g_pscb[rb][dr->psci];
+                                for (size_t q = 0; q < sizeof g_pscb[rb][0]; q++){ hp ^= pp[q]; hp *= 1099511628211ull; }
                                 if (dr->vsid > 0 && g_kbuf[rb]){
                                     const uint8_t *kp = (const uint8_t *)g_kbuf[rb] + dr->koff;
                                     for (unsigned q = 0; q < dr->ksz && dr->koff + q < MAXKB; q++){ hk ^= kp[q]; hk *= 1099511628211ull; }
@@ -4238,7 +4596,7 @@ void metal_run_main_loop(void){
                                          * Drawable'a dogrudan yazilan kopya bir sonraki
                                          * ekran gecisinin cozumuyle EZILIRDI; kopyayi
                                          * cok ornekli dokuya dortgen olarak ciz, coz. */
-                                        if (dt2 == d.texture && hd_msaa_n() > 1 && g_pso_ms && !hd_post){
+                                        if (dt2 == d.texture && hd_msaa_n() > 1 && hd_pso_ms() && !hd_post){
                                             g_hd_mscol = hd_ms_tex(g_hd_mscol, d.texture.pixelFormat,
                                                                    d.texture.width, d.texture.height);
                                             MTLRenderPassDescriptor *mp =
@@ -4250,7 +4608,7 @@ void metal_run_main_loop(void){
                                             pp_rp(mp, "blit -> ekran (MSAA dortgen)");
                                             id<MTLRenderCommandEncoder> me =
                                                 [cb renderCommandEncoderWithDescriptor:mp];
-                                            [me setRenderPipelineState:g_pso_ms];
+                                            [me setRenderPipelineState:hd_pso_ms()];
                                             [me setVertexBuffer:g_blitvb offset:0 atIndex:0];
                                             [me setFragmentSamplerState:g_samp atIndex:0];
                                             [me setFragmentTexture:st2 atIndex:0];
@@ -4417,16 +4775,33 @@ void metal_run_main_loop(void){
                                         atomic_load(&g_clear_b), 1.0);
                                     c_ms = 0;
 #if NFS_ENHANCED
+                                    int c_ml = 0;                   /* bkz. BELLEKSIZ MSAA EKLERI */
+                                    g_hd_msp.on = 0; g_hd_msp.ml = 0; g_hd_msp.dz = 0;
                                     if (!dr->target && hd_msaa_n() > 1 && !hd_post){
-                                        g_hd_mscol = hd_ms_tex(g_hd_mscol, tgt.pixelFormat,
-                                                               tgt.width, tgt.height);
-                                        if (g_hd_mscol){
+                                        unsigned zq = DEPTH_ZID(dr->depth);
+                                        /* hicbir ek yuklenmeyecek (renk ilk kullanim, G ilk kez,
+                                         * derinlik temizlenecek) ve hicbir ornek saklanmayacak */
+                                        c_ml = hd_ms_memless() && first_use &&
+                                               (hd_gb_first || !(hd_scene_open && hd_ssr_on())) &&
+                                               !(zq && zq < 64u && g_hd_msz_seen[zq] && g_hd_msz_kept[zq] &&
+                                                 !g_hd_zpend_ms[zq]) &&
+                                               hd_ms_memless_ok(rb, i);
+                                        id<MTLTexture> msc;
+                                        if (c_ml) msc = g_hd_mscol_ml = hd_ms_tex_ml(g_hd_mscol_ml, tgt.pixelFormat,
+                                                                                     tgt.width, tgt.height);
+                                        else      msc = g_hd_mscol = hd_ms_tex(g_hd_mscol, tgt.pixelFormat,
+                                                                               tgt.width, tgt.height);
+                                        if (!msc) c_ml = 0;
+                                        if (msc){
                                             c_ms = 1;
                                             c_att = hd_ms_predict(rb, i);
-                                            rp.colorAttachments[0].texture = g_hd_mscol;
+                                            if (c_ml) atomic_fetch_add(&g_hd_ml_pass, 1ull);
+                                            rp.colorAttachments[0].texture = msc;
                                             if (c_att & 1u) rp.colorAttachments[0].resolveTexture = tgt;
-                                            rp.colorAttachments[0].storeAction = hd_mslazy()
-                                                ? MTLStoreActionUnknown             /* kapanirken: hd_ms_end */
+                                            rp.colorAttachments[0].storeAction =
+                                                  c_ml ? ((c_att & 1u) ? MTLStoreActionMultisampleResolve   /* belleksiz: kesin */
+                                                                       : MTLStoreActionDontCare)
+                                                : hd_mslazy() ? MTLStoreActionUnknown             /* kapanirken: hd_ms_end */
                                                 : MTLStoreActionStoreAndMultisampleResolve;
                                             atomic_fetch_add(&g_hd_mspass, 1ull);
                                         }
@@ -4435,18 +4810,23 @@ void metal_run_main_loop(void){
                                     if (!dr->target && hd_scene_open && hd_ssr_on()){
                                         NSUInteger ns = c_ms ? (NSUInteger)hd_msaa_n() : 1u;
                                         for (int gi = 0; gi < HD_NG; gi++){
-                                            g_hd_g[gi] = hd_tex(g_hd_g[gi], kHdGFmt[gi], tgt.width, tgt.height, 1);
-                                            if (ns > 1) g_hd_gms[gi] = hd_tex(g_hd_gms[gi], kHdGFmt[gi], tgt.width, tgt.height, ns);
+                                            g_hd_g[gi] = hd_tex(g_hd_g[gi], hd_gfmt(gi), tgt.width, tgt.height, 1);
+                                            if (ns > 1 && c_ml) g_hd_gms_ml[gi] = hd_ms_tex_ml(g_hd_gms_ml[gi], hd_gfmt(gi), tgt.width, tgt.height);
+                                            else if (ns > 1) g_hd_gms[gi] = hd_tex(g_hd_gms[gi], hd_gfmt(gi), tgt.width, tgt.height, ns);
                                         }
                                         for (int gi = 0; gi < HD_NG; gi++){
                                             MTLRenderPassColorAttachmentDescriptor *ga = rp.colorAttachments[1 + gi];
-                                            ga.texture = (ns > 1) ? g_hd_gms[gi] : g_hd_g[gi];
+                                            ga.texture = (ns > 1) ? (c_ml ? g_hd_gms_ml[gi] : g_hd_gms[gi]) : g_hd_g[gi];
                                             if (ns > 1){ if (c_att & 2u) ga.resolveTexture = g_hd_g[gi];
-                                                         ga.storeAction = hd_mslazy() ? MTLStoreActionUnknown
-                                                                                      : MTLStoreActionStoreAndMultisampleResolve; }
+                                                         ga.storeAction = c_ml ? ((c_att & 2u) ? MTLStoreActionMultisampleResolve
+                                                                                                : MTLStoreActionDontCare)
+                                                                       : hd_mslazy() ? MTLStoreActionUnknown
+                                                                       : MTLStoreActionStoreAndMultisampleResolve; }
                                             else ga.storeAction = MTLStoreActionStore;
                                             ga.loadAction = hd_gb_first ? MTLLoadActionClear : MTLLoadActionLoad;
-                                            ga.clearColor = MTLClearColorMake(0, 0, 0, 0);
+                                            ga.clearColor = (gi == 2 && hd_gpack())     /* paketli: sifir yon = 512 */
+                                                ? MTLClearColorMake(512.0 / 1023.0, 512.0 / 1023.0, 512.0 / 1023.0, 0)
+                                                : MTLClearColorMake(0, 0, 0, 0);
                                         }
                                         hd_gb_first = 0;
                                         hd_scene_zid = DEPTH_ZID(dr->depth);
@@ -4463,7 +4843,7 @@ void metal_run_main_loop(void){
                                     if (zid && zid < MAXZ){
                                         if (atomic_exchange(&g_zforget[zid], 0)){ g_ztex[zid] = nil;
 #if NFS_ENHANCED
-                                            if (zid < 64u) g_hd_msz[zid] = nil;
+                                            if (zid < 64u){ g_hd_msz[zid] = nil; g_hd_msz_seen[zid] = 0; g_hd_msz_kept[zid] = 0; }
 #endif
                                         }
                                         id<MTLTexture> zt = g_ztex[zid];
@@ -4508,17 +4888,31 @@ void metal_run_main_loop(void){
                                     if (c_ms){
                                         if (ztex && zid < 64u){
                                             zres = ztex;
-                                            id<MTLTexture> old = g_hd_msz[zid];
-                                            g_hd_msz[zid] = hd_ms_tex(old, MTLPixelFormatDepth32Float,
-                                                                      tgt.width, tgt.height);
-                                            zclear = (g_hd_msz[zid] != old);       /* yeni: tanimsiz */
+                                            /* temizlemeden yuklemek istiyor ama son gecis saklamadi */
+                                            int lost = g_hd_msz_seen[zid] && !g_hd_msz_kept[zid] && !g_hd_zpend_ms[zid];
+                                            if (c_ml){
+                                                g_hd_msz_ml = hd_ms_tex_ml(g_hd_msz_ml, MTLPixelFormatDepth32Float,
+                                                                           tgt.width, tgt.height);
+                                                ztex = g_hd_msz_ml;
+                                                zclear = 1;                     /* belleksiz: hep temizlenir */
+                                            } else {
+                                                id<MTLTexture> old = g_hd_msz[zid];
+                                                g_hd_msz[zid] = hd_ms_tex(old, MTLPixelFormatDepth32Float,
+                                                                          tgt.width, tgt.height);
+                                                zclear = (g_hd_msz[zid] != old);       /* yeni: tanimsiz */
+                                                ztex = g_hd_msz[zid];
+                                            }
                                             zval = 1.f;
                                             if (g_hd_zpend_ms[zid]){ zclear = 1; zval = g_hd_zpend_msv[zid]; g_hd_zpend_ms[zid] = 0; }
-                                            ztex = g_hd_msz[zid];
+                                            if (lost){ zclear = 1; atomic_fetch_add(&g_hd_mszlost, 1ull); }
+                                            g_hd_msz_seen[zid] = 1;
                                             g_hd_zms_used[zid] = 1;
+                                            g_hd_msp.dz = 1; g_hd_msp.zid = zid; g_hd_msp.zclr = zclear;
                                         } else {
-                                            g_hd_msdepth_scratch = hd_ms_tex(g_hd_msdepth_scratch,
-                                                MTLPixelFormatDepth32Float, tgt.width, tgt.height);
+                                            /* derinliksiz ekran gecisi: hep Clear + DontCare */
+                                            g_hd_msdepth_scratch = hd_ml_hw()
+                                                ? hd_ms_tex_ml(g_hd_msdepth_scratch, MTLPixelFormatDepth32Float, tgt.width, tgt.height)
+                                                : hd_ms_tex(g_hd_msdepth_scratch, MTLPixelFormatDepth32Float, tgt.width, tgt.height);
                                         }
                                     }
 #endif
@@ -4542,6 +4936,18 @@ void metal_run_main_loop(void){
                                             g_hd_zsdirty[zid] = 0;
                                             atomic_fetch_add(&g_hd_zres, 1ull);
                                         }
+                                        /* MS derinligin saklamasi: belleksizde acilista kesin (hic
+                                         * saklanmaz), Private'ta kapanista secilir (hd_ms_end) */
+                                        if (c_ms && g_hd_msp.dz && c_ml){
+                                            rp.depthAttachment.storeAction = rp.depthAttachment.resolveTexture
+                                                ? MTLStoreActionMultisampleResolve : MTLStoreActionDontCare;
+                                            g_hd_msz_kept[g_hd_msp.zid] = 0;
+                                            atomic_fetch_add(&g_hd_mszskip, 1ull);
+                                            g_hd_msp.dz = 0;
+                                        } else if (c_ms && g_hd_msp.dz && hd_mslazy()){
+                                            g_hd_msp.res = rp.depthAttachment.resolveTexture != nil;
+                                            rp.depthAttachment.storeAction = MTLStoreActionUnknown;
+                                        } else g_hd_msp.dz = 0;
 #endif
                                     } else if (g_depth_tex){
                                         rp.depthAttachment.texture = g_depth_tex;
@@ -4554,6 +4960,10 @@ void metal_run_main_loop(void){
                                     }
                                     cur_z = zid;
                                     c_zon = ztex != nil;
+#if NFS_ENHANCED
+                                    g_hd_msp.on = c_ms; g_hd_msp.ml = c_ml;
+                                    if (!c_ms) g_hd_msp.dz = 0;
+#endif
                                     if (g_pp_sb){ char pn[48];
                                         if (!dr->target) snprintf(pn, sizeof pn, "EKRAN%s%s", c_ms ? " +MSAA" : "",
 #if NFS_ENHANCED
@@ -4607,8 +5017,8 @@ void metal_run_main_loop(void){
                                             (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].width:0ul,
                                             (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].height:0ul,
                                             dr->tex1, dr->blend, dr->count,
-                                            (double)dr->psc[0][0],(double)dr->psc[0][1],
-                                            (double)dr->psc[0][2],(double)dr->psc[0][3]); } }
+                                            (double)dr->c0[0],(double)dr->c0[1],
+                                            (double)dr->c0[2],(double)dr->c0[3]); } }
 #if NFS_ENHANCED
                                 if (dr->ps >= PSREFL && c_gb){ hd_refl_drawn = 1; atomic_fetch_add(&g_hd_refl_draws, 1ull); }
                                 /* Ayni Z yuzeyi bu karede ekranda (cok ornekli ikiziyle)
@@ -4640,6 +5050,9 @@ void metal_run_main_loop(void){
                                                | ((uint64_t)(dr->vsid & 0xFFF) << 32)
                                                | ((uint64_t)(c_ms & 1) << 48)
                                                | ((uint64_t)(c_gb & 1) << 49);
+#if NFS_ENHANCED
+                                  if (c_ms) k2 |= (uint64_t)hd_msaa_l2() << 50;   /* bkz. COZUNURLUGE GORE MSAA */
+#endif
                                   id<MTLRenderPipelineState> ps2 = pso_for(k2);
                                   if (ps2 != c_pso){ c_pso = ps2;
                                       [enc setRenderPipelineState:ps2]; } }
@@ -4686,11 +5099,17 @@ void metal_run_main_loop(void){
                                   }
 #endif
                                   memcpy(fp.proj, dr->proj, sizeof fp.proj);
-                                  memcpy(fp.c, dr->psc, sizeof fp.c);
                                   memcpy(fp.fogv, dr->fogv, sizeof fp.fogv);
-                                  if (!c_fp_valid || memcmp(&fp, &c_fp, sizeof fp)){
-                                      memcpy(&c_fp, &fp, sizeof fp); c_fp_valid = 1;
-                                      [enc setFragmentBytes:&fp length:sizeof fp atIndex:0]; } }
+                                  /* ayni havuz sirasi + ayni kucuk alanlar: 548 baytlik
+                                   * blogu kurup karsilastirmaya gerek yok */
+                                  if (!(c_fp_valid && dr->psci == c_psci &&
+                                        !memcmp(&fp, &c_fp, offsetof(__typeof__(fp), c)) &&
+                                        !memcmp(fp.fogv, c_fp.fogv, sizeof fp.fogv))){
+                                      memcpy(fp.c, g_pscb[rb][dr->psci], sizeof fp.c);
+                                      if (!c_fp_valid || memcmp(&fp, &c_fp, sizeof fp)){
+                                          memcpy(&c_fp, &fp, sizeof fp); c_fp_valid = 1;
+                                          [enc setFragmentBytes:&fp length:sizeof fp atIndex:0]; }
+                                      c_psci = dr->psci; } }
                                 { unsigned ts[4] = { dr->tex, dr->tex1, dr->tex2, dr->tex3 };
                                   for (int q4=0;q4<4;q4++){
                                       if (ts[q4] == c_tex[q4]) continue;
@@ -4702,7 +5121,15 @@ void metal_run_main_loop(void){
                                       [enc setFragmentTexture:txn atIndex:(NSUInteger)q4];
                                   } }
                                 atomic_fetch_add(&g_draw_n, 1ull);
-                                if (dr->vsid > 0){
+                                if (dr->vsid > 0 && dr->ix_isz){
+                                    id<MTLBuffer> pl = g_pool_fr[rb];
+                                    [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
+                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
+                                    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
+                                                     indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                                                   indexBuffer:pl indexBufferOffset:dr->ix_ib
+                                                 instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
+                                } else if (dr->vsid > 0){
                                     [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
                                     [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
                                     [enc drawPrimitives:MTLPrimitiveTypeTriangle
@@ -4792,6 +5219,11 @@ void metal_run_main_loop(void){
                         int in_win = gpuw_in(fno_pre);
                         pp_end(cb);
                         [cb addCompletedHandler:^(id<MTLCommandBuffer> b2){
+                            /* hatayla biten kare: GPU sureleri 0 gelir, olcumleri de bozar */
+                            if (b2.status == MTLCommandBufferStatusError){
+                                unsigned long ne = atomic_fetch_add(&g_cb_err, 1ul);
+                                if (ne < 5) fprintf(stderr, "metal: KOMUT TAMPONU HATASI: %s\n",
+                                                    [[b2.error localizedDescription] UTF8String]); }
                             fb_release(fbi);        /* GPU bitti: takim yeniden kullanilabilir */
                             double g = (b2.GPUEndTime - b2.GPUStartTime) * 1e9;
                             if (g > 0.0 && g < 1e9){
@@ -4863,6 +5295,10 @@ void metal_run_main_loop(void){
           for (int i = 0; i < NFB; i++){ v += g_fb_vb[i].length; r += g_fb_rvb[i].length; k += g_fb_kb[i].length; }
           fprintf(stderr, "metal: tampon halkasi boyu (%d takim toplami): kose %.1f MB + ham kose %.1f MB + sabit %.1f MB, %lu kez buyudu\n",
                   NFB, v / 1048576.0, r / 1048576.0, k / 1048576.0, atomic_load(&g_fb_grow)); }
+        fprintf(stderr, "metal: kose/indis havuzu: %.1f MB (dolu %.1f MB), %lu yansi canli, %lu kuruldu (%.1f MB kopya), %lu dustu, tablo dolu %lu\n",
+                g_pool ? g_pool.length / 1048576.0 : 0.0, g_pool_top / 1048576.0, g_mir_live, g_mir_build,
+                g_mir_bytes / 1048576.0, g_mir_drop, g_mir_full);
+        fprintf(stderr, "metal: komut tamponu hatasi: %lu kare\n", atomic_load(&g_cb_err));
         { unsigned long n = atomic_load(&g_enc_late);
           fprintf(stderr, "metal: kodlama 60 ms'yi asti (eskiden kodlanan tampona takas olurdu): %lu kez", n);
           for (unsigned long q = 0; q < n && q < 8; q++) fprintf(stderr, "%s%ld", q ? "," : "  kareler: ", g_enc_late_f[q]);
@@ -4903,6 +5339,10 @@ void metal_budget_report(void){
             " Z paylasim: %llu ekran->hedef cizimi, %llu hedef->ekran cizimi (gorunmez)\n",
             g_hd_msn, atomic_load(&g_hd_mspass), atomic_load(&g_hd_msblit),
             atomic_load(&g_hd_zres), atomic_load(&g_hd_zshare), atomic_load(&g_hd_zrev));
+    fprintf(stderr, "[HD] MSAA ekleri: %llu gecis BELLEKSIZ, ongoru tutmayan %llu%s | MS derinlik: %llu saklandi, "
+            "%llu saklanmadi, %llu kez temizlemeden yukleme istendi ama ornekler kayipti (0 olmali)\n",
+            atomic_load(&g_hd_ml_pass), atomic_load(&g_hd_ml_miss), g_hd_ml_off ? " (belleksiz kip KAPANDI)" : "",
+            atomic_load(&g_hd_mszst), atomic_load(&g_hd_mszskip), atomic_load(&g_hd_mszlost));
 #endif
     unsigned long long n  = atomic_load(&g_gpu_n);
     unsigned long long gs = atomic_load(&g_gpu_ns);

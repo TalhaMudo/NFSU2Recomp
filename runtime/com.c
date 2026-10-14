@@ -233,6 +233,7 @@ static void label_put(int row, const char *txt){
     memset(g_mem + a, 0, g_lbl_cap[row]); memcpy(g_mem + a, txt, n);
 }
 static int g_cur_row = -1;             /* oyunun etkin satiri (-1 = bilinmiyor) */
+static int g_row4_on = 1;              /* 4K satiri secilebilir mi (bkz. modes_refresh) */
 static int modemap_on(void){ return !ENVC("NOWIDE"); }
 /* Satirlar GORUNUMUN (pencere / tam ekran) oranindan uretilir: "1080p" =
  * gorunum oraninda 1080 satir.  Boylece cizim yuzeyi pencereyi bantsiz
@@ -254,11 +255,23 @@ static void modes_refresh(void){
     if (maxpix > 1.0e5 && dw * dh > maxpix){ double k = sqrt(maxpix / (dw * dh)); dw *= k; dh *= k; }
     unsigned w = (unsigned)dw & ~1u, h = (unsigned)dh & ~1u;
     g_modes[ROW_NATIVE][0] = w; g_modes[ROW_NATIVE][1] = h;
+    /* 4K satiri yalnizca ekran onu gosterebiliyorsa (ekran satiri >= 2160).
+     * Daha kucuk ekranda (MacBook ~3K) 4K kucultulerek gosteriliyordu: ~1.6
+     * kat piksel, ekranda kazanc yok, dizustu isiniyor (kullanici istegi
+     * 2026-10-14).  Satir silinemez (tablo 6 satir), oyuna SECILEMEZ
+     * bildiriliyor: EnumAdapterModes 5. kaydinda 1280x1024'u vermiyor.
+     * Oyun kodundan okundu: sub_005be5b0 kullanilabilirligi ([0x86e880+4*satir])
+     * tablo degerini listede arayarak isaretler, sub_0049b600 oklarla
+     * kullanilamayan satiri atlar, sub_005be6a0 kayitli satir kullanilamazsa
+     * bir alttaki kullanilabilir satira iner (4K -> ekran).  Bu satira yine
+     * de gelinirse ekran cozunurlugu ve etiketi kullanilir. */
+    g_row4_on = 2160u <= h;
+    if (!g_row4_on){ g_modes[4][0] = w; g_modes[4][1] = h; }
     if (!modemap_on()) return;
     static const char *fixed[6] = {"720p","1080p","1440p",0,"4K","1600x1200"};
     char nb[16];
     for (int i = 0; i < 6; i++){
-        if (fixed[i]) label_put(i, fixed[i]);
+        if (fixed[i] && (i != 4 || g_row4_on)) label_put(i, fixed[i]);
         else { snprintf(nb, sizeof nb, "%ux%u", w, h); label_put(i, nb); }
     }
 }
@@ -1002,6 +1015,22 @@ static void res_pick(uint32_t gw, uint32_t gh, uint32_t *dw, uint32_t *dh){
     fprintf(stderr,"com: cihaz cozunurlugu %ux%u -> %ux%u (aspfix=%.4f)\n",
             gw, gh, aw, ah, (double)g_aspfix);
 }
+/* Sabit dosyasinin YALNIZCA bu gölgelendiricinin okudugu kismini kopyala.
+ * Eskiden cizim basina dosyanin tamami (4416 bayt) kopyalaniyordu, tek
+ * satiri (16 bayt) olceklemek icin: yarista kare basina 1316 kopya, 5.7 MB,
+ * 0.14 ms (olculdu).  Asagi akis [0, vs_kmax) disini okumuyor: GPU yolu
+ * metal_draw_raw'a tam vs_kmax satir veriyor, CPU yolu vs_run da bu
+ * siniri asmiyor (goreli adreslemede vs_kmax zaten 256). */
+static int16_t g_vs_kmax[MAXVS];          /* 0 = henuz bakilmadi */
+static void vsk_copy_used(VSConst *dst, const VSConst *src, const VSProg *prog){
+    unsigned vs = g_cur_vs;
+    int n = (vs < MAXVS) ? g_vs_kmax[vs] : 0;
+    if (n <= 0){ n = vs_kmax(prog); if (n < 1) n = 1; if (n > 256) n = 256;
+                 if (vs < MAXVS) g_vs_kmax[vs] = (int16_t)n; }
+    memcpy(dst->f, src->f, (size_t)n * sizeof dst->f[0]);
+    memcpy(dst->i, src->i, sizeof dst->i);
+    memcpy(dst->b, src->b, sizeof dst->b);
+}
 /* Konum matrisinin sabit yazmaci golgelendiriciye gore degisiyor; bir kez
  * cozup sakla (-2 = henuz bakilmadi). */
 static int8_t g_pos_cx[MAXVS], g_pos_cw[MAXVS]; static uint8_t g_pos_seen[MAXVS];
@@ -1030,7 +1059,7 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog){
          * ortografik; onlar kucululurse kenarlarda bant olusur. */
         { static int hf = -1;
           if (hf < 0){ const char *e = ENVC("HUDFIX"); hf = !(e && *e && *e=='0'); }
-          if (hf){ static VSConst ht; memcpy(&ht, vsk, sizeof ht);
+          if (hf){ static VSConst ht; vsk_copy_used(&ht, vsk, prog);
                    for (int k = 0; k < 4; k++) ht.f[cx][k] *= g_aspfix;
                    return &ht; } }
         if (ENVC("ASPLOG")){ static int no = 0;
@@ -1042,7 +1071,7 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog){
         return vsk; } }
     g_asp_persp++; g_asp_np[vs]++;
     static VSConst tmp;
-    memcpy(&tmp, vsk, sizeof tmp);
+    vsk_copy_used(&tmp, vsk, prog);
     for (int k = 0; k < 4; k++) tmp.f[cx][k] *= g_aspfix;
     if (ENVC("ASPLOG")){ static int n = 0;
         if (n < 6){ n++;
@@ -1154,7 +1183,12 @@ static void texproj_push(void){
     metal_set_texproj(sel);
 }
 
-static void draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
+/* dip_indexed -> draw_up: bu cizimin koseleri havuzdaki yansilardan indisle
+ * okunacak (n > 0 iken).  draw_up GPU yoluna giremezse 0 doner ve cagiran
+ * eski (indis acma) yoluna duser. */
+static struct { uint32_t n, vbo, ibo, isz; int32_t base; uint64_t gh; } g_ix;
+static uint64_t g_dip_ix = 0, g_dip_ixfb[6];
+static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     uint64_t _t0 = now_ns();
     static TVert tv[4096];
     const VSConst *vsk = &g_vsk;
@@ -1166,9 +1200,19 @@ static void draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     vsk = fixmat_apply(vsk);
     vsk = aspect_apply(vsk, prog);
 
+    /* Bildirim ayristirmasi (bildirim, gölgelendirici) basina BIR KEZ.
+     * Eskiden her cizimde 32'ye kadar ogeyi konuk belleginden okuyup
+     * mem_is_committed ile sinayarak bastan kuruyordu (kare basina ~1300
+     * kez).  Guvenli: bildirim nesneleri yaratilinca kopyalanip bir daha
+     * degismiyor ve com_alloc adresleri yeniden kullanmiyor. */
+    static struct { uint32_t decl; const VSProg *prog; int nel, p_off, p_type, c_off, c_type,
+                    t_off, t_type, ok; DElem el[16]; } dcc[64];
+    uint32_t d = g_cur_decl;
+    unsigned dci = (unsigned)(((uintptr_t)prog >> 4) ^ (d >> 3) ^ (d >> 11)) & 63u;
+    int dlog = ENVC("DECLLOG") != NULL;
+    if (dlog || !dcc[dci].ok || dcc[dci].decl != d || dcc[dci].prog != prog){
     DElem el[16]; int nel = 0;
     int p_off = -1, p_type = 2, c_off = -1, c_type = 4, t_off = -1, t_type = 1;
-    uint32_t d = g_cur_decl;
     uint32_t ep = (d && mem_is_committed(d+8)) ? MR32(d+4) : 0;
     if (ep){
         for (int k = 0; k < 32 && nel < 16; k++){
@@ -1212,6 +1256,14 @@ static void draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     if (p_off < 0){ p_off = 0;  p_type = 2; }
     if (c_off < 0){ c_off = 12; c_type = 4; }
     if (t_off < 0){ t_off = 16; t_type = 1; }
+    dcc[dci].decl = d; dcc[dci].prog = prog; dcc[dci].nel = nel;
+    dcc[dci].p_off = p_off; dcc[dci].p_type = p_type; dcc[dci].c_off = c_off;
+    dcc[dci].c_type = c_type; dcc[dci].t_off = t_off; dcc[dci].t_type = t_type;
+    memcpy(dcc[dci].el, el, sizeof el); dcc[dci].ok = 1;
+    }
+    const DElem *el = dcc[dci].el; int nel = dcc[dci].nel;
+    int p_off = dcc[dci].p_off, p_type = dcc[dci].p_type, c_off = dcc[dci].c_off,
+        c_type = dcc[dci].c_type, t_off = dcc[dci].t_off, t_type = dcc[dci].t_type;
 
     /* ---------------- GPU kose gölgelendiricisi (GPUVS) ----------------
      * Olculdu: calisma suresinin ~%45'i CPU'daki vs_run yorumlayicisinda,
@@ -1230,17 +1282,29 @@ static void draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
             metal_set_stage_tex(g_tex_stage[1], g_tex_stage[2], g_tex_stage[3]);
             metal_set_ps(g_cur_ps_id, &g_psc[0][0]);
             texproj_push(); smp_push();
+            if (g_ix.n){
+                int metal_draw_ix(unsigned, unsigned, unsigned, unsigned, unsigned, int,
+                                  unsigned, int, const float *, unsigned, unsigned long long);
+                if (metal_draw_ix(g_ix.vbo, stride, g_ix.ibo, g_ix.isz, g_ix.n, g_ix.base,
+                                  g_cur_tex, gid, &vsk->f[0][0], (unsigned)g_gvs_nk[gid], g_ix.gh)){
+                    g_vs_draws++; g_gpuvs_draws++; g_v_xform += nv;
+                    g_t_draw_ns += now_ns() - _t0;
+                    return 1;
+                }
+                return 0;
+            }
             if (metal_draw_raw(g_mem + vp, nv, stride, pt, g_cur_tex, gid,
                                &vsk->f[0][0], (unsigned)g_gvs_nk[gid])){
                 g_vs_draws++; g_gpuvs_draws++; g_v_xform += nv;
                 g_t_draw_ns += now_ns() - _t0;
-                return;
+                return 1;
             }
             /* Kuyruga alinamadi (arena tasmasi): CPU yolu devam etsin --
              * sessizce dusurmek geometriyi yok ediyordu. */
             g_gpuvs_drop++;
         }
     }
+    if (g_ix.n) return 0;           /* indisli kaynak CPU yoluna verilemez */
 
     for (uint32_t i = 0; i < nv; i++){
         uint32_t o = vp + i*stride;
@@ -1408,6 +1472,61 @@ static void draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
         }
     }
     metal_draw_tv(tv, nv, pt, g_cur_tex);
+    return 1;
+}
+
+/* DrawIndexedPrimitive hizli yolu: duragan VB/IB havuzda yansitilip indisli
+ * cizilir (bkz. metal.m KALICI KOSE / INDIS HAVUZU).  0 = uygulanamadi,
+ * cagiran indis acma yoluna duser. */
+static int dip_indexed(uint32_t pt, uint32_t basev, uint32_t starti, uint32_t ntri, uint32_t isz){
+    int metal_mirror(uint32_t, uint32_t, const void *, uint32_t, unsigned, uint32_t *, uint32_t *);
+    const uint8_t *metal_pool_cpu(void);
+    static int off = -1;             /* NOIX=1: kapali (A/B olcumu, guvenlik) */
+    if (off < 0){ const char *e = ENVC("NOIX"); off = (e && *e && *e != '0'); }
+    if (off) return 0;
+    if (pt != 4u || !g_gpuvs){ g_dip_ixfb[0]++; return 0; }         /* serit/yelpaze: eski yol */
+    uint32_t vb = g_ss_vb, ib = g_ib_obj, stride = g_ss_stride, so = g_ss_off;
+    if (!mem_is_committed(vb+63) || !mem_is_committed(ib+63)){ g_dip_ixfb[1]++; return 0; }
+    uint32_t vsz = MR32(vb+4), vba = MR32(vb+8), isb = MR32(ib+4), iba = MR32(ib+8);
+    /* son 4 karede kilitlendiyse icerigi degisiyor olabilir: her kare yeniden
+     * yansitmak yerine eski yol (dinamik tamponlar hep oradan gider) */
+    if ((uint32_t)g_present - MR32(vb+52) < 4u || (uint32_t)g_present - MR32(ib+52) < 4u){
+        g_dip_ixfb[2]++; return 0; }
+    uint32_t ni = ntri * 3u;
+    if ((stride & 3u) || (so & 3u) || (int32_t)basev < 0 || !vba || !iba || !vsz || !isb ||
+        (uint64_t)(starti + ni) * isz > isb ||
+        !mem_is_committed(vba + vsz - 1u) || !mem_is_committed(iba + isb - 1u)){
+        g_dip_ixfb[3]++; return 0; }
+    /* Metal indis ofseti 4'un kati olmali; 16 bitlik indiste tek numarali
+     * baslangic icin IB'nin 2 bayt kaydirilmis ikinci yansisi kullanilir
+     * (anahtar ib+2: com_alloc 16'ya hizali, baska nesneyle cakismaz).
+     * Olculdu: bu olmadan DIP cizimlerinin %19'u eski yola dusuyordu. */
+    uint32_t sh = ((starti * isz) & 3u) ? 2u : 0u;
+    if (sh && isz != 2u){ g_dip_ixfb[3]++; return 0; }
+    uint32_t voff, ioff, imax;
+    if (!metal_mirror(vb, MR32(vb+48), g_mem + vba, vsz, 0, &voff, NULL) ||
+        !metal_mirror(ib + sh, MR32(ib+48), g_mem + iba + sh, isb - sh, isz, &ioff, &imax)){
+        g_dip_ixfb[4]++; return 0; }
+    /* Sinir: tum IB'nin en buyuk indisi bu VB'ye sigiyorsa tarama yok;
+     * sigmiyorsa (bir IB birden cok VB'ye hizmet ediyor) cizimin araligi. */
+    if ((uint64_t)so + ((uint64_t)basev + imax + 1u) * stride > vsz){
+        const uint8_t *P = metal_pool_cpu() + ioff + (size_t)starti * isz - sh;
+        uint32_t mx = 0;
+        if (isz == 2u){ const uint16_t *x = (const uint16_t *)P; for (uint32_t k = 0; k < ni; k++) if (x[k] > mx) mx = x[k]; }
+        else          { const uint32_t *x = (const uint32_t *)P; for (uint32_t k = 0; k < ni; k++) if (x[k] > mx) mx = x[k]; }
+        if ((uint64_t)so + ((uint64_t)basev + mx + 1u) * stride > vsz){ g_dip_ixfb[5]++; return 0; }
+    }
+    /* geometri kimligi (HD isin izleme onbellegi): ayni yansi + ayni aralik =
+     * ayni geometri; uretim degisince kimlik de degisir */
+    uint64_t gh = 1469598103934665603ull;
+    uint32_t kv[9] = { vb, MR32(vb+48), ib, MR32(ib+48), starti, ni, basev, stride, so };
+    for (int q = 0; q < 9; q++){ gh = (gh ^ kv[q]) * 1099511628211ull; gh ^= gh >> 29; }
+    g_ix.n = ni; g_ix.vbo = voff + so; g_ix.ibo = ioff + starti * isz - sh; g_ix.isz = isz;
+    g_ix.base = (int32_t)basev; g_ix.gh = gh | 1ull;
+    int ok = draw_up(4u, ni, 0u, stride);
+    g_ix.n = 0;
+    if (ok) g_dip_ix++;
+    return ok;
 }
 
 /* ---- D3DX HLE Asama 2: cagri kaydi ve etkisizlik denetimi (dxrec.h) ----
@@ -1722,6 +1841,8 @@ int com_call(CPU *c, uint32_t magic){
             else { uint32_t fmt=A(c,2); if(!fmt) fmt=22u;   /* istenen bicimi yansit */
                    if (mode == 0 && modemap_on()) modes_refresh();   /* menu metinleri */
                    const uint32_t *ml = g_tbl[mode];   /* secilebilirlik: oyunun tablosu */
+                   if (mode == 4 && modemap_on() && !g_row4_on)
+                       ml = g_tbl[ROW_NATIVE];         /* 4K secilemez: bkz. modes_refresh */
                    if(pm){ mem_commit(pm,16);
                            MR32(pm)   = ml[0];
                            MR32(pm+4) = ml[1];
@@ -1904,6 +2025,8 @@ int com_call(CPU *c, uint32_t magic){
                     uint32_t isz   = (ifmt==102u) ? 4u : 2u;   /* INDEX32 : INDEX16 */
                     uint32_t ntri  = (pt==4u||pt==5u||pt==6u) ? nprim : 0u;
                     if (!ntri || !vbase || !ibase){ g_dip_skip++; }
+                    else if (dip_indexed(pt, basev, starti, ntri, isz)){
+                        g_dip_draws++; g_dip_tris += ntri; }
                     else {
                         if (!g_idx_scratch) g_idx_scratch = gbuf_alloc(4096u*64u);
                         uint32_t maxv = 4095u / 3u * 3u;       /* draw_up siniri */
@@ -3144,6 +3267,10 @@ int com_call(CPU *c, uint32_t magic){
         if      (MID(GetDevice)){ uint32_t p=A(c,1); if(p) MR32(p)=g_dev; r=0; }
         else if (MID(Lock)){
             uint32_t off=A(c,1), sz=A(c,2), pp=A(c,3);
+            /* KALICI HAVUZ: icerik degisebilir -> yansi uretimi ilerlesin ve
+             * tampon birkac kare "degisken" sayilsin (bkz. dip_indexed). */
+            if (self && (iface==IF_VB || iface==IF_IB)){
+                MR32(self+48) = MR32(self+48) + 1u; MR32(self+52) = (uint32_t)g_present; }
             uint32_t base = self?MR32(self+8):0;
             if(!base){ base=gbuf_alloc(sz?sz:65536); if(self) MR32(self+8)=base; }
             if(pp) MR32(pp)=base+off; r=0; }
@@ -4018,6 +4145,11 @@ void com_report(void){
             " %d/%d (shader,bildirim) cifti kayitli\n",
             (unsigned long long)g_gpuvs_draws, (unsigned long long)g_gpuvs_fail,
             g_gvs_next-1, g_gvsn);
+    fprintf(stderr,"  indisli cizim      : %llu havuzdan, eski yol: serit/yelpaze %llu, nesne %llu, yeni kilit %llu, "
+            "hiza/sinir %llu, yansi %llu, indis disi %llu\n",
+            (unsigned long long)g_dip_ix, (unsigned long long)g_dip_ixfb[0], (unsigned long long)g_dip_ixfb[1],
+            (unsigned long long)g_dip_ixfb[2], (unsigned long long)g_dip_ixfb[3], (unsigned long long)g_dip_ixfb[4],
+            (unsigned long long)g_dip_ixfb[5]);
     { unsigned ovrv=0, ovkb=0; void metal_raw_overflow(unsigned*,unsigned*);
       metal_raw_overflow(&ovrv,&ovkb);
       if (ovrv || ovkb || g_gpuvs_drop)

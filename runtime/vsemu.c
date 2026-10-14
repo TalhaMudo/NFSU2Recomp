@@ -777,7 +777,14 @@ int ps_uses_colorout(const VSProg *p);
  *   ev 2: ornek.rgb = 1     -> A + B
  * G-tamponuna B = o2 - o1 (sis dahil) ve orijinal ornek R0 yazilir; sahne
  * sonunda birlestirme gecisi renk + B*(R_yeni - R0) hesaplar (bkz.
- * metal.m "HD: SSR").  Sinif: 1 = 2B (yol), 2 = kup (araba).          */
+ * metal.m "HD: SSR").  Sinif: 1 = 2B (yol), 2 = kup (araba).
+ * Hedeflerin bicimi ve kodlamasi: metal.m "G-TAMPONU PAKETLEME" (iki taraf
+ * ayni olmali; HD_GPACK=0 eski duzen).                                  */
+static int hd_gpack(void){
+    static int v = -1;
+    if (v < 0){ const char *e = getenv("HD_GPACK"); v = (e && *e == '0') ? 0 : 1; }
+    return v;
+}
 int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask, int reflk);
 int ps_to_msl_ex(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask){
     return ps_to_msl_ex2(p, id, out, cap, cubemask, -1);
@@ -999,18 +1006,31 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
     EMIT("  res.rgb = mix(P.fog.rgb, res.rgb, mix(1.0, saturate(i.fog), P.fog.a));\n");
     if (reflk >= 0){
         if (!hd_seen) return 0;             /* asama farkli bicimde: varyant yok */
+        int cls = ((cubemask >> reflk) & 1u) ? 2 : 1;
         EMIT("  hd_o[hd_ev] = res;\n  }\n");
         EMIT("  PSOut hd_out; hd_out.c0 = hd_o[0];\n");
-        EMIT("  hd_out.c1 = float4(hd_o[2].rgb - hd_o[1].rgb, %d.0);\n", ((cubemask >> reflk) & 1u) ? 2 : 1);
-        EMIT("  hd_out.c2 = float4(saturate(hd_rs.rgb), 1.0);\n");
-        /* kup: ornekleme vektoru = yansima yonu (araba boyasi icin isin) */
-        if ((cubemask >> reflk) & 1u) EMIT("  hd_out.c3 = float4(i.uv%d.xyz, 1.0);\n", reflk);
-        else                          EMIT("  hd_out.c3 = float4(0.0);\n");
+        if (hd_gpack()){
+            /* c1 = R0 + sinif/4, c2 = B/4, c3 = birim yon (kod 512 = sifir) */
+            EMIT("  hd_out.c1 = float4(saturate(hd_rs.rgb), %d.0 * 0.25);\n", cls);
+            EMIT("  hd_out.c2 = float4(saturate((hd_o[2].rgb - hd_o[1].rgb) * 0.25), 0.0);\n");
+            if (cls == 2) EMIT("  { float3 hd_d = i.uv%d.xyz; float hd_l = dot(hd_d, hd_d);\n"
+                               "    hd_out.c3 = float4((hd_l > 1e-20 ? hd_d * rsqrt(hd_l) : float3(0.0))"
+                               " * (511.0 / 1023.0) + 512.0 / 1023.0, 0.0); }\n", reflk);
+            else          EMIT("  hd_out.c3 = float4(float3(512.0 / 1023.0), 0.0);\n");
+        } else {
+            EMIT("  hd_out.c1 = float4(hd_o[2].rgb - hd_o[1].rgb, %d.0);\n", cls);
+            EMIT("  hd_out.c2 = float4(saturate(hd_rs.rgb), 1.0);\n");
+            /* kup: ornekleme vektoru = yansima yonu (araba boyasi icin isin) */
+            if (cls == 2) EMIT("  hd_out.c3 = float4(i.uv%d.xyz, 1.0);\n", reflk);
+            else          EMIT("  hd_out.c3 = float4(0.0);\n");
+        }
         EMIT("  return hd_out;\n}\n");
     } else if (NFS_ENHANCED){
         /* HD: yansimasiz opak cizim G-tamponunu SIFIRLAR (onundeki yolun
-         * verisini ortmeli); karisimli cizimlerde yazma maskesi kapali. */
-        EMIT("  PSOut hd_out; hd_out.c0 = res; hd_out.c1 = float4(0.0); hd_out.c2 = float4(0.0); hd_out.c3 = float4(0.0);\n");
+         * verisini ortmeli); karisimli cizimlerde yazma maskesi kapali.
+         * Paketli duzende sifir yon 512 koduyla yazilir (bkz. metal.m). */
+        EMIT("  PSOut hd_out; hd_out.c0 = res; hd_out.c1 = float4(0.0); hd_out.c2 = float4(0.0);\n");
+        EMIT("  hd_out.c3 = float4(%s);\n", hd_gpack() ? "float3(512.0 / 1023.0), 0.0" : "0.0");
         EMIT("  return hd_out;\n}\n");
     } else
         EMIT("  return res;\n}\n");
@@ -1400,11 +1420,16 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
         VEMIT("    device const uchar *VBASE [[buffer(1)]], device const uchar *KBASE [[buffer(2)]],\n");
         VEMIT("    device const uint *ITEM [[buffer(3)]], device const HDRec *REC [[buffer(4)]],\n");
         VEMIT("    device packed_float3 *OUTP [[buffer(5)]], device HDAttr *OUTA [[buffer(6)]],\n");
-        VEMIT("    constant HDCap &C [[buffer(7)]]) {\n");
+        VEMIT("    constant HDCap &C [[buffer(7)]], device const uchar *POOL [[buffer(8)]]) {\n");
         VEMIT("  if (tid >= C.count) return;\n");
         VEMIT("  uint g = C.first + tid; HDRec rc = REC[ITEM[g]]; uint vid = g - rc.first;\n");
         VEMIT("  device const VSPar &K = *(device const VSPar *)(KBASE + rc.koff);\n");
-        VEMIT("  device const uchar *B = VBASE + rc.rawoff + vid * K.stride;\n");
+        /* indisli kayit (metal.m KALICI KOSE / INDIS HAVUZU): kose ve indis havuzda */
+        VEMIT("  device const uchar *VB0 = VBASE;\n");
+        VEMIT("  if (rc.isz != 0u){ uint ix = (rc.isz == 4u) ? *(device const uint *)(POOL + rc.ib + vid * 4u)\n");
+        VEMIT("                                              : uint(*(device const ushort *)(POOL + rc.ib + vid * 2u));\n");
+        VEMIT("                     vid = uint(int(ix) + rc.base); VB0 = POOL; }\n");
+        VEMIT("  device const uchar *B = VB0 + rc.rawoff + vid * K.stride;\n");
         VEMIT("#define LDF(x)  (as_type<float>(*(device const uint*)(B+(x))))\n");
         VEMIT("#define LDB(x)  ((float)(B[(x)]))\n");
         VEMIT("#define LDS(x)  ((float)(*(device const short*)(B+(x))))\n");
