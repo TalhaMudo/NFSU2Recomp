@@ -285,7 +285,7 @@ static int tbl_row(uint32_t w, uint32_t h){
     return -1;
 }
 
-static uint32_t g_rs[256] = {0};
+uint32_t g_rs[256] = {0};        /* d3dx_hle.c satir ici etkisizlik denetimi de okur */
 /* RSLOG=1: oyunun HANGI render state'leri kurdugunu olc.  Ele almadigimiz
  * bir state'i kor tahminle uygulamak yerine once kullanildigini dogrula. */
 static uint32_t g_rs_hits[256] = {0};
@@ -305,8 +305,8 @@ typedef struct { uint32_t magic; uint32_t a[8]; int nargs; } SBRec;
 typedef struct { SBRec r[MAXSBREC]; int n; int used; } SBlock;
 static SBlock  g_sb[MAXSB];
 static int     g_sbn = 1;          /* 0 = gecersiz */
-static int     g_sb_rec = 0;       /* kayittaki blok, 0 = kayit yok */
-static int     g_sb_replay = 0;
+int     g_sb_rec = 0;       /* kayittaki blok, 0 = kayit yok (d3dx_hle.c okur) */
+int     g_sb_replay = 0;
 static uint64_t g_sb_applied = 0, g_sb_captured = 0, g_sb_dropped = 0, g_sb_full = 0;
 
 /* Ham durum golgeleri: Capture bunlardan okur (oyunun VERDIGI degerler). */
@@ -317,12 +317,12 @@ static uint32_t g_raw_tex[8] = {0};
  * rampasi -- yolun kendi (tekrarlanan) diffuse UV'siyle orneklendi; far
  * konisi tum yol boyunca kopyalandi ve zemin bastan basa patlak parladi.
  * Oyun bu durumu hic yazmiyor cunku varsayilan zaten dogru olmali. */
-static uint32_t g_tss_raw[8][40] = {
+uint32_t g_tss_raw[8][40] = {
     [0] = { [11] = 0u }, [1] = { [11] = 1u }, [2] = { [11] = 2u },
     [3] = { [11] = 3u }, [4] = { [11] = 4u }, [5] = { [11] = 5u },
     [6] = { [11] = 6u }, [7] = { [11] = 7u },
 };
-static uint32_t g_smp_raw[16][20];
+uint32_t g_smp_raw[16][20];
 
 /* Bu metot bir state block'a kaydedilir mi? */
 /* --- metot KIMLIGI ------------------------------------------------------
@@ -625,7 +625,7 @@ static int g_rs_init = 0;
  * yaziyor.  rs_apply tamamen g_rs'ten turedigi icin atlamak birebir
  * ayni sonucu verir.  Bayrak KALICI: metal henuz hazir degilken yapilan
  * degisiklikler cihaz gelince yine uygulanir. */
-static int g_rs_dirty = 1;
+int g_rs_dirty = 1;
 static uint64_t g_rs_skip = 0, g_rs_run = 0;
 static void rs_apply(void){
     g_rs_run++;
@@ -1539,7 +1539,7 @@ static int dip_indexed(uint32_t pt, uint32_t basev, uint32_t starti, uint32_t nt
 #include "dxrec.h"
 #define DXREC_DEPTH 8
 static DxRec *g_dxrec[DXREC_DEPTH];
-static int    g_dxrec_depth = 0;
+int    g_dxrec_depth = 0;
 const char *dxrec_mid_name(int mid){ return (mid > 0 && mid < MID__count) ? g_midname[mid] : "?"; }
 int dxrec_sb_recording(void){ return g_sb_rec != 0 || g_sb_replay != 0; }
 void dxrec_begin(DxRec *r, int kind){

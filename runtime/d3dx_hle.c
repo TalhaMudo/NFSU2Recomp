@@ -107,7 +107,6 @@ DX_WRAP(DX_ENDPASS,        0065addb)
 DX_WRAP(DX_END,            0065acf5)
 DX_WRAP(DX_SETMATRIX,      0066d13a)
 DX_WRAP(DX_SETVECTOR,      0066d303)
-DX_WRAP(DX_SETTEXTURE,     0066d7e9)
 DX_WRAP(DX_SETINTARRAY,    0066e8a9)
 DX_WRAP(DX_SETFLOAT,       0066f501)
 DX_WRAP(DX_SETVECTORARRAY, 0066ca38)
@@ -733,6 +732,19 @@ static int n4_dry, n4_dryn; static uint32_t n4_dryk[NDRY][4];
  *       adet) 7/8 Set{Vertex,Pixel}Shader(a0) 9/10 ...ConstantI 11/12 ...ConstantB
  *       (9..12 etkisizlik denetimi yok: her zaman yapilir) */
 static const int n4_nargs[13] = { 0, 2, 3, 3, 2, 3, 3, 1, 1, 3, 3, 3, 3 };
+/* Tur 1..3 icin com.c dxrec_call_redundant'in satir ici esi (ayni kural);
+ * kayit/tekrar/iz acikken -1: yavas yol (dxn_skip) karar verir. */
+extern uint32_t g_rs[256], g_tss_raw[8][40], g_smp_raw[16][20];
+extern int g_rs_dirty, g_sb_rec, g_sb_replay, g_dxrec_depth, g_fxtr;
+static inline int n4_red_fast(int kind, uint32_t a0, uint32_t a1, uint32_t a2){
+    if (g_sb_rec | g_sb_replay | g_dxrec_depth | g_fxtr) return -1;
+    switch (kind){
+    case 1: return a0 >= 256u || (g_rs[a0] == a1 && !g_rs_dirty);
+    case 2: return !(a0 < 8u && a1 < 40u) || g_tss_raw[a0][a1] == a2;
+    case 3: return !(a0 < 16u && a1 < 20u) || g_smp_raw[a0][a1] == a2;
+    }
+    return -1;
+}
 static inline uint32_t n4_dev(CPU *c, uint32_t dev, int kind, uint32_t off, uint32_t ret,
                               uint32_t a0, uint32_t a1, uint32_t a2){
     if (n4_dry){
@@ -740,7 +752,8 @@ static inline uint32_t n4_dev(CPU *c, uint32_t dev, int kind, uint32_t off, uint
                              n4_dryk[n4_dryn][2] = a1; n4_dryk[n4_dryn][3] = a2; }
         n4_dryn++; return 0;
     }
-    if (dxn_skip(kind, a0, a1, a2)){ n4_skipped++; return 0; }
+    int f = n4_red_fast(kind, a0, a1, a2);
+    if (f > 0 || (f < 0 && dxn_skip(kind, a0, a1, a2))){ n4_skipped++; return 0; }
     n4_issued++;
     uint32_t fn = MR32(MR32(dev) + off);
     int na = n4_nargs[kind];
@@ -755,54 +768,60 @@ static inline uint32_t n4_dev(CPU *c, uint32_t dev, int kind, uint32_t off, uint
  * dword ve deger tamponunun ilk dword'u son gercek 664a2f'den beri
  * degismediyse degerlendirme ayni sonucu yazardi -> atla.  En fazla 2
  * girdi / 64 bayt; daha buyukler her zaman degerlendirilir. */
-typedef struct { uint32_t R, th, dst, dval, vb, vval, eax, n; uint32_t dp[2], nb[2]; uint8_t d[128]; } N4Memo;
-#define N4M_CAP 8192u
+typedef struct { uint32_t R, th, dst, dval, vb, vval, eax, n, base; uint32_t rec[2], pp[2], dp[2], nb[2]; uint8_t d[96]; } N4Memo;
+#define N4M_CAP 2048u
 static N4Memo *g_n4m;
 static int g_n4m_on = -1;
 static uint64_t n4m_hit, n4m_miss, n4m_big, n4m_why[4];
 void sub_00664a2f_orig(CPU *c);
-/* 1: girdiler toplandi (n, dp, nb doldu); 0: notlanamaz */
-static inline int n4m_inputs(uint32_t R, uint32_t *n, uint32_t *dp, uint32_t *nb){
+/* 1: girdiler toplandi (rec, pp, dp, nb doldu); 0: notlanamaz */
+static inline int n4m_inputs(uint32_t R, uint32_t *n, uint32_t *rec, uint32_t *pp, uint32_t *dp, uint32_t *nb){
     if (!MR32(R+0x38u) || (MR8(R+0x30u) & 4)){ n4m_why[0]++; return 0; }
     if (!MR32(R+0x3cu)){ n4m_why[1]++; return 0; }
     uint32_t k = MR16(R+0x4eu), base = MR32(R+0x34u), tot = 0;
     if (k == 0 || k > 2u){ n4m_why[2]++; return 0; }
     for (uint32_t i = 0; i < k; i++){
-        uint32_t pp = MR32(base + i*32u + 0xcu), d = MR32(pp), ds = MR32(pp+4u);
+        uint32_t r = base + i*32u, p = MR32(r + 0xcu), d = MR32(p), ds = MR32(p+4u);
         uint32_t el = MR32(ds+0x10u); if (!el) el = 1;
         uint32_t rows = MR32(ds+0x14u); if (!rows) rows = 1;
         uint32_t b = d ? el*rows*16u : 0u;
-        tot += b; if (tot > 128u){ n4m_why[3]++; return 0; }
-        dp[i] = d; nb[i] = b;
+        tot += b; if (tot > 96u){ n4m_why[3]++; return 0; }
+        rec[i] = r; pp[i] = p; dp[i] = d; nb[i] = b;
     }
     *n = k; return 1;
 }
 static inline uint32_t n4_eval(CPU *c, uint32_t th, uint32_t a, uint32_t b, uint32_t R, uint32_t P, uint32_t ret){
     if (g_n4m_on < 0){ const char *e = getenv("D3DXN4MEMO"); g_n4m_on = e ? atoi(e) != 0 : 1;
                        if (g_n4m_on) g_n4m = calloc(N4M_CAP, sizeof *g_n4m); }
-    uint32_t n = 0, dp[2] = {0,0}, nb[2] = {0,0};
     N4Memo *s = NULL;
     uint32_t dst = MR32(R+0x48u) + MR32(P), vb = MR32(R+8u);
-    if (g_n4m && n4m_inputs(R, &n, dp, nb)){
-        s = &g_n4m[((R >> 2) * 0x9E3779B1u) >> 19];
-        if (s->R == R && s->th == th && s->dst == dst && s->vb == vb && s->n == n
-            && dp[0] == s->dp[0] && nb[0] == s->nb[0] && (n < 2 || (dp[1] == s->dp[1] && nb[1] == s->nb[1]))
+    if (g_n4m){
+        s = &g_n4m[((R >> 2) * 0x9E3779B1u) >> 21];
+        /* isabet: ayni durum, girdi kayitlari ayni parametreyi gosteriyor,
+         * veri ve hedef/deger tamponu son gercek degerlendirmedeki gibi */
+        if (s->R == R && s->th == th && s->dst == dst && s->vb == vb && s->n
+            && MR16(R+0x4eu) == s->n && MR32(R+0x34u) == s->base
+            && MR32(s->rec[0] + 0xcu) == s->pp[0] && MR32(s->pp[0]) == s->dp[0]
+            && (s->n < 2 || (MR32(s->rec[1] + 0xcu) == s->pp[1] && MR32(s->pp[1]) == s->dp[1]))
             && rd32s(dst) == s->dval && rd32s(vb) == s->vval
-            && !memcmp(s->d, g_mem + dp[0], nb[0]) && (n < 2 || !memcmp(s->d + nb[0], g_mem + dp[1], nb[1]))){
+            && !memcmp(s->d, g_mem + s->dp[0], s->nb[0])
+            && (s->n < 2 || !memcmp(s->d + s->nb[0], g_mem + s->dp[1], s->nb[1]))){
             n4m_hit++;
             return s->eax;
         }
-        n4m_miss++;
-    } else if (g_n4m) n4m_big++;
+    }
+    uint32_t n = 0, rec[2] = {0,0}, pp[2] = {0,0}, dp[2] = {0,0}, nb[2] = {0,0};
+    int ok = g_n4m && n4m_inputs(R, &n, rec, pp, dp, nb);
+    if (g_n4m){ if (ok) n4m_miss++; else n4m_big++; }
     c->ecx = th; PUSH32(b); PUSH32(a); PUSH32(ret);
     if (g_n4m) sub_00664a2f_orig(c); else sub_00664a2f(c);
     uint32_t r = c->eax;
-    if (s){
-        s->R = R; s->th = th; s->dst = dst; s->vb = vb; s->n = n; s->eax = r;
-        s->dp[0] = dp[0]; s->nb[0] = nb[0]; s->dp[1] = dp[1]; s->nb[1] = nb[1];
+    if (ok){
+        s->R = R; s->th = th; s->dst = dst; s->vb = vb; s->n = n; s->eax = r; s->base = MR32(R+0x34u);
+        for (uint32_t i = 0; i < 2; i++){ s->rec[i] = rec[i]; s->pp[i] = pp[i]; s->dp[i] = dp[i]; s->nb[i] = nb[i]; }
         memcpy(s->d, g_mem + dp[0], nb[0]); if (n > 1) memcpy(s->d + nb[0], g_mem + dp[1], nb[1]);
         s->dval = rd32s(dst); s->vval = rd32s(vb);
-    }
+    } else if (s) s->R = 0;
     return r;
 }
 /* ---- Asama 4c: yerel sampler uygulayici, sub_00668cd0(this, P, Rbas, Rson) ret 12 ----
@@ -1020,6 +1039,88 @@ void sub_00668e0d(CPU *c){
     sub_00668e0d_orig(c);
 out:
     if (t0){ g_dx[DX_668E0D].ticks += mach_absolute_time() - t0; g_dx[DX_668E0D].n++; }
+}
+
+/* ---- Asama 4e: yerel SetTexture yolu ----
+ * sub_0065ccd8(this, doku, i, o40) ret 12: nesne tablosu yuvasi
+ *   y = [this+0x18] + (o40 ? [[o40+8] + i*4] : i)*24;  [y+4] == doku ise 0.
+ *   doku->AddRef, eski->Release, [y+4] = doku; o40 varsa havuz halkasi
+ *   ([o40+0x10] .. o40, dugum: +0 efekt, +8 indeks tablosu) her efektin
+ *   yuvasina ayni: AddRef(yeni), Release(eski), yaz.  0 doner.
+ * com.c'de doku AddRef/Release'in hicbir yan etkisi yok (1/0 doner):
+ *   hedef bir com.c dokusuysa cagri atlanir.
+ * sub_0066d7e9 SetTexture(this, h, doku) ret 12: h < 0 ise kayit = ~h
+ *   (metin tutamaci -> orijinal); dizi parametresi + eleman yoksa ya da tur
+ *   5..9 degilse 0x8876086c; [this+0x3c]==3 -> orijinal (666a78 yolu);
+ *   yuva ayniysa 0; degilse 65ccd8 sonra 66056c(this, kayit).
+ *   D3DXNATIVE8=0 kapatir. */
+void sub_0065ccd8_orig(CPU *c);
+extern int g_fxtr; int fxtr_now(void);
+static int g_n8_on = -1;
+static uint64_t n8_tex, n8_set, n8_refskip;
+static inline int n8_init(void){
+    if (g_n8_on < 0){ const char *e = getenv("D3DXNATIVE8"); g_n8_on = e ? atoi(e) != 0 : 1; }
+    return g_n8_on;
+}
+static inline void n8_ref(CPU *c, uint32_t obj, uint32_t off, uint32_t ret){
+    uint32_t fn = MR32(MR32(obj) + off);
+    if ((fn & 0xF0000000u) == 0xE0000000u && ((fn >> 16) & 0x1fffu) == 3u && !(g_fxtr && fxtr_now())){
+        n8_refskip++; return; }
+    PUSH32(obj); PUSH32(ret); dispatch_indirect(c, fn);
+}
+static void n8_store(CPU *c, uint32_t th, uint32_t tex, uint32_t ix, uint32_t o40){
+    n8_tex++;
+    uint32_t y = MR32(th+0x18u) + (o40 ? MR32(MR32(o40+8u) + ix*4u) : ix)*24u;
+    if (MR32(y+4u) == tex) return;
+    if (tex) n8_ref(c, tex, 4u, 0x65cd10u);
+    uint32_t old = MR32(y+4u);
+    if (old){ n8_ref(c, old, 8u, 0x65cd1du); MR32(y+4u) = 0; }
+    MR32(y+4u) = tex;
+    if (!o40) return;
+    for (uint32_t nd = MR32(o40+0x10u); nd != o40; nd = MR32(nd+0x10u)){
+        uint32_t ef = MR32(nd);
+        if (!ef) continue;
+        uint32_t y2 = MR32(ef+0x18u) + MR32(MR32(nd+8u) + ix*4u)*24u, nw = MR32(y+4u);
+        if (nw) n8_ref(c, nw, 4u, 0x65cd52u);
+        uint32_t o2 = MR32(y2+4u);
+        if (o2){ n8_ref(c, o2, 8u, 0x65cd5fu); MR32(y2+4u) = 0; }
+        MR32(y2+4u) = MR32(y+4u);
+    }
+}
+void sub_0065ccd8(CPU *c){
+    if (!n8_init()){ sub_0065ccd8_orig(c); return; }
+    uint32_t sp = c->esp, ret = MR32(sp), th = c->ecx;
+    PUSH32(c->ebp); PUSH32(c->ebx); PUSH32(c->esi); PUSH32(c->edi);  /* orijinal prolog: alt cagrilar ayni esp'yi gorsun */
+    n8_store(c, th, MR32(sp+4u), MR32(sp+8u), MR32(sp+12u));
+    c->esp = sp + 16u; c->eip = ret; c->eax = 0;
+}
+void sub_0066056c(CPU *c);
+void sub_0066d7e9_orig(CPU *c);
+void sub_0066d7e9(CPU *c){
+    uint64_t t0 = dx_on() ? mach_absolute_time() : 0;
+    uint32_t sp = c->esp, th = MR32(sp+4u), h = MR32(sp+8u), tex = MR32(sp+12u);
+    if (!n8_init() || (int32_t)h >= 0 || MR32(th+0x3cu) == 3u){ sub_0066d7e9_orig(c); goto out; }
+    {
+    n8_set++;
+    uint32_t ret = MR32(sp), rec = ~h, d = MR32(rec+4u), r;
+    if ((MR32(d+0x10u) && MR32(rec+8u) == 0xffffffffu) || (int32_t)MR32(d) < 5 || (int32_t)MR32(d) > 9){
+        r = 0x8876086cu; goto done;
+    }
+    uint32_t o40 = MR32(MR32(MR32(th+0xb0u) + MR32(rec+0x14u)*4u) + 0x40u), ix = MR32(MR32(rec));
+    uint32_t e = o40 ? MR32(MR32(o40+8u) + ix*4u) : ix;
+    if (tex == MR32(MR32(th+0x18u) + e*24u + 4u)){ r = 0; goto done; }
+    PUSH32(c->ebp); PUSH32(c->ebx); PUSH32(c->esi); PUSH32(c->edi);
+    PUSH32(c->ebp); PUSH32(c->ebx); PUSH32(c->esi); PUSH32(c->edi);   /* 65ccd8'in prologu */
+    n8_store(c, th, tex, ix, o40);
+    c->esp += 16u;
+    c->ecx = th; PUSH32(rec); PUSH32(0x66d8afu); sub_0066056c(c);
+    r = c->eax;
+    c->esp += 16u;
+done:
+    c->eax = r; c->esp = sp + 16u; c->eip = ret;
+    }
+out:
+    if (t0){ g_dx[DX_SETTEXTURE].ticks += mach_absolute_time() - t0; g_dx[DX_SETTEXTURE].n++; }
 }
 
 /* Cekirdek: 1 dondururse durum yerelde uygulandi, *res = 669296'nin donus
@@ -1660,11 +1761,13 @@ void d3dx_hle_report(void){
             (unsigned long long)n4_calls, (unsigned long long)n4_dirty,
             (unsigned long long)n4_issued, (unsigned long long)n4_skipped);
         fprintf(stderr, "  yerel gecis dongusu (6691b1, Asama 4b): %llu\n", (unsigned long long)n5_calls);
-        fprintf(stderr, "  ifade notu: isabet %llu, kacan %llu, notlanamaz %llu (ifade degil %llu, girdisiz %llu, girdi>2 %llu, >128 bayt %llu)\n",
+        fprintf(stderr, "  ifade notu: isabet %llu, kacan %llu, notlanamaz %llu (ifade degil %llu, girdisiz %llu, girdi>2 %llu, >96 bayt %llu)\n",
             (unsigned long long)n4m_hit, (unsigned long long)n4m_miss, (unsigned long long)n4m_big,
             (unsigned long long)n4m_why[0], (unsigned long long)n4m_why[1], (unsigned long long)n4m_why[2], (unsigned long long)n4m_why[3]);
         if (n4vs.runs) fprintf(stderr, "  DOGRULAMA-4: %llu kosu, FARKLI %llu (kayit gecersiz, karsilastirilmadi: %llu)\n",
             (unsigned long long)n4vs.runs, (unsigned long long)n4vs.bad, (unsigned long long)n4vs.norec);
+        if (n8_set || n8_tex) fprintf(stderr, "  yerel SetTexture: %llu | doku yuvasi (65ccd8): %llu | atlanan doku AddRef/Release: %llu\n",
+            (unsigned long long)n8_set, (unsigned long long)n8_tex, (unsigned long long)n8_refskip);
         if (n7vs.runs || n7_calls) fprintf(stderr, "  yerel shader uygulayici (668e0d): %llu | DOGRULAMA-7: %llu kosu, FARKLI %llu (karsilastirilmadi %llu) | nesne durumu (tur 14/15): %llu\n",
             (unsigned long long)n7_calls, (unsigned long long)n7vs.runs, (unsigned long long)n7vs.bad, (unsigned long long)n7vs.norec, (unsigned long long)n4_obj);
         if (n6vs.runs || n6_calls) fprintf(stderr, "  yerel sampler uygulayici (668cd0): %llu | DOGRULAMA-6: %llu kosu, FARKLI %llu (karsilastirilmadi %llu)\n",
