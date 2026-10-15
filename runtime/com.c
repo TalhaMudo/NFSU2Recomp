@@ -1615,6 +1615,31 @@ static int dxrec_call_redundant(int mid, const uint32_t *a, const uint8_t *d, ui
         return dlen == 0 || !memcmp(g_psc[a[0]], d, dlen);
     return 0;
 }
+/* D3DX yerel yolu (d3dx_hle.c, Asama 4): bu cihaz cagrisi SIMDI yapilsa
+ * etkisiz mi?  Etkisizse cagiran onu hic yapmaz (konuk dagitimi + com_call
+ * tasarrufu).  Durum blogu kaydi/tekrari, acik dxrec kaydi ya da FXTRACE
+ * karesinde HAYIR: cagri gercekten yapilmali ki kayda/ize girsin.
+ * kind: 1 SetRenderState(a0, a1), 2 SetTextureStageState(a0, a1, a2),
+ *       3 SetSamplerState(a0, a1, a2), 4 SetTexture(a0, a1),
+ *       5/6 Set{Vertex,Pixel}ShaderConstantF(a0, a1=veri, a2), 7/8 Set{Vertex,Pixel}Shader(a0). */
+int fxtr_now(void); extern int g_fxtr;
+int dxn_skip(int kind, uint32_t a0, uint32_t a1, uint32_t a2){
+    if (g_sb_rec || g_sb_replay || g_dxrec_depth) return 0;
+    if (g_fxtr && fxtr_now()) return 0;
+    uint32_t a[3] = { a0, a1, a2 };
+    int mid = kind == 1 ? MID_SetRenderState : kind == 2 ? MID_SetTextureStageState
+            : kind == 3 ? MID_SetSamplerState : kind == 4 ? MID_SetTexture
+            : kind == 5 ? MID_SetVertexShaderConstantF : kind == 6 ? MID_SetPixelShaderConstantF
+            : kind == 7 ? MID_SetVertexShader : kind == 8 ? MID_SetPixelShader : 0;
+    if (!mid) return 0;
+    if (kind == 5 || kind == 6){                 /* a1: konuk veri isaretcisi */
+        uint32_t dlen = dxrec_datalen(mid, a);
+        if (!dlen) return 0;
+        if (!a1 || !mem_is_committed(a1) || !mem_is_committed(a1 + dlen - 1u)) return 0;
+        return dxrec_call_redundant(mid, a, g_mem + a1, dlen);
+    }
+    return dxrec_call_redundant(mid, a, NULL, 0);
+}
 static int dxrec_supported(int mid){
     return MID(SetRenderState) || MID(SetSamplerState) || MID(SetTextureStageState)
         || MID(SetTexture) || MID(SetVertexShader) || MID(SetPixelShader)
@@ -1718,6 +1743,43 @@ void comstat_report(void){
     }
 }
 
+/* FXTRACE=<kare>[,<kare>...]: o karelerde her cihaz cagrisini (argumanlar,
+ * sabit/matris verisi) ve d3dx_hle.c'den gelen efekt metodu isaretlerini
+ * sirayla basar.  Yerel ID3DXEffect'in D3DX ile ayni cihaz durumunu
+ * uretmesi icin davranis referansi (D3DX_HLE.md, Asama 4). */
+int g_fxtr = 0;
+static uint32_t g_fxtr_fr[8]; static int g_fxtr_nf;
+__attribute__((constructor)) static void fxtr_init(void){
+    const char *e = getenv("FXTRACE");
+    for (; e && *e && g_fxtr_nf < 8; ){
+        g_fxtr_fr[g_fxtr_nf++] = (uint32_t)strtoul(e, (char**)&e, 10);
+        if (*e == ',') e++; else break;
+    }
+    g_fxtr = g_fxtr_nf > 0;
+}
+int fxtr_now(void){
+    for (int i = 0; i < g_fxtr_nf; i++) if (g_fxtr_fr[i] == g_present_no) return 1;
+    return 0;
+}
+static void fxtr_floats(uint32_t p, uint32_t n){
+    for (uint32_t i = 0; i < n; i++){
+        float f; uint32_t u = (p && mem_is_committed(p+4u*i)) ? MR32(p+4u*i) : 0u;
+        memcpy(&f, &u, 4); fprintf(stderr, "%s%g", (i&3) ? "," : (i ? " | " : " "), f);
+    }
+}
+static void fxtr_dev(CPU *c, int iface, int mid, int nargs, const char *nm){
+    if (iface != IF_DEV){
+        if (iface == IF_STATEBLOCK || ((MID(AddRef) || MID(Release)) && iface == IF_TEX))
+            fprintf(stderr, "D  [%d]%s %08x\n", iface, nm, A(c,0));
+        return;
+    }
+    fprintf(stderr, "D  %s", nm);
+    for (int i = 1; i < nargs && i < 7; i++) fprintf(stderr, " %x", A(c,i));
+    if (MID(SetVertexShaderConstantF) || MID(SetPixelShaderConstantF)) fxtr_floats(A(c,2), A(c,3)*4u);
+    else if (MID(SetTransform)) fxtr_floats(A(c,2), 16u);
+    fprintf(stderr, "\n");
+}
+
 int com_call(CPU *c, uint32_t magic){
     uint32_t iface=(magic>>16)&0x1FFFu, m=magic&0xFFFFu;
     g_com_calls++;
@@ -1737,6 +1799,7 @@ int com_call(CPU *c, uint32_t magic){
     } else mid = mid_resolve(nm);
 
     if (g_dxrec_depth) dxrec_note(c, (int)iface, mid, nargs);
+    if (g_fxtr && fxtr_now()) fxtr_dev(c, (int)iface, mid, nargs, nm);
     /* ZSEQ=<kare>: o karede hedef / Z yuzeyi / Clear / Z durumu sirasi (tani) */
     if (iface==IF_DEV && ENVC("ZSEQ") && g_present_no == (uint32_t)atoi(ENVC("ZSEQ"))){
         static unsigned nd = 0;

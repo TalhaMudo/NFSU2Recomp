@@ -1490,6 +1490,25 @@ typedef struct { uint32_t tex0, tex1, tex2, flags; float c0[4]; float fogc[4]; f
 static int g_rt = -1;
 static id<MTLComputePipelineState> g_hd_vsk[HD_MAXVSI];
 static id<MTLBuffer> g_rt_pos, g_rt_attr, g_rt_scratch, g_rt_item[3], g_rt_rec[3], g_rt_mat[3], g_rt_arg[3];
+/* --- ANLIK YAPI: YERINDE GUNCELLEME (refit) -------------------------------
+ * Hareketli geometrinin yapisi her karede bastan kuruluyordu.  Bir onceki
+ * karedekiyle ayni cizimler ayni sirada ve ayni ucgen sayisiyla geldiyse
+ * ucgen duzeni aynidir; yalnizca konumlar degisir.  O zaman agac yeniden
+ * kurulmaz, kutulari yeni konumlara uydurulur (refit, kurulumun kucuk bir
+ * kesri).  Hareket agaci zamanla gevsettigi icin her RT_REFIT_MAX karede
+ * bir yine bastan kurulur.  HD_RT_REFIT=0 eski davranis. */
+#define RT_REFIT_MAX 20u
+static uint64_t g_rt_dsig;                      /* son kurulan/uydurulan duzenin imzasi */
+static uint32_t g_rt_dsince = 0xFFFFFFFFu;      /* son tam kurulumdan beri kare */
+static _Atomic unsigned long long g_rt_nbuild, g_rt_nrefit;
+static int hd_rt_refit_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("HD_RT_REFIT"); v = (e && *e == '0') ? 0 : 1; }
+    return v;
+}
+static MTLAccelerationStructureUsage hd_rt_dyn_usage(void){
+    return MTLAccelerationStructureUsagePreferFastBuild | (hd_rt_refit_on() ? MTLAccelerationStructureUsageRefit : 0);
+}
 static id<MTLBuffer> g_rt_sposb[2], g_rt_sattrb[2], g_rt_sscratch, g_rt_tscratch, g_rt_inst;
 static unsigned g_rt_sbuf;           /* etkin sabit tampon cifti (sikistirmada degisir) */
 #define g_rt_spos  g_rt_sposb[g_rt_sbuf]
@@ -1533,13 +1552,16 @@ static NSString *kRTFSrc = @
 "  return q.xy / (abs(d) < 1e-6 ? 1e-6 : d); }\n"
 /* Isinlar HESAPLAMA cekirdeginde atilir.  Ayni kod parca gölgelendiricisinde
  * olculdu: GPU ~14 ms/kare (oyun GPU'ya takildi, ~74 fps); cekirdekte ~2 ms. */
-"kernel void hd_rt_kern(uint2 tid [[thread_position_in_grid]],\n"
+"kernel void hd_rt_kern(uint2 tid0 [[thread_position_in_grid]],\n"
 "    texture2d<float, access::write> outp [[texture(0)]], depth2d<float> dep [[texture(1)]],\n"
 "    texture2d<float> g1 [[texture(2)]], texture2d<float> g3 [[texture(4)]],\n"
 "    constant SSRP &S [[buffer(0)]], instance_acceleration_structure acc [[buffer(1)]],\n"
 "    device const HDMat *MAT [[buffer(3)]],\n"
 "    device const HDAttr *ATT [[buffer(4)]], constant HDTex &TX [[buffer(6)]],\n"
 "    device const HDAttr *SATT [[buffer(7)]]) {\n"
+/* S.cb2.w = 0 tam; 1/2 = satranc tahtasinin o karedeki yarisi (bkz. YARIM ISIN) */
+"  uint par = uint(S.cb2.w + 0.5);\n"
+"  uint2 tid = par == 0u ? tid0 : uint2(tid0.x * 2u + ((tid0.y + par) & 1u), tid0.y);\n"
 /* S.cb0.w = olcek (1 ya da 2): cikti (W/olcek, H/olcek); her cikti pikseli tam
  * cozunurluklu G-tamponunun (tid * olcek) pikselini temsil eder. */
 "  uint sc = uint(max(S.cb0.w, 1.0));\n"
@@ -1650,13 +1672,8 @@ static NSString *kRTFSrc = @
 "  }\n"
 "}\n"
 /* birlestirme: renk + B * (R_yeni - R0) */
-"fragment float4 hd_rtc_frag(FSO in [[stage_in]],\n"
-"    texture2d<float> scene [[texture(0)]], depth2d<float> dep [[texture(1)]],\n"
-"    texture2d<float> g1 [[texture(2)]],\n"
-"    texture2d<float> g2 [[texture(3)]], texture2d<float> rt [[texture(5)]],\n"
-"    constant SSRP &S [[buffer(0)]]) {\n"
-"  uint2 px = uint2(in.pos.xy);\n"
-"  float4 c = scene.read(px);\n"
+"static float4 rtc(uint2 px, float4 c, depth2d<float> dep, texture2d<float> g1,\n"
+"                  texture2d<float> g2, texture2d<float> rt, constant SSRP &S) {\n"
 "  float4 gb = g1.read(px);\n"
 "  int dbg = int(S.cam.w) - 1;\n"
 "  float cls = GB_CLS(gb);\n"
@@ -1687,7 +1704,34 @@ static NSString *kRTFSrc = @
 "  float3 R0 = GB_R0(gb, gv);\n"
 "  float3 Rn = mix(R0, r.rgb, r.a * S.prm.z);\n"
 "  return float4(c.rgb + GB_B(gb, gv) * (Rn - R0), c.a);\n"
+"}\n"
+"fragment float4 hd_rtc_frag(FSO in [[stage_in]],\n"
+"    texture2d<float> scene [[texture(0)]], depth2d<float> dep [[texture(1)]],\n"
+"    texture2d<float> g1 [[texture(2)]],\n"
+"    texture2d<float> g2 [[texture(3)]], texture2d<float> rt [[texture(5)]],\n"
+"    constant SSRP &S [[buffer(0)]]) {\n"
+"  uint2 px = uint2(in.pos.xy);\n"
+"  return rtc(px, scene.read(px), dep, g1, g2, rt, S);\n"
+"}\n"
+/* kopyasiz: pikselin kendi rengi karo belleginden (programlanabilir karistirma) */
+"fragment float4 hd_rtc_frag_fb(FSO in [[stage_in]], float4 c [[color(0)]],\n"
+"    depth2d<float> dep [[texture(1)]], texture2d<float> g1 [[texture(2)]],\n"
+"    texture2d<float> g2 [[texture(3)]], texture2d<float> rt [[texture(5)]],\n"
+"    constant SSRP &S [[buffer(0)]]) {\n"
+"  return rtc(uint2(in.pos.xy), c, dep, g1, g2, rt, S);\n"
 "}\n";
+/* --- KOPYASIZ BIRLESTIRME ----------------------------------------------------
+ * Isin izleme birlestirmesi her pikselde yalnizca KENDI rengini okur.  Eskiden
+ * once tum ekran bir kopyaya aktariliyor (3024x1964'te 0.34 ms GPU, ~46 MB
+ * trafik), sonra tum ekran bastan yaziliyordu.  Apple GPU'larinda gecis ekrani
+ * yukleyip pikselin rengini karo belleginden okuyabilir: kopya gerekmez.  SSR
+ * (baska piksellerden ornekler) ve tekil MSAA kipi eski yolda.  HD_RT_FB=0 eski. */
+static id<MTLRenderPipelineState> g_rt_pso_fb;
+static int hd_rt_fb_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("HD_RT_FB"); v = !(e && *e == '0') && [g_dev supportsFamily:MTLGPUFamilyApple1]; }
+    return v;
+}
 static void hd_rt_init(void){
     if (!hd_rt_on() || g_rt_pso) return;
     NSError *e = nil;
@@ -1707,6 +1751,10 @@ static void hd_rt_init(void){
     pd.fragmentFunction = ff;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     g_rt_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+    if (hd_rt_fb_on()){ MTLRenderPipelineDescriptor *pf = [pd copy];
+        pf.fragmentFunction = [lib newFunctionWithName:@"hd_rtc_frag_fb"];
+        NSError *ef = nil; g_rt_pso_fb = [g_dev newRenderPipelineStateWithDescriptor:pf error:&ef];
+        if (!g_rt_pso_fb) fprintf(stderr, "[HD] kopyasiz birlestirme kurulamadi: %s\n", [[ef localizedDescription] UTF8String]); }
     if (hd_msaa_n() > 1){ pd.rasterSampleCount = (NSUInteger)hd_msaa_n();
                           g_rt_pso_ms = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e]; }
     if (!g_rt_pso){ fprintf(stderr, "[HD] RT boru hatti kurulamadi: %s\n", [[e localizedDescription] UTF8String]); g_rt = 0; return; }
@@ -1731,10 +1779,11 @@ static void hd_rt_init(void){
         gd.triangleCount = (k ? RT_SMAXV : RT_MAXV) / 3; gd.opaque = YES;
         MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
         ad.geometryDescriptors = @[gd];
-        ad.usage = k ? MTLAccelerationStructureUsageNone : MTLAccelerationStructureUsagePreferFastBuild;
+        ad.usage = k ? MTLAccelerationStructureUsageNone : hd_rt_dyn_usage();
         MTLAccelerationStructureSizes sz = [g_dev accelerationStructureSizesWithDescriptor:ad];
         id<MTLAccelerationStructure> a = [g_dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
-        id<MTLBuffer> sc = [g_dev newBufferWithLength:sz.buildScratchBufferSize options:MTLResourceStorageModePrivate];
+        NSUInteger scs = sz.buildScratchBufferSize > sz.refitScratchBufferSize ? sz.buildScratchBufferSize : sz.refitScratchBufferSize;
+        id<MTLBuffer> sc = [g_dev newBufferWithLength:scs options:MTLResourceStorageModePrivate];
         if (k){ g_rt_sas = a; g_rt_sscratch = sc; } else { g_rt_as = a; g_rt_scratch = sc; }
     }
     g_rt_inst = [g_dev newBufferWithLength:2 * sizeof(MTLAccelerationStructureInstanceDescriptor)
@@ -2086,11 +2135,14 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     g_rt_stamp++; g_rt_texs[0] = g_white;
     /* terfi edenlerin GPU kopyalari: (anlik ilk kose, sabit ilk kose, adet) */
     static uint32_t cp[512][3]; unsigned ncp = 0;
+    uint64_t dsig = 1469598103934665603ull;         /* anlik ucgen duzeninin imzasi (bkz. refit) */
     /* --- 2. gecis: kayitlar + malzemeler --- */
     for (unsigned i = 0; i < upto && i < MAXD; i++){
         if (!act[i]) continue;
         MDraw *dr = &g_dbuf[rb][i];
         unsigned n = dr->count - dr->count % 3u, f = fill[dr->vsid];
+        { uint64_t w[4] = { (uint64_t)dr->vsid << 32 | n, (uint64_t)(uint32_t)dr->ps << 32 | dr->tex, dr->gh, f };
+          for (int q = 0; q < 4; q++){ dsig ^= w[q]; dsig *= 1099511628211ull; } }
         fill[dr->vsid] += n;
         int base = dr->ps % PSREFL, cube = base >= PSCUBE, b = base % PSCUBE;
         HDMatC m; rt_mat_of(dr, &m);
@@ -2248,18 +2300,31 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
             [be fillBuffer:g_rt_spos range:NSMakeRange((NSUInteger)g_rt_zr[q][0] * 12, (NSUInteger)g_rt_zr[q][1] * 12) value:0];
         [be endEncoding];
     }
-    /* --- GPU: alt yapilar + ust yapi --- */
-    id<MTLAccelerationStructureCommandEncoder> ae = pp_accel(cb, "RT: ivme yapisi kurulumu");
+    /* --- GPU: alt yapilar + ust yapi (profilde ayri kalemler) --- */
+    id<MTLAccelerationStructureCommandEncoder> ae = nil;
     int have_dyn = total >= 3;
     if (have_dyn){
+        dsig ^= (uint64_t)total; dsig *= 1099511628211ull;
+        int refit = hd_rt_refit_on() && dsig == g_rt_dsig && g_rt_dsince < RT_REFIT_MAX;
+        ae = pp_accel(cb, refit ? "RT: anlik yapi (refit)" : "RT: anlik yapi kurulumu");
         MTLAccelerationStructureTriangleGeometryDescriptor *gd =
             [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
         gd.vertexBuffer = g_rt_pos; gd.vertexStride = 12; gd.triangleCount = total / 3; gd.opaque = YES;
         MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
-        ad.geometryDescriptors = @[gd]; ad.usage = MTLAccelerationStructureUsagePreferFastBuild;
-        [ae buildAccelerationStructure:g_rt_as descriptor:ad scratchBuffer:g_rt_scratch scratchBufferOffset:0];
-    }
+        ad.geometryDescriptors = @[gd]; ad.usage = hd_rt_dyn_usage();
+        if (refit){
+            [ae refitAccelerationStructure:g_rt_as descriptor:ad destination:g_rt_as
+                             scratchBuffer:g_rt_scratch scratchBufferOffset:0];
+            g_rt_dsince++; atomic_fetch_add(&g_rt_nrefit, 1ull);
+        } else {
+            [ae buildAccelerationStructure:g_rt_as descriptor:ad scratchBuffer:g_rt_scratch scratchBufferOffset:0];
+            g_rt_dsince = 0; atomic_fetch_add(&g_rt_nbuild, 1ull);
+        }
+        g_rt_dsig = dsig;
+        [ae endEncoding]; ae = nil;
+    } else g_rt_dsince = 0xFFFFFFFFu;
     if (g_rt_sdirty && g_rt_scur >= 3 && (g_rt_sbuilt == 0 || frame - g_rt_last_sbuild >= RT_SREBUILD)){
+        ae = pp_accel(cb, "RT: sabit yapi kurulumu");
         MTLAccelerationStructureTriangleGeometryDescriptor *gd =
             [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
         gd.vertexBuffer = g_rt_spos; gd.vertexStride = 12; gd.triangleCount = g_rt_scur / 3; gd.opaque = YES;
@@ -2271,9 +2336,11 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         for (unsigned q = 0; q < g_rt_mpend_n && g_rt_mfree_n < RT_SMAXE; q++) g_rt_mfree[g_rt_mfree_n++] = g_rt_mpend[q];
         g_rt_mpend_n = 0;
         atomic_fetch_add(&g_rt_sbuilds, 1ull);
+        [ae endEncoding]; ae = nil;
     }
     int have_st = g_rt_sbuilt >= 3;
-    if (!have_dyn && !have_st){ [ae endEncoding]; return 0; }
+    if (!have_dyn && !have_st) return 0;
+    ae = pp_accel(cb, "RT: ust yapi");
     { MTLAccelerationStructureInstanceDescriptor *id2 = (MTLAccelerationStructureInstanceDescriptor *)[g_rt_inst contents];
       /* ornek 0 her zaman var olan yapi; kimlik (accelerationStructureIndex) hangi depo oldugunu soyler */
       id2[0].accelerationStructureIndex = have_dyn ? 0u : 1u;
@@ -2321,47 +2388,6 @@ static void hd_rt_trace(id<MTLCommandBuffer> cb, const void *par, size_t parsz, 
 }
 /* Sahne sonu birlestirmesi: isin izleme (varsa) ya da SSR.  i = sahnenin
  * bittigi cizim indeksi; scr = cozulmus ekran dokusu (drawable). */
-/* ---- SAHNEYI BOLEN ARA GECISI ERTELE -----------------------------------
- * Olculdu (PASSPROF icerik dokumu, yaris karesi): ana sahne 674 cizim tek
- * ekran gecisi; ardindan 23 cizimlik bir ekran disi gecis (isik parlamalari:
- * sahnenin Z'sini TEST eder, Z yazmaz), sonra ekrana TEK cizim, sonra son
- * islem.  O tek cizim yuzunden sahne ikinci bir ekran gecisi aciyor: 4x renk
- * + 3 G-tamponu saklanip geri yukleniyordu (~200 MB yazma + ~200 MB okuma).
- * Kalip:  ... ekran | R = ekran disi kosu (tek hedef T) | S = ekran kosusu ...
- * R Z yazmiyor / temizlemiyorsa ve S Z yazmiyor, T'yi orneklemiyor, ayni Z
- * yuzeyini kullaniyorsa iki kosu yer degistirir: S ekranin rengine yazar
- * (R okuyamaz), R yalniz T'ye yazar (S okumuyor), ikisi de Z'yi degistirmez
- * -> sonuc piksel piksel ayni, ama sahne TEK gecis.  HD_REORDER=0 kapatir. */
-static _Atomic unsigned long long g_hd_reord;
-static void hd_reorder(int rb){
-    static int on = -1; if (on < 0){ const char *e = ENVC("HD_REORDER"); on = (e && *e == '0') ? 0 : 1; }
-    if (!on) return;
-    unsigned n = g_dn[rb]; MDraw *D = g_dbuf[rb];
-    static MDraw tmp[64];
-    for (unsigned a = 1; a + 1 < n; a++){
-        const MDraw *p = &D[a - 1];
-        if (p->target || p->is_blit || p->is_clear) continue;                 /* onceki: ekran cizimi */
-        if (!D[a].target || D[a].is_blit || D[a].is_clear) continue;          /* a: ekran disi kosunun basi */
-        unsigned T = D[a].target, tid = TGT_ID(T), zs = DEPTH_ZID(p->depth), b = a, c;
-        int ok = 1;
-        for (; b < n; b++){ const MDraw *x = &D[b];
-            if (x->target != T || x->is_blit) break;
-            if (x->is_clear || (x->depth & 2u)){ ok = 0; break; } }
-        if (!ok || b >= n || b - a > 512u) continue;
-        for (c = b; c < n && c - b < 64u; c++){ const MDraw *x = &D[c];
-            if (x->target || x->is_blit || x->is_clear) break;
-            if (DEPTH_ZID(x->depth) != zs || (x->depth & 2u) ||
-                x->tex == tid || x->tex1 == tid || x->tex2 == tid || x->tex3 == tid){ ok = 0; break; } }
-        if (!ok || c == b) continue;
-        if (c < n && !D[c].target && !D[c].is_blit && !D[c].is_clear) continue;   /* S 64'u asti: kazanc yok */
-        unsigned ns = c - b, nr = b - a;
-        memcpy(tmp, &D[b], (size_t)ns * sizeof(MDraw));
-        memmove(&D[a + ns], &D[a], (size_t)nr * sizeof(MDraw));
-        memcpy(&D[a], tmp, (size_t)ns * sizeof(MDraw));
-        atomic_fetch_add(&g_hd_reord, 1ull);
-        a = c - 1;
-    }
-}
 /* ---- MSAA: gereksiz saklama / cozme ------------------------------------
  * Olculdu (PASSPROF, 1080p yaris karesi): ekran gecisleri GPU suresinin en
  * buyuk kalemi; karede 5 cok ornekli ekran gecisi var ve HER biri renk +
@@ -2504,21 +2530,6 @@ static void hd_ms_fallback(id<MTLCommandBuffer> cb, id<MTLTexture> scr, int pend
     [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
     atomic_fetch_add(&g_hd_msfb, 1ull);
 }
-/* i'deki cizim ekranda yalniz Clear olan bir gecis acacaksa 1: ardindan gelen
- * ilk gercek is baska hedefte, ve ekran okunmadan once ekrana yine cizilecek. */
-static int hd_clear_only(int rb, unsigned i){
-    unsigned n = g_dn[rb], j = i;
-    const MDraw *d0 = &g_dbuf[rb][i];
-    if (!hd_mslazy() || d0->target || !d0->is_clear || d0->is_blit) return 0;
-    while (j < n && g_dbuf[rb][j].is_clear && !g_dbuf[rb][j].target && !g_dbuf[rb][j].is_blit) j++;
-    if (j >= n) return 0;
-    if (!g_dbuf[rb][j].target) return 0;                          /* gecis gercek cizimle (ya da ekran blitiyle) suruyor */
-    for (unsigned k = j; k < n; k++){ const MDraw *x = &g_dbuf[rb][k];
-        if (x->is_blit){ if (!x->blit_src || !x->target) return 0; continue; }
-        if (!x->target) return 1;
-    }
-    return 0;
-}
 static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLTexture> scr,
                          unsigned zid, int refl_drawn){
     id<MTLTexture> zt = (zid && zid < MAXZ) ? g_ztex[zid] : nil;
@@ -2599,7 +2610,19 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
                     { rt_tris = hd_rt_frame(cb, rb, i, iv, vp, ivp, 1.f / p00, 1.f / p11, &rt_nt, sp2.fogp); sp2.cb[1][3] = (float)g_rt_only_static; }
                 }
             }
-            hd_rt_trace(cb, &sp2, sizeof sp2, zt, ow, oh, rt_nt);
+            /* --- YARIM ISIN ----------------------------------------------------
+             * Isin cekirdegi (3024x1964'te ~2.5 ms) yansima sisteminin en buyuk
+             * kalemi.  Her karede satranc tahtasinin yalnizca bir yarisi izlenir;
+             * obur yari isin dokusunda kalan onceki karenin sonucudur (120 fps'te
+             * 8 ms).  Birlestirmenin 4 noktali buyutmesi ikisini zaten karistirir.
+             * Doku yeni yaratildiysa o kare tam izlenir.  HD_RT_HALF=0 eski. */
+            static int half = -1; static unsigned hpar; static id<MTLTexture> hseen;
+            if (half < 0){ const char *e = ENVC("HD_RT_HALF"); half = (e && *e == '0') ? 0 : 1; }
+            NSUInteger tw2 = ow;
+            if (half && hseen == g_rt_out){ sp2.cb[2][3] = (float)(1u + (hpar++ & 1u)); tw2 = (ow + 1) / 2; }
+            hseen = g_rt_out;
+            hd_rt_trace(cb, &sp2, sizeof sp2, zt, tw2, oh, rt_nt);
+            sp2.cb[2][3] = 0.f;
             sp = ms ? g_rt_pso_ms : g_rt_pso;
         }
     }
@@ -2608,6 +2631,26 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
     { static int comp = -1; if (comp < 0){ const char *e = ENVC("HD_COMP"); comp = (e && *e == '0') ? 0 : 1; }
       if (!comp) return;
       if (g_ab_mode == 1 || g_ab_mode == 2 || g_ab_mode == 3 || g_ab_mode == 4 || g_ab_mode == 6) return; }
+    int fb = rt_tris && !ms && g_rt_pso_fb;        /* bkz. KOPYASIZ BIRLESTIRME */
+    if (fb){
+        MTLRenderPassDescriptor *sr = [MTLRenderPassDescriptor renderPassDescriptor];
+        sr.colorAttachments[0].texture = scr;
+        sr.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        sr.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pp_rp(sr, "birlestirme: RT (kopyasiz)");
+        id<MTLRenderCommandEncoder> se = [cb renderCommandEncoderWithDescriptor:sr];
+        [se setRenderPipelineState:g_rt_pso_fb];
+        [se setFragmentTexture:zt atIndex:1];
+        [se setFragmentTexture:g_hd_g[0] atIndex:2];
+        [se setFragmentTexture:g_hd_g[1] atIndex:3];
+        [se setFragmentTexture:g_hd_g[2] atIndex:4];
+        [se setFragmentTexture:g_rt_out atIndex:5];
+        [se setFragmentBytes:&sp2 length:sizeof sp2 atIndex:0];
+        [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [se endEncoding];
+        atomic_fetch_add(&g_hd_ssr_n, 1ull);
+        return;
+    }
     if (!g_hd_scenecopy || g_hd_scenecopy.width != scr.width || g_hd_scenecopy.height != scr.height){
         MTLTextureDescriptor *cd = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:scr.pixelFormat
@@ -2646,6 +2689,84 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
     atomic_fetch_add(&g_hd_ssr_n, 1ull);
 }
 #endif
+/* --- GECIS BIRLESTIRME (iki build) ------------------------------------------
+ * 3024x1964'te normal surumde ekran karede 5 ayri gecisle ciziliyordu (PASSPROF
+ * icerik dokumu, 2026-10-15): yalniz Clear iceren bos gecis, ana sahne, isik
+ * parlamasi hedefi araya girdigi icin TEK cizimlik ikinci sahne gecisi, son
+ * islem dortgeni ve yalniz Z baglamasi degistigi icin ayri arayuz gecisi.  Her
+ * ayri gecis tam ekran renk (+ Z) okuyup yaziyor (~24 MB her biri).  Uc
+ * duzenleme, ucu de pikseli degistirmez:
+ *  1) pass_reorder: sahneyi bolen ara gecis ertelenir (asagida, kurallariyla).
+ *  2) pass_clear_only: yalniz Clear iceren ekran gecisi acilmaz; ekran ilk
+ *     gercek kullaniminda zaten ayni renkle temizleniyor, Z temizligi
+ *     g_zpend ile bekliyor.
+ *  3) Z'yi ne test eden ne yazan cizim, yalniz Z yuzeyi farkli diye yeni
+ *     gecis acmaz.
+ * Onceden 1 ve 2 yalniz HD'deydi.  PASSMERGE=0 ucunu de kapatir. */
+static int pass_merge_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("PASSMERGE"); v = (e && *e == '0') ? 0 : 1; }
+    return v;
+}
+/* ---- SAHNEYI BOLEN ARA GECISI ERTELE -----------------------------------
+ * Olculdu (PASSPROF icerik dokumu, yaris karesi): ana sahne 674 cizim tek
+ * ekran gecisi; ardindan 23 cizimlik bir ekran disi gecis (isik parlamalari:
+ * sahnenin Z'sini TEST eder, Z yazmaz), sonra ekrana TEK cizim, sonra son
+ * islem.  O tek cizim yuzunden sahne ikinci bir ekran gecisi aciyor: 4x renk
+ * + 3 G-tamponu saklanip geri yukleniyordu (~200 MB yazma + ~200 MB okuma).
+ * Kalip:  ... ekran | R = ekran disi kosu (tek hedef T) | S = ekran kosusu ...
+ * R Z yazmiyor / temizlemiyorsa ve S Z yazmiyor, T'yi orneklemiyor, ayni Z
+ * yuzeyini kullaniyorsa iki kosu yer degistirir: S ekranin rengine yazar
+ * (R okuyamaz), R yalniz T'ye yazar (S okumuyor), ikisi de Z'yi degistirmez
+ * -> sonuc piksel piksel ayni, ama sahne TEK gecis.  HD_REORDER=0 kapatir. */
+static _Atomic unsigned long long g_hd_reord;
+static void pass_reorder(int rb){
+    static int on = -1; if (on < 0){ const char *e = ENVC("HD_REORDER"); on = (e && *e == '0') ? 0 : 1; }
+    if (!on || !pass_merge_on()) return;
+    unsigned n = g_dn[rb]; MDraw *D = g_dbuf[rb];
+    static MDraw tmp[64];
+    for (unsigned a = 1; a + 1 < n; a++){
+        const MDraw *p = &D[a - 1];
+        if (p->target || p->is_blit || p->is_clear) continue;                 /* onceki: ekran cizimi */
+        if (!D[a].target || D[a].is_blit || D[a].is_clear) continue;          /* a: ekran disi kosunun basi */
+        unsigned T = D[a].target, tid = TGT_ID(T), zs = DEPTH_ZID(p->depth), b = a, c;
+        int ok = 1;
+        for (; b < n; b++){ const MDraw *x = &D[b];
+            if (x->target != T || x->is_blit) break;
+            if (x->is_clear || (x->depth & 2u)){ ok = 0; break; } }
+        if (!ok || b >= n || b - a > 512u) continue;
+        for (c = b; c < n && c - b < 64u; c++){ const MDraw *x = &D[c];
+            if (x->target || x->is_blit || x->is_clear) break;
+            if (DEPTH_ZID(x->depth) != zs || (x->depth & 2u) ||
+                x->tex == tid || x->tex1 == tid || x->tex2 == tid || x->tex3 == tid){ ok = 0; break; } }
+        if (!ok || c == b) continue;
+        if (c < n && !D[c].target && !D[c].is_blit && !D[c].is_clear) continue;   /* S 64'u asti: kazanc yok */
+        unsigned ns = c - b, nr = b - a;
+        memcpy(tmp, &D[b], (size_t)ns * sizeof(MDraw));
+        memmove(&D[a + ns], &D[a], (size_t)nr * sizeof(MDraw));
+        memcpy(&D[a], tmp, (size_t)ns * sizeof(MDraw));
+        atomic_fetch_add(&g_hd_reord, 1ull);
+        a = c - 1;
+    }
+}
+/* i'deki cizim ekranda yalniz Clear olan bir gecis acacaksa 1: ardindan gelen
+ * ilk gercek is baska hedefte, ve ekran okunmadan once ekrana yine cizilecek. */
+static int pass_clear_only(int rb, unsigned i){
+    unsigned n = g_dn[rb], j = i;
+    const MDraw *d0 = &g_dbuf[rb][i];
+#if NFS_ENHANCED
+    if (!hd_mslazy()) return 0;
+#endif
+    if (!pass_merge_on() || d0->target || !d0->is_clear || d0->is_blit) return 0;
+    while (j < n && g_dbuf[rb][j].is_clear && !g_dbuf[rb][j].target && !g_dbuf[rb][j].is_blit) j++;
+    if (j >= n) return 0;
+    if (!g_dbuf[rb][j].target) return 0;                          /* gecis gercek cizimle (ya da ekran blitiyle) suruyor */
+    for (unsigned k = j; k < n; k++){ const MDraw *x = &g_dbuf[rb][k];
+        if (x->is_blit){ if (!x->blit_src || !x->target) return 0; continue; }
+        if (!x->target) return 1;
+    }
+    return 0;
+}
 
 /* GERCEK kup doku.  Oyun araba cevre haritasini 6 YUZE ayri ayri
  * ciziyor (olculdu: SetRenderTarget 6 farkli kup yuzeyiyle), sonra
@@ -4252,8 +4373,8 @@ void metal_run_main_loop(void){
                         int hd_post = 0;                /* (HD) ekrandan ilk kopya gecti: son islem asamasi */
                         unsigned c_att = 0;             /* (HD) gecise cozme hedefi baglandi: bit0 renk, bit1 G */
                         (void)hd_post; (void)c_att;
+                        if (rb >= 0) pass_reorder(rb);  /* sahneyi bolen ara gecisi ertele (bkz. GECIS BIRLESTIRME) */
 #if NFS_ENHANCED
-                        if (rb >= 0) hd_reorder(rb);    /* sahneyi bolen ara gecisi ertele */
                         int hd_scene_open = 1;          /* ekrandan ilk kopyaya kadar ana sahne */
                         int hd_gb_first = 1;            /* G-tamponu bu karede ilk kez */
                         int hd_refl_drawn = 0;          /* bu karede yansima varyanti cizildi */
@@ -4738,12 +4859,13 @@ void metal_run_main_loop(void){
                                     atomic_fetch_add(&g_hd_mipgen, 1ull);
                                 }
 #endif
-#if NFS_ENHANCED
+                                /* bkz. GECIS BIRLESTIRME: Z kullanmayan cizim Z yuzeyi yuzunden gecis bolmez */
+                                int zsplit = DEPTH_ZID(dr->depth) != cur_z &&
+                                             !(enc && pass_merge_on() && !dr->is_clear && !(dr->depth & 3u));
                                 /* yalniz Clear iceren ekran gecisi: acma (Z temizligi yukarida kaydedildi) */
-                                if (!enc || dr->target != cur_t || DEPTH_ZID(dr->depth) != cur_z)
-                                    if (hd_msaa_n() > 1 && !hd_post && !screen_touched && hd_clear_only(rb, i)) continue;
-#endif
-                                if (dr->target != cur_t || DEPTH_ZID(dr->depth) != cur_z){
+                                if (!enc || dr->target != cur_t || zsplit)
+                                    if (!hd_post && !screen_touched && pass_clear_only(rb, i)) continue;
+                                if (dr->target != cur_t || zsplit){
 #if NFS_ENHANCED
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil;
@@ -5326,6 +5448,8 @@ void metal_budget_report(void){
       fprintf(stderr, "[HD] RT onbellek: kare basina ort anlik %.0f ucgen + sabit %.0f ucgen; terfi %llu, atma %llu, sifirlama %llu, sabit kurulum %llu\n",
               f ? (double)atomic_load(&g_rt_dynv) / 3 / f : 0.0, f ? (double)atomic_load(&g_rt_statv) / 3 / f : 0.0,
               atomic_load(&g_rt_promo), atomic_load(&g_rt_evict), atomic_load(&g_rt_reset), atomic_load(&g_rt_sbuilds));
+      fprintf(stderr, "[HD] RT anlik yapi: %llu tam kurulum, %llu yerinde guncelleme (refit %s)\n",
+              atomic_load(&g_rt_nbuild), atomic_load(&g_rt_nrefit), hd_rt_refit_on() ? "ACIK" : "KAPALI");
       fprintf(stderr, "[HD] RT onbellek: sikistirma %llu, yeniden ozetleme %llu, depo %u kose (%u olu)\n",
               atomic_load(&g_rt_compact), atomic_load(&g_rt_rehash), g_rt_scur, g_rt_sdead);
       if (g_rt_fixcnt){ const uint32_t *fc = (const uint32_t *)[g_rt_fixcnt contents];

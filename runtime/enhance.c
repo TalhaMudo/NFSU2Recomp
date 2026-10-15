@@ -17,7 +17,12 @@
  *    dokusunu ilk kullanildigi hedefin boyutunda yaratiyor.
  *
  *    Ortam:  HDREFL=0       yansima iyilestirmesini kapat (A/B icin)
- *            HD_ROAD=1.0    yol yansimasi: geri tamponun kati
+ *            HD_ROAD=0.5    yol yansimasi: geri tamponun kati.  2026-10-15
+ *                           1.0 -> 0.5: 3024x1964 yarista 120 fps'i tutarken
+ *                           ~2.5 W az (kare basina enerji -%17); goruntu farki
+ *                           yok denecek kadar az (isin izleme acikken bu doku
+ *                           yalnizca yedek ve bulanik).  Kup/ayna kucultmek ek
+ *                           kazanc getirmedi.
  *            HD_MIRROR=1024 ayna kenari (piksel)
  *            HD_CUBE=512    kup yuzu kenari (piksel)
  *            HD_BLUR=0.5    yol yansimasi bulanikligi: 1 = oyunun kendi
@@ -80,7 +85,7 @@
 #define RET_CUBE       0x005BA559u
 
 static int    g_init, g_refl = 1;
-static double g_road = 1.0, g_blur = 0.5;
+static double g_road = 0.5, g_blur = 0.5;
 static uint32_t g_mirror = 1024, g_cube = 512;
 static uint32_t g_hits[4];
 static uint32_t g_last_w[4], g_last_h[4];
@@ -102,7 +107,7 @@ static void enh_init(void){
     if ((e = getenv("HD_BLUR"))   && *e) g_blur   = atof(e);
     if (g_blur < 0.0) g_blur = 0.0;
     if (g_blur > 1.0) g_blur = 1.0;
-    if (g_road <= 0.0) g_road = 1.0;
+    if (g_road <= 0.0) g_road = 0.5;
     fprintf(stderr, "[HD] yansima: %s  yol=%.2fx geri tampon  bulaniklik=%.2f  ayna=%u  kup=%u\n",
             g_refl ? "ACIK" : "KAPALI", g_road, g_blur, g_mirror, g_cube);
 }

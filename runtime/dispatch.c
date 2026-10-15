@@ -73,6 +73,9 @@ void dispatch_indirect(CPU *c, uint32_t addr){
     }
     for (int i = 0; i < g_patch_n; i++)
         if (g_patch[i].addr == addr){ g_stat_indirect_ok++; g_patch[i].fn(c); return; }
+    /* EFXSTAT: D3DX efekt vtable cagrilarinin envanteri (d3dx_hle.c) */
+    { extern int g_efx_stat; extern void efx_stat_note(CPU *c, uint32_t addr);
+      if (g_efx_stat && addr - 0x650000u < 0x40000u) efx_stat_note(c, addr); }
     uint32_t off = addr - TEXT_BASE;
     if (off < TEXT_SIZE){
         uint32_t k = g_idx[off];

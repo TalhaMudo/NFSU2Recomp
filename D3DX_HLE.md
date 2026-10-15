@@ -336,7 +336,7 @@ aynı olmalı). İlk üçü `overrides.c`'deki yağmur / günün-saati sarmalay�
 biri eksik olursa `sub_XXXX_orig` üretilmez ve link kırılır:
 
 ```
-60fab0,61e390,61f130,5c7ed0,50d510,65ae35,6623ea,66aa3f,66ace2,6691b1,669296,664a2f,663a42,688e89,663275,662edc,660a52,668e0d,664792,66ac27,65addb,65acf5,66d13a,66d303,66d7e9,66e8a9,66f501,66ca38,65ab24
+60fab0,61e390,61f130,5c7ed0,50d510,65ae35,6623ea,66aa3f,66ace2,6691b1,669296,664a2f,663a42,688e89,663275,662edc,660a52,668e0d,664792,66ac27,65addb,65acf5,66d13a,66d303,66d7e9,66e8a9,66f501,66ca38,65ab24,67193e,66056c,65cf44,640c12,668cd0
 ```
 
 Tam üretim yerine mevcut shard'lara uygulamak için:
