@@ -113,6 +113,114 @@ def _flag_defuse(i):
         d = 0                     # ECX==0 ise govde hic calismaz, bayraklar korunur
     return d, u
 
+# ---- FLAGABI: fonksiyonlar arasi bayrak canliligi (bkz. tools/flagabi.py) ----
+# x86'da "tanimsiz" birakilan bayragi okumanin anlamli sonucu yok: ABI modunda
+# tanimsiz bayraklar da TANIMLANDI sayilir.  Aksi halde and/test/xor AF'yi hic
+# oldurmez; AF dolayli cagri / dis kenar kaynagindan geriye dogru yayilip
+# hemen her cagri noktasinda "canli" gorunur (olculdu: 3171 sahte "bayrak
+# donduren" fonksiyon, hepsi yalniz AF).
+_EFUNDEF = [(F_CF, X86_EFLAGS_UNDEFINED_CF), (F_PF, X86_EFLAGS_UNDEFINED_PF), (F_AF, X86_EFLAGS_UNDEFINED_AF),
+            (F_ZF, X86_EFLAGS_UNDEFINED_ZF), (F_SF, X86_EFLAGS_UNDEFINED_SF), (F_OF, X86_EFLAGS_UNDEFINED_OF)]
+def _flag_defuse_abi(i):
+    d, u = _flag_defuse(i)
+    if i.mnemonic in _OPAQUE: return d, u
+    base = i.mnemonic.split()[-1]
+    if base[:1] == 'f' or X86_GRP_FPU in i.groups: return d, u
+    if base in _SHIFT or base in _ROT or base in _DSH:
+        return d, u                  # sayac 0 olabilir: tanimsizi oldurme
+    if i.mnemonic.split()[0] in ('rep','repe','repz','repne','repnz'):
+        return d, u
+    ef = getattr(i, 'eflags', 0) or 0
+    for bit, um in _EFUNDEF:
+        if ef & um: d |= bit
+    return d, u
+
+def abi_cfg(blocks, in_text):
+    """FLAGABI icin kompakt akis grafigi: blok -> (ardillar, dis_tur, komutlar)
+    dis_tur: 0 yok, 1 bilinmeyen dis kenar (tum bayraklar canli), 2 dolayli jmp
+    (sanal kuyruk cagrisi / switch tablosu: ABI'de olu).
+    komut: (adres, tanim, kullanim, tur, hedef)  tur: 0 normal, 1 dogrudan cagri,
+    2 dolayli cagri, 3 ret."""
+    g = {}
+    for ba in blocks:
+        ins = blocks[ba]
+        if not ins:
+            g[ba] = ([], 1, []); continue
+        last = ins[-1]; m = last.mnemonic
+        s = []; ext = 0
+        cond = (m.startswith('j') and m[1:] in CC) or m in ('jecxz','jcxz','loop','loope','loopz','loopne','loopnz')
+        if m == 'jmp' or cond:
+            o = last.operands[0] if last.operands else None
+            if o is not None and o.type == X86_OP_IMM and o.imm in blocks: s.append(o.imm)
+            elif m == 'jmp' and (o is None or o.type != X86_OP_IMM): ext = 2
+            else: ext = 1
+            if cond:
+                nxt = last.address + last.size
+                if nxt in blocks: s.append(nxt)
+                else: ext = 1
+        elif m in ('ret','retf','iret','iretd'):
+            pass
+        else:
+            nxt = last.address + last.size
+            if nxt in blocks: s.append(nxt)
+            else: ext = 1
+        kl = []
+        for i in ins:
+            mm = i.mnemonic
+            if mm == 'call':
+                o = i.operands[0] if i.operands else None
+                if o is not None and o.type == X86_OP_IMM and in_text(o.imm):
+                    kl.append((i.address, F_ALL, 0, 1, o.imm))
+                else:
+                    kl.append((i.address, F_ALL, 0, 2, 0))   # ABI: cagrilan, cagiranin bayragini okumaz
+            elif mm in ('ret','retn'):
+                kl.append((i.address, 0, 0, 3, 0))
+            else:
+                d, u = _flag_defuse_abi(i)
+                kl.append((i.address, d, u, 0, 0))
+        g[ba] = (s, ext, kl)
+    return g
+
+def abi_liveness(g, ent, giris, donen_mi):
+    """-> (giris canli, {komut: sonrasi canli}, {cagri: (sonrasi canli, tur, hedef)})
+    cagri T: tanim F_ALL, kullanim giris[T]; ret: donen_mi ise F_ALL yoksa 0."""
+    live_in = {ba: 0 for ba in g}
+    after = {}; sonra = {}
+    order = sorted(g, reverse=True)
+    for _ in range(64):
+        changed = False
+        for ba in order:
+            s, ext, kl = g[ba]
+            cur = F_ALL if ext == 1 else 0
+            for t in s: cur |= live_in.get(t, F_ALL)
+            for (adr, d, u, tur, hedef) in reversed(kl):
+                if tur == 3:
+                    cur = F_ALL if donen_mi else 0
+                after[adr] = cur
+                if tur == 3: continue
+                if tur in (1, 2):
+                    sonra[adr] = (cur, tur, hedef)
+                    if tur == 1: u = giris.get(hedef, 0)
+                cur = (cur & ~d) | u
+            if cur != live_in[ba]:
+                live_in[ba] = cur; changed = True
+        if not changed: break
+    return live_in.get(ent, F_ALL), after, sonra
+
+_ABI = None
+def abi_tablo():
+    """FLAGABI=<json> (tools/flagabi.py ciktisi) -> (giris, donen) ya da None"""
+    global _ABI
+    if _ABI is None:
+        import os as _os, json as _json
+        p = _os.environ.get('FLAGABI', '')
+        if p:
+            j = _json.load(open(p))
+            _ABI = ({int(k, 16): v for k, v in j['giris'].items()}, {int(a, 16) for a in j['donen']})
+        else:
+            _ABI = False
+    return _ABI or None
+
 def flag_liveness(blocks, addrs, in_text):
     """Komut adresi -> o komuttan SONRA canli olan bayraklar."""
     succ = {}
@@ -162,6 +270,74 @@ def flag_liveness(blocks, addrs, in_text):
     return after
 
 class Unsupported(Exception): pass
+
+# ---- X87OPT: blok ici x87 yazmac tahsisi ---------------------------------
+# ST(n) = c->st[(c->top+n)&7] calisma aninda indisli: clang bu degerleri hic
+# yazmaca alamiyor, her x87 islemi top okuma + adres + yukle/sakla.  Bir temel
+# blokta yigin derinligi derleme aninda bilinir: bolge basinda _T = c->top,
+# ST(n) -> _x[off+n+8] (sabit indis -> ARM FP yazmaci), FPUSH/FPOP yalniz
+# statik off'u degistirir.  Yazilmadan okunan yuva bolge icinde bir kez
+# yuklenir; bolge sonunda (dal, cagri, ret, c->st/c->top'a dokunan komut,
+# blok sonu) yalnizca hala yigindaki degistirilmis yuvalar geri yazilir ve
+# c->top bir kez guncellenir.
+import re as _re
+_ST_RE = _re.compile(r'ST\((\d+)\)')
+_STA_RE = _re.compile(r'ST\((\d+)\)\s*=(?!=)')
+_SINIR_RE = _re.compile(r'\b\w+\(c[,)]|\breturn\b|c->st|c->top|\bST\(|FPUSH|FPOP|fsw_get')
+
+class X87Bolge:
+    def __init__(self): self.sifirla(); self.kullanildi = False
+    def sifirla(self):
+        self.aktif = False; self.off = 0; self.wr = set(); self.ld = set()
+    def _yuva(self, k):
+        if not -8 <= k <= 7: raise ValueError('x87 derinlik')
+        return k + 8
+    def cevir(self, lines):
+        """x87 komutunun satirlari -> bolge satirlari ya da None (ham birak)"""
+        metin = '\n'.join(lines)
+        if 'c->st' in metin or 'c->top' in metin:
+            return None
+        yedek = (self.aktif, self.off, set(self.wr), set(self.ld))
+        try:
+            out = []
+            if not self.aktif:
+                out.append('_T = (uint32_t)c->top;'); self.aktif = True
+            for line in lines:
+                st = line.strip()
+                if st == 'FPOP();':
+                    self.off += 1; continue
+                pre = []
+                if st.startswith('FPUSH(') and st.endswith(');'):
+                    expr = self._st(st[6:-2], pre)
+                    k = self.off - 1; self._yuva(k)
+                    self.wr.add(k); self.off -= 1
+                    out += pre; out.append(f'_x[{k + 8}] = (double)({expr});'); continue
+                line = line.replace('fsw_get(c)', f'fsw_get_top(c, (_T + ({self.off})) & 7u)')
+                out += []
+                line = self._st(line, pre)
+                out += pre; out.append(line)
+            self.kullanildi = True
+            return out
+        except ValueError:
+            self.aktif, self.off, self.wr, self.ld = yedek
+            return None
+    def _st(self, line, pre):
+        top = {}; atama = {}
+        for m in _ST_RE.finditer(line): top[int(m.group(1))] = top.get(int(m.group(1)), 0) + 1
+        for m in _STA_RE.finditer(line): atama[int(m.group(1))] = atama.get(int(m.group(1)), 0) + 1
+        for n, say in top.items():
+            k = self.off + n; self._yuva(k)
+            if say > atama.get(n, 0) and k not in self.wr and k not in self.ld:
+                pre.append(f'_x[{k + 8}] = c->st[(_T + ({k})) & 7];'); self.ld.add(k)
+        for n in atama: self.wr.add(self.off + n)
+        off = self.off
+        return _ST_RE.sub(lambda m: f'_x[{off + int(m.group(1)) + 8}]', line)
+    def kapat(self):
+        if not self.aktif: return []
+        out = [f'c->st[(_T + ({k})) & 7] = _x[{k + 8}];' for k in sorted(self.wr) if k >= self.off]
+        if self.off: out.append(f'c->top = (int32_t)((_T + ({self.off})) & 7u);')
+        self.sifirla()
+        return out
 
 class RawLifter:
     """Ham bayt tamponu uzerinde lift: komut semantigi testleri icin."""
@@ -411,6 +587,12 @@ class Lifter:
             return [f"{{ uint32_t _ct = {E(0)}; PUSH32(0x{i.address+i.size:x}u); dispatch_indirect(c, _ct); }}"]
         if m in ('ret','retf'):
             n = o[0].imm if o else 0
+            # RETEIP=0: donus adresi c->eip'e yazilmaz (yalniz yigindan atilir).
+            # Lift edilmis cagiran hep cagrinin arkasinda devam eder; c->eip'i
+            # okuyan tek yer (genexec) artik ittigi adresi kullaniyor.
+            import os as _os
+            if _os.environ.get('RETEIP','1') == '0':
+                return [f"c->esp += {4 + n}u; return;"]
             return [f"POP32(c->eip);" + (f" c->esp += {n}u;" if n else "") + " return;"]
 
         # ---------------- x87 FPU ----------------
@@ -1395,17 +1577,28 @@ class Lifter:
         if _os.environ.get('FLAGOPT','1') == '0':
             self.fafter = {}
         else:
-            try: self.fafter = flag_liveness(blocks, addrs, self.in_text)
+            abi = abi_tablo()
+            try:
+                if abi:
+                    _, self.fafter, _ = abi_liveness(abi_cfg(blocks, self.in_text), entry, abi[0], entry in abi[1])
+                else:
+                    self.fafter = flag_liveness(blocks, addrs, self.in_text)
             except Exception: self.fafter = {}
         # dallanma hedeflerini topla
         lbl=set(addrs)
         out=[]; targets=set()
         body=[]
+        x87opt = _os.environ.get('X87OPT','') == '1'
+        xb = X87Bolge()
         for ba in addrs:
             body.append(f"L_{ba:08x}:; /* --- blok --- */")
             ins=blocks[ba]
+            xb.sifirla()
             for k,i in enumerate(ins):
                 m=i.mnemonic
+                if x87opt and xb.aktif and (m=='jmp' or (m.startswith('j') and m[1:] in CC)
+                        or m in ('jecxz','jcxz','loop','loope','loopz','loopne','loopnz')):
+                    body += ["    "+l for l in xb.kapat()]
                 if self.watch:
                     body.append(f"    WCHK(0x{i.address:x}u);")
                 if self.comments:
@@ -1460,7 +1653,17 @@ class Lifter:
                     continue
                 self.cur_fmask = self.fafter.get(i.address, F_ALL)
                 try:
-                    for line in self.insn(i, targets):
+                    lines = self.insn(i, targets)
+                    if x87opt:
+                        if m[:1]=='f' or X86_GRP_FPU in i.groups:
+                            yeni = xb.cevir(lines)
+                            if yeni is None:
+                                body += ["    "+l for l in xb.kapat()]
+                            else:
+                                lines = yeni
+                        elif xb.aktif and any(_SINIR_RE.search(l) for l in lines):
+                            body += ["    "+l for l in xb.kapat()]
+                    for line in lines:
                         body.append("    "+line)
                 except Unsupported as e:
                     if not self.trap: raise
@@ -1471,6 +1674,7 @@ class Lifter:
                     if not self.trap: raise
                     self.traps+=1; self.trap_kinds[f"<{type(e).__name__}>"]+=1
                     body.append(f'    unsupported_insn(c, 0x{i.address:x}u, "internal");')
+            if x87opt: body += ["    "+l for l in xb.kapat()]
             # blok dusuyorsa bir sonraki bloga atla
             last=ins[-1] if ins else None
             if last is not None and last.mnemonic not in ('ret','retf','jmp') and not (last.mnemonic.startswith('j') and last.mnemonic[1:] in CC):
@@ -1503,6 +1707,8 @@ class Lifter:
         # KRITIK: bloklar adrese gore sirali basiliyor; giris blogu en dusuk
         # adresli olmak zorunda degil. C yurutmesi govdenin tepesinden basladigi
         # icin giris blogu acikca hedeflenmeli.
+        if xb.kullanildi:
+            out.append("    uint32_t _T = 0; double _x[16];")
         out.append(f"    goto L_{entry:08x};")
         out += body
         out.append("}")

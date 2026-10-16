@@ -222,19 +222,29 @@ static void qpc_report(void){
  * Donguden gelen QPC'de (donus 0x43bdfe, onu cagiran 0x57eb79) kalan
  * sure oyunun kendi formuluyle hesaplanir ve (kalan - pay) kadar uyunur;
  * son pay yine donerek beklenir.  Cikis kosulu ve saat ayni oldugu icin
- * oyunun zamanlamasi degismez, yalnizca CPU bos kalir.
- * SPINSLEEP=<pay us> (varsayilan 400), SPINSLEEP=0 kapatir.
+ * oyunun zamanlamasi degismez, yalnizca CPU bos kalir.  Uyku kevent
+ * NOTE_CRITICAL ile (guest_sleep_ns): nanosleep ortalama 447 us gec
+ * uyaniyordu, kevent 41 us (%98'i <= 200 us).
+ * SPINSLEEP=<pay us> (varsayilan 200), SPINSLEEP=0 kapatir.
  * Yigin: POP32 sonrasi [esp+0xc] = 0x57eb79, E = esp+0x14 (0057eae0'nun
  * yerel taban), hedef float [E+0xc] = [esp+0x20], start = EBX. */
 static int g_spin_pay = -1;
-static uint64_t g_spin_n, g_spin_us;
+static uint64_t g_spin_n, g_spin_us, g_spin_gec[7];   /* gec uyanma: <=25,50,100,200,400,800,>800 us */
 static void spin_report(void){
     fprintf(stderr, "\n=== SPINSLEEP: kare bekleme dongusu %llu kez uyudu, toplam %.2f sn (pay %d us) ===\n",
             (unsigned long long)g_spin_n, g_spin_us / 1e6, g_spin_pay);
+    fprintf(stderr, "  gec uyanma: <=25us %llu  <=50 %llu  <=100 %llu  <=200 %llu  <=400 %llu  <=800 %llu  >800 %llu\n",
+            (unsigned long long)g_spin_gec[0], (unsigned long long)g_spin_gec[1], (unsigned long long)g_spin_gec[2],
+            (unsigned long long)g_spin_gec[3], (unsigned long long)g_spin_gec[4], (unsigned long long)g_spin_gec[5],
+            (unsigned long long)g_spin_gec[6]);
+    extern uint64_t g_sleep_late_ns, g_sleep_gil_ns, g_sleep_n;
+    if (g_sleep_n) fprintf(stderr, "  ortalama: nanosleep gecikmesi %.0f us, uyanista kilit bekleme %.0f us\n",
+                           g_sleep_late_ns / 1e3 / g_sleep_n, g_sleep_gil_ns / 1e3 / g_sleep_n);
 }
+uint64_t spin_slept_us(void){ return g_spin_us; }   /* perflog: kare sinirlayici uykusu */
 static void qpc_spin_sleep(CPU *c){
     if (MR32(c->esp + 0xcu) != 0x57eb79u) return;
-    if (g_spin_pay < 0){ const char *e = getenv("SPINSLEEP"); g_spin_pay = e ? atoi(e) : 400;
+    if (g_spin_pay < 0){ const char *e = getenv("SPINSLEEP"); g_spin_pay = e ? atoi(e) : 200;
                          if (g_spin_pay && ENVC("QPCWHO")) atexit(spin_report); }
     if (!g_spin_pay) return;
     /* oyunun birimi: F = [0x828028] QPC tiki basina (olculen 0.001 = ms,
@@ -250,6 +260,9 @@ static void qpc_spin_sleep(CPU *c){
     void guest_sleep_ns(long ns);
     guest_sleep_ns((long)(us * 1000.0));
     g_spin_n++; g_spin_us += (uint64_t)us;
+    { double gec = (double)(host_qpc() - now) - us;          /* istenenden fazla uyunan us */
+      int b = gec <= 25 ? 0 : gec <= 50 ? 1 : gec <= 100 ? 2 : gec <= 200 ? 3 : gec <= 400 ? 4 : gec <= 800 ? 5 : 6;
+      g_spin_gec[b]++; }
 }
 static void qpc_who(CPU *c){
     static int init = 0; static uint64_t tot = 0;
@@ -280,7 +293,15 @@ int win32_call(CPU *c, uint32_t idx){
     const char *n = e->name;
     uint32_t r = 0;
 
-    if      (!strcmp(n,"GetVersion"))            r = 0x0A280105u;      /* 5.1.2600 */
+    /* QueryPerformanceCounter en sik cagri (kare sinirlayici); ad zincirinin
+     * ~20 strcmp'ini atlamak icin import indisi ilk eslesmede onbellege alinir. */
+    static uint32_t qpc_idx = 0xFFFFFFFFu;
+    if (idx == qpc_idx || (qpc_idx == 0xFFFFFFFFu && !strcmp(n,"QueryPerformanceCounter") && (qpc_idx = idx, 1))){
+        if (ENVC("QPCWHO")) qpc_who(c);
+        if (c->eip == 0x43bdfeu) qpc_spin_sleep(c);
+        uint64_t v = host_qpc(); uint32_t p=ARG(c,0);
+        if(p){ MR32(p)=(uint32_t)v; MR32(p+4)=(uint32_t)(v>>32); } r=1; }
+    else if (!strcmp(n,"GetVersion"))            r = 0x0A280105u;      /* 5.1.2600 */
     else if (!strcmp(n,"GetModuleHandleA"))      r = 0x00400000u;
     else if (!strcmp(n,"GetProcessHeap"))        r = 0x00000001u;
     else if (!strcmp(n,"HeapCreate"))            r = 0x00000002u;
@@ -390,11 +411,6 @@ int win32_call(CPU *c, uint32_t idx){
     else if (!strcmp(n,"SetLastError"))          r = 0;
     else if (!strcmp(n,"GetTickCount")) r = host_ms();
     else if (!strcmp(n,"QueryPerformanceFrequency")){ uint32_t p=ARG(c,0); if(p){MR32(p)=1000000;MR32(p+4)=0;} r=1; }
-    else if (!strcmp(n,"QueryPerformanceCounter")){
-        if (ENVC("QPCWHO")) qpc_who(c);
-        if (c->eip == 0x43bdfeu) qpc_spin_sleep(c);
-        uint64_t v = host_qpc(); uint32_t p=ARG(c,0);
-        if(p){ MR32(p)=(uint32_t)v; MR32(p+4)=(uint32_t)(v>>32); } r=1; }
     else if (!strcmp(n,"SetUnhandledExceptionFilter")) r = 0;
     else if (!strcmp(n,"UnhandledExceptionFilter"))    r = 0;
     else if (!strcmp(n,"IsProcessorFeaturePresent"))   r = 1;

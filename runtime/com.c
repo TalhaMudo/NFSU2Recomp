@@ -845,7 +845,12 @@ static int g_fixmat = -1;
 static uint64_t g_t_draw_ns = 0, g_v_xform = 0;
 static uint64_t g_t_vs_ns = 0;
 static uint64_t g_v_per_vs[64] = {0};
+/* Cizim yolu sure istatistigi (cikis raporu) yalniz DRAWTIME=1 ile: cizim
+ * basina iki saat okumasi gercek oyunda konuk thread'in ~%0.8'iydi. */
 static inline uint64_t now_ns(void){
+    static int on = -1;
+    if (on < 0) on = getenv("DRAWTIME") != NULL;
+    if (!on) return 0;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec;
 }
@@ -2072,7 +2077,7 @@ int com_call(CPU *c, uint32_t magic){
         else if (!strncmp(nm,"Draw",4)){
             g_draw++;
             { static const char *seen[8]; static int ns=0;
-              int f=0; for(int q=0;q<ns;q++) if(!strcmp(seen[q],nm)) f=1;
+              int f=0; for(int q=0;q<ns;q++) if(seen[q]==nm) f=1;   /* adlar g_if tablosundan: isaretci yeter */
               if(!f && ns<8){ seen[ns++]=nm;
                   fprintf(stderr,"  [cizim-adi] \"%s\"\n", nm); } }
             if (MID(DrawIndexedPrimitive)){
@@ -2780,6 +2785,8 @@ int com_call(CPU *c, uint32_t magic){
                   fprintf(stderr,"  kapsama sifirlandi (Present %u)\n", g_present_no);
               } }
             if (metal_available()) metal_present();
+            { extern int g_perflog; void perflog_guest_frame(void);
+              if (g_perflog) perflog_guest_frame(); }
             { void mprot_rearm(void); mprot_rearm(); }
             /* Oyunun kendi slot havuzlari: tukenen varsa ekrana kirmizi ad
              * basiliyor.  Liste 0x828538 (kuyruk) -> +4 (onceki) ... 0x828534. */
@@ -4069,19 +4076,25 @@ int com_call(CPU *c, uint32_t magic){
                     uint32_t mm = R->magic & 0xFFFFu;
                     uint32_t ifc = (R->magic>>16) & 0x1FFFu;
                     if (ifc >= NEL(g_if) || mm >= g_if[ifc].n) continue;
-                    const char *n2 = g_if[ifc].m[mm].name;
-                    if      (NMEQ(n2, "SetRenderState")){
+                    /* metot adi yerine onbellekli sayisal kimlik: D3DX Begin her
+                     * efektte 5 blok yakaliyor, ad karsilastirmasi sicak noktaydi */
+                    int md;
+                    if (ifc < MIDIF && mm < MIDM){
+                        md = g_midc[ifc][mm];
+                        if (!md) md = g_midc[ifc][mm] = (int16_t)mid_resolve(g_if[ifc].m[mm].name);
+                    } else md = mid_resolve(g_if[ifc].m[mm].name);
+                    if      (md == MID_SetRenderState){
                         if (R->a[1] < 256u) R->a[2] = g_rs[R->a[1]]; }
-                    else if (NMEQ(n2, "SetTextureStageState")){
+                    else if (md == MID_SetTextureStageState){
                         if (R->a[1] < 8u && R->a[2] < 40u) R->a[3] = g_tss_raw[R->a[1]][R->a[2]]; }
-                    else if (NMEQ(n2, "SetSamplerState")){
+                    else if (md == MID_SetSamplerState){
                         if (R->a[1] < 16u && R->a[2] < 20u) R->a[3] = g_smp_raw[R->a[1]][R->a[2]]; }
-                    else if (NMEQ(n2, "SetTexture")){
+                    else if (md == MID_SetTexture){
                         if (R->a[1] < 8u) R->a[2] = g_raw_tex[R->a[1]]; }
-                    else if (NMEQ(n2, "SetVertexShader"))      R->a[1] = g_raw_vs;
-                    else if (NMEQ(n2, "SetPixelShader"))       R->a[1] = g_raw_ps;
-                    else if (NMEQ(n2, "SetVertexDeclaration")) R->a[1] = g_raw_decl;
-                    else if (NMEQ(n2, "SetFVF"))               R->a[1] = g_cur_fvf;
+                    else if (md == MID_SetVertexShader)      R->a[1] = g_raw_vs;
+                    else if (md == MID_SetPixelShader)       R->a[1] = g_raw_ps;
+                    else if (md == MID_SetVertexDeclaration) R->a[1] = g_raw_decl;
+                    else if (md == MID_SetFVF)               R->a[1] = g_cur_fvf;
                 }
                 g_sb_captured++;
             }
@@ -4270,7 +4283,7 @@ void com_report(void){
                 (bi>0 && (unsigned)bi<g_vsprogn && g_vsprog[bi]) ? vs_ninstr(g_vsprog[bi]) : 0u);
         g_v_per_vs[bi]=0;
     }
-    fprintf(stderr,"  cizim yolu suresi : %.2f sn, %llu kose donusturuldu (%.1f M kose/sn)\n",
+    fprintf(stderr,"  cizim yolu suresi : %.2f sn (DRAWTIME=1 ile), %llu kose donusturuldu (%.1f M kose/sn)\n",
             g_t_draw_ns/1e9, (unsigned long long)g_v_xform,
             g_t_draw_ns ? (double)g_v_xform/(g_t_draw_ns/1000.0) : 0.0);
     fprintf(stderr,"  bagli doku asamasi: 1'li %llu, 2'li %llu, 3'lu %llu, 4'lu %llu cizim\n",

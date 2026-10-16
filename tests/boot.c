@@ -109,6 +109,7 @@ void sampler_report(void){
 
 static void *guest_main_thread(void *unused){
     (void)unused;
+    pthread_setname_np("konuk ana");
     mem_altstack_install();
     if (setjmp(g_exit_jmp)==0){
         g_exit_armed = 1;

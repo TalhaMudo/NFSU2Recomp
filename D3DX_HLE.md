@@ -383,6 +383,65 @@ için yalnızca değer + gölge karşılaştırması), Set* yolu (`65ab24`
 mod A), ifade değerlendirmesinin MOV‑özel yerel karşılığı, Begin/End durum
 bloklarının gölgeden süzülmüş uygulanması.
 
+### 120 fps'te güç: oyunun kare sınırlayıcısı dönüyordu ✅ (2026-10-16)
+
+**Sorun:** Aşama 4'ün −%23 CPU kazancı 120 fps'te watt'a hiç yansımadı
+(`powermetrics`, yarış 3024x1964: temel 8.33 W, yeni 8.31 W). P0 kümesi iki
+sürümde de 3.2 GHz ve aynı aktiflikteydi. `ps -M` ile thread başına gerçek
+CPU: oyun thread'i iki sürümde de **8.2 ms/kare** (kare 8.34 ms → %98 dolu).
+Kazanılan süre bir bekleme döngüsünde yanıyordu.
+
+**Kaynak:** QueryPerformanceCounter koşu başına ~250 milyon kez çağrılıyor
+(yarışta kare başına ~19 bin; `PACE60`'ta ~2 bin). `QPCWHO=1` ile çağıran:
+`sub_0043bdf0` (GetTicks = QPC >> `[0x8284e4]`), onu çağıran `0x57eb79`,
+yani `sub_0057eae0` — NFSU2'nin kendi kare sınırlayıcısı:
+
+```
+X = [0x865558] = 1/120 sn (kare hedefi), dt = bu karenin süresi
+dt < X ise:  start = GetTicks(); hedef = (X - dt) * [0x784550] (=1000, ms)
+             do { gecen = Fark(start, GetTicks()); } while (gecen < hedef);
+Fark = sub_0043be20 = (now - start) * 2^S * [0x828028] (=0.001, ms)
+```
+
+Döngü yalnızca saate bakıyor; uyumadan dönüyor. D3DX'te (ya da başka yerde)
+kazanılan her ms bu döngüye gidiyordu.
+
+**Düzeltme** (`runtime/win32.c`, `qpc_spin_sleep`): QPC çağrısı bu döngüden
+geliyorsa (dönüş `0x43bdfe`, `[esp+0xc]` = `0x57eb79`) kalan süre oyunun
+kendi formülüyle hesaplanır: start = EBX, hedef = `[esp+0x20]` (float, ms).
+Sonra büyük kilidi bırakarak (kalan − pay) uyunur; son pay yine dönerek
+beklenir. Çıkış koşulu ve saat aynı kaldığı için zamanlama ve görüntü
+değişmez. `SPINSLEEP=<pay µs>` (varsayılan 200), `SPINSLEEP=0` kapatır.
+
+Uyku `nanosleep` değil, `kevent` zamanlayıcısı + `NOTE_CRITICAL`
+(`win32_ext.c`, `guest_sleep_ns`). macOS `nanosleep`'i zamanlayıcı
+birleştirme payıyla uyandırıyor: oyunda 3 ms'lik istekte ortalama 447 µs
+geç, %12'si 800 µs'den fazla. Bu yüzden 400 µs payla kare sapması 0.44 →
+0.50 ms'ye çıkıyor, 150 µs payla fps 116.6'ya düşüyordu. `kevent` ile
+ortalama gecikme 41 µs (%98'i ≤ 200 µs), kilit bekleme 2–6 µs; 150 ve 400 µs
+payla fps 119.9–120.0, sapma 0.43 ms (dönen sürümle aynı), en uzun kare
+9.5 ms. Bağımsız ölçüm (QoS fark etmiyor): `nanosleep` ve `mach_wait_until`
+medyan ~770 µs, `kevent` `NOTE_CRITICAL` medyan ~45 µs geç.
+
+**Ölçüm** (120 fps yarış, kare 6400–11600, `powermetrics` iki koşu ortalaması):
+
+| sürüm | toplam | CPU | GPU | oyun thread'i (`ps -M`) | fps | en uzun kare |
+|---|---|---|---|---|---|---|
+| A temel (`k21`) | 8.83 W | 5.18 W | 3.65 W | 8.26 ms/kare | 119.9 | 14.9 ms |
+| B Aşama 4, `SPINSLEEP=0` | 8.83 W | 5.10 W | 3.74 W | 8.22 ms/kare | 119.9 | 14.7 ms |
+| C Aşama 4 + uyku | **7.64 W** | **3.96 W** | 3.68 W | **5.25 ms/kare** | 119.9 | 9.5 ms |
+
+C, A'dan iki koşuda da 1.19 W düşük: toplam −%13.5, CPU −%24. Süreç
+toplamı 1.40 → 1.05 çekirdek, QPC çağrısı 269 M → 4.2 M. (Bu ölçüm
+`nanosleep` + 400 µs payla; `kevent` sürümü sapmayı da düzeltti, aşağı bkz.)
+HD build'de de aynı: oyun thread'i 8.11 → 5.32 ms/kare, süreç 1.43 → 1.17
+çekirdek, 119.8 fps.
+
+**Ölçüm dersi:** 120 fps'te konuk thread CPU'su (`CPUWIN` dahil) kare
+sınırlayıcının dönmesini içerir. CPU kazancını `PACE60=1` ile, güç kazancını
+yalnızca `powermetrics` ile ölçün. Thread başına gerçek CPU: yarış
+penceresinin başında ve sonunda `ps -M -p <pid>`.
+
 ---
 
 ## Ortam değişkenleri
@@ -407,6 +466,8 @@ bloklarının gölgeden süzülmüş uygulanması.
 | `D3DXNATIVE5/6/7/8=0` | sırasıyla geçiş döngüsü, sampler, shader, SetTexture yerel yolunu kapatır |
 | `EFXSTAT=<kare>` | ID3DXEffect vtable envanteri + efekt oluşturma satırları |
 | `FXTRACE=<kare>[,…]` | o karelerde her cihaz çağrısı (argüman/sabit verisi) ve efekt metodu sırayla |
+| `SPINSLEEP=<µs>` | oyunun kare sınırlayıcısında dönme yerine uyku; son pay (varsayılan 200) dönerek beklenir. `0` kapatır |
+| `QPCWHO=1` | QueryPerformanceCounter çağıranları (thread, dönüş, üst çerçeve) + 1 M çağrıda bir kare damgası + `SPINSLEEP` özeti (uyku sayısı, geç uyanma dağılımı, kilit bekleme) |
 
 Hepsi ölçüm/tanı amaçlı; `run.sh` bunları temizlemiyor. Ölçümde tarif:
 `AUTOSEQ` Quick Race + `QUITFRAMES=9000`, pencere 5900–8990. Bkz.
@@ -449,4 +510,5 @@ Tam üretim yerine mevcut shard'lara uygulamak için:
 | 2026-09-24 | 3 | parametre sürümleri + geçiş notu | — | olumsuz: doğrulamada isabetlerin %78'i yanlış (doku nesne tablosu, çizim başına doku değişimi); varsayılan kapalı |
 | 2026-10-15 | 3c | yerel yardımcılar; daha ucuz Aşama 2 kontrolü | 6.76 → 6.68 (`PACE60`) | yardımcılar kalıcı; Aşama 2 daraltması kazançsız, geri alındı |
 | 2026-10-15 | 4a–4e | `669296`/`6691b1`/`668cd0`/`668e0d`/SetTexture yerel | 6.97 → 5.34 (`PACE60`, aynı oturum) | −%23; tüm doğrulamalar 0 fark, görüntü aynı |
+| 2026-10-16 | güç | kare sınırlayıcı (`sub_0057eae0`) dönme → uyku | 8.26 → 5.25 (120 fps, `ps -M`) | 8.83 → 7.64 W (−%13.5), 119.9 fps korundu; Aşama 4 tek başına 0 W'tı |
 | | | | | |

@@ -18,7 +18,7 @@ LDOPT="${LDOPT} -mmacosx-version-min=$MINOS"
 WHICH="${1:-both}"
 case "$WHICH" in both|orig|hd) ;; *) echo "kullanim: ./link.sh [orig|hd]"; exit 1 ;; esac
 
-CSRC="mem dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance"
+CSRC="mem dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance perflog"
 MSRC="metal audio bundle"
 FW="-lm -framework Cocoa -framework Metal -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreServices -framework AudioToolbox"
 SHARDS="out/obj/shard_*.o out/obj/fntab.o out/obj/stubs.o"

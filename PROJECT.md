@@ -1115,6 +1115,9 @@ render'ı (kare başına ~1250 çizim, ~62 bin COM çağrısı).
 | anahtar | işlev |
 |---|---|
 | `PACE60=1` | eski 60 Hz kare frenini geri getirir (varsayılan: fren yok) |
+| `SPINSLEEP=<µs>` | oyunun 120 fps kare sınırlayıcısı (`sub_0057eae0`) dönme yerine uyur, son pay (varsayılan 200 µs) dönerek, uyku `kevent` `NOTE_CRITICAL` ile; `0` kapatır. Yarışta −1.2 W (bkz. `D3DX_HLE.md`) |
+| `QPCWHO=1` | QueryPerformanceCounter çağıranlarının dökümü (tanı) |
+| `PERFLOG=<dizin>` | gerçek oyun oturumu kaydı (kullanıcı oynarken); bkz. "Gerçek oturum kaydı" |
 | `NOVSYNC=1` | vsync'i kapatır — YALNIZCA ölçüm için, görüntü yırtılır |
 | `QUITFRAMES=<n>` | n kare sonra TEMİZ çıkar (PGO/ölçüm için) |
 | `LDOPT=...` | `link.sh`'in son link satırına eklenir |
@@ -1448,3 +1451,33 @@ zayif GPU'lu Mac'lerde olculmedi; GPU suresi kare butcesini asarsa
 3'ten (1280x960) 4'e (1280x1024) kaydi ve kontrollu kosularda tekrar
 uretilemedi (en olasi neden test penceresine gelen gercek klavye girisi).
 Cok kosulu testlerden once dosyayi yedekleyin.
+
+## Gerçek oturum kaydı (`PERFLOG`, `tools/oturum.sh`)
+
+Otomatik koşular (`AUTOSEQ` yarışı) birebir A/B için; bu kayıt kullanıcının
+kendi oynadığı oturumda (hızlı sürüş, efektler, kaza, menü) yükün **nerede ve
+ne zaman** oluştuğunu görmek için.
+
+```bash
+./tools/oturum.sh            # normal sürüm; ./tools/oturum.sh hd
+python3 tools/oturum_analiz.py ~/nfs_oturum/<tarih>   # -> <dizin>/rapor.md
+```
+
+Betik powermetrics'i (CPU/GPU watt, termal basınç; parola bir kez) ve oyunu
+`open --env PERFLOG=<dizin>` ile başlatır, oyundan çıkınca kapatır.
+`runtime/perflog.c` yazar:
+
+| dosya | içerik |
+|---|---|
+| `konuk.csv` | konuk kare başına duvar/CPU süresi, kare sınırlayıcı uykusu (boş pay), Present beklemesi, COM/Win32 çağrıları, VS/PS/PSO derleme, doku yaratma/yükleme |
+| `render.csv` | ana thread kare aralığı, `nextDrawable` beklemesi, kodlama süresi, çizim/köşe, düşen kare |
+| `gpu.csv` | kare başına GPU süresi |
+| `saniye.csv` | süreç enerjisi (`ri_energy_nj`, P çekirdek), komut/çevrim (IPC), termal durum, bellek |
+| `thread.csv` | saniyede bir thread başına kullanıcı/sistem süresi |
+| `ornek.bin` | 1 ms'de bir konuk, 4 ms'de bir ana thread: PC + çerçeve zinciri (`thread_suspend` → durum → `resume`; askıdayken kilit/malloc yok) |
+| `ekran/` | 2 sn'de bir ~480 px JPEG (GPU kopyası, arka planda yazılır) |
+
+Ek yük (120 fps yarış, `ps -M`): konuk thread +%1.6, süreç +%5 (çoğu
+örnekleyicinin kendisi); fps, en uzun kare ve sapma değişmiyor.
+`task_gpu_utilisation` 0 dönüyor: GPU watt yalnızca powermetrics'ten.
+

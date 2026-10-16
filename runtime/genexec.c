@@ -325,7 +325,7 @@ int run_generated(CPU *c, uint32_t entry){
             case 2: {                                            /* call r/m32 */
                 uint32_t t = o.is_reg ? c->r[o.reg] : ({ CHK(o.ea,4); MR32(o.ea); });
                 uint32_t next = pc+1+o.len;
-                PUSH32(next); dispatch_indirect(c, t); pc = c->eip; continue; }
+                PUSH32(next); dispatch_indirect(c, t); pc = next; continue; }   /* bkz. asagi */
             case 4: {                                            /* jmp r/m32 */
                 uint32_t t = o.is_reg ? c->r[o.reg] : ({ CHK(o.ea,4); MR32(o.ea); });
                 pc = t; continue; }
@@ -343,8 +343,11 @@ int run_generated(CPU *c, uint32_t entry){
         case 0xE8: {
             uint32_t next = pc + 5, t = next + MR32(pc+1);
             PUSH32(next);
-            dispatch_indirect(c, t);   /* .text -> lifted fonksiyon; o POP32(eip) yapar */
-            pc = c->eip; continue; }
+            dispatch_indirect(c, t);
+            /* donus noktasi = itilen adres (c->eip DEGIL): lift edilmis ret
+             * RETEIP=0 ile c->eip'e yazmiyor; model zaten degistirilmis donus
+             * adreslerini yok sayiyor, lift edilmis cagiran da hep 'next'te devam eder. */
+            pc = next; continue; }
         case 0xC3: POP32(c->eip); return 1;
         case 0xC2: { uint16_t n = MR16(pc+1); POP32(c->eip); c->esp += n; return 1; }
         case 0x90: pc++; continue;

@@ -145,6 +145,11 @@ static inline uint32_t parity8(uint32_t v){ v&=0xff; v^=v>>4; v^=v>>2; v^=v>>1; 
 static inline uint16_t fsw_get(const struct CPU *c){
     return (uint16_t)((c->fsw & (uint16_t)~0x3800u) | (uint16_t)((c->top & 7u) << 11));
 }
+/* X87OPT: blok ici x87 yazmac tahsisinde c->top bolge sonunda yazilir;
+ * fnstsw o andaki (statik) top'u acikca alir. */
+static inline uint16_t fsw_get_top(const struct CPU *c, uint32_t top){
+    return (uint16_t)((c->fsw & (uint16_t)~0x3800u) | (uint16_t)((top & 7u) << 11));
+}
 static inline void fcompare(struct CPU *c, double a, double b){
     c->fsw &= (uint16_t)~(FSW_C0|FSW_C2|FSW_C3);
     if (a != a || b != b)      c->fsw |= FSW_C0|FSW_C2|FSW_C3;  /* sirasiz (NaN) */

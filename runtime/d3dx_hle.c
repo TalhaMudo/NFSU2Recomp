@@ -1606,6 +1606,17 @@ out3:
 #include <time.h>
 static long cw_from = -2, cw_to = 0, cw_f0 = -1, cw_f1 = -1;
 static double cw_t0, cw_t1;
+/* thread'e ozel komut/cevrim sayaci (libsystem_kernel thread_selfcounts):
+ * zamandan cok daha kararli; ceviricinin urettigi kodun verimlilik olcusu */
+#include <dlfcn.h>
+static uint64_t cw_i0[2], cw_i1[2];
+static int (*cw_tsc)(int, void *, size_t);
+static void cw_counts(uint64_t *v){
+    static int init = 0;
+    if (!init){ init = 1; cw_tsc = (int (*)(int, void *, size_t))dlsym(RTLD_DEFAULT, "thread_selfcounts"); }
+    v[0] = v[1] = 0;
+    if (cw_tsc) cw_tsc(1, v, 2 * sizeof(uint64_t));
+}
 void guest_cpu_mark(void){
     if (cw_from == -2){
         const char *e = getenv("CPUWIN"); cw_from = -1;
@@ -1616,8 +1627,8 @@ void guest_cpu_mark(void){
     if (f < cw_from || (cw_f1 >= 0 && f > cw_to)) return;
     struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     double t = ts.tv_sec*1e3 + ts.tv_nsec/1e6;
-    if (cw_f0 < 0){ cw_f0 = f; cw_t0 = t; }
-    if (f <= cw_to){ cw_f1 = f; cw_t1 = t; }
+    if (cw_f0 < 0){ cw_f0 = f; cw_t0 = t; cw_counts(cw_i0); }
+    if (f <= cw_to){ cw_f1 = f; cw_t1 = t; cw_counts(cw_i1); }
 }
 
 /* ---- EFXSTAT=<kare>: ID3DXEffect vtable (0x7b6fe8, 82 metot) envanteri ----
@@ -1738,6 +1749,11 @@ void d3dx_hle_report(void){
     if (cw_f1 > cw_f0 && cw_f0 >= 0)
         fprintf(stderr, "\n=== CPUWIN: konuk thread CPU %.3f ms/kare (%ld..%ld, %ld kare) ===\n",
                 (cw_t1 - cw_t0) / (double)(cw_f1 - cw_f0), cw_f0, cw_f1, cw_f1 - cw_f0);
+        if (cw_i1[0] > cw_i0[0]){
+            double fr = (double)(cw_f1 - cw_f0), ki = (double)(cw_i1[0] - cw_i0[0]), kc = (double)(cw_i1[1] - cw_i0[1]);
+            fprintf(stderr, "=== CPUWIN: konuk thread %.3f M komut/kare, %.3f M cevrim/kare, IPC %.2f ===\n",
+                    ki / fr / 1e6, kc / fr / 1e6, ki / kc);
+        }
     if (m3_calls){
         fprintf(stderr, "  --- gecis notu (sub_006691b1, Asama 3) ---\n");
         fprintf(stderr, "  cagri %llu | isabet %llu (%.1f%%) | atlanan %llu | kayit %llu (uygun %llu)\n"

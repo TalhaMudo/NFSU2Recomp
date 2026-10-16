@@ -9,7 +9,9 @@ from lift import Lifter, Unsupported
 
 EXE = sys.argv[1]
 NSHARD = int(sys.argv[2]) if len(sys.argv)>2 else 128
-OUT = 'gen/all'
+# GENOUT: cikis dizini (varsayilan gen/all); COMMENTS=1: her x86 komutu yorum
+# olarak yazilir (kod ayni; komut duzeyinde profil icin, bkz. tools/lift_profil.py)
+OUT = os.environ.get('GENOUT', 'gen/all')
 os.makedirs(OUT, exist_ok=True)
 
 # ---------- Faz 1: kapali fonksiyon kumesi ----------
@@ -52,19 +54,44 @@ def discover_all():
 
 # ---------- Faz 2: paralel uretim ----------
 _L=None
+# INLINE=<n>: cagri yapmayan, en fazla n x86 komutluk "yaprak" fonksiyonlar her
+# shard'a static inline (always_inline) kopya olarak konur, dogrudan cagrilar
+# onlara yonlendirilir.  Cagri basina sabit bedel (giris/cikis yazmac saklama,
+# c-> alanlarinin bellege yazilip geri okunmasi) yaprak cagrilarda isin kendisi
+# kadar.  Orijinal sub_X tanimlari aynen kalir (fntab, dolayli cagri).
+INLINE_MAX = int(os.environ.get('INLINE','0') or 0)
+_INL = {}
+import re as _re
+_INL_CALL = _re.compile(r'\bsub_([0-9a-f]{8})\(c\)')
+_INL_YASAK = ('dispatch_indirect', 'unsupported_insn', 'cpuid_shim', 'guest_hook', 'rdtsc_shim', 'cov_hit')
 OVERRIDES = {int(x,16) for x in os.environ.get('OVERRIDE','').replace('0x','').split(',') if x.strip()}
 
-def _init():
-    global _L
+def _init(inl=None):
+    global _L, _INL
+    if inl: _INL = inl
     hooks = [int(x,16) for x in os.environ.get('HOOKS','').replace('0x','').split(',') if x.strip()]
     watch = os.environ.get('WATCH','') == '1'
     cov   = os.environ.get('COVERAGE','') == '1'
-    _L = Lifter(EXE, comments=False, trap=True, hooks=hooks, watch=watch)
+    _L = Lifter(EXE, comments=os.environ.get('COMMENTS','') == '1', trap=True, hooks=hooks, watch=watch)
     _L.cov = cov
+
+def _inlprobe(a):
+    """yaprak + kucuk + override degil -> (adres, kod) ya da (adres, None)"""
+    if a in OVERRIDES: return a, None
+    _L.traps = 0
+    try:
+        code, tg = _L.lift(a)
+    except Exception:
+        return a, None
+    m = _re.search(r'\((\d+) komut,', code)
+    if not m or int(m.group(1)) > INLINE_MAX: return a, None
+    if _INL_CALL.search(code.split('{', 1)[1]) or any(y in code for y in _INL_YASAK): return a, None
+    if _L.traps: return a, None
+    return a, code
 
 def _shard(args):
     idx, addrs = args
-    L=_L; parts=[]; defined=[]; refs=set(); traps=0; trunc=0; kinds=collections.Counter()
+    L=_L; parts=[]; defined=[]; refs=set(); traps=0; trunc=0; kinds=collections.Counter(); used=set()
     for a in addrs:
         L.traps=0; L.truncated=0
         try:
@@ -75,6 +102,11 @@ def _shard(args):
         if a in OVERRIDES:
             code = code.replace(f"void sub_{a:08x}(CPU *restrict c) {{",
                                 f"void sub_{a:08x}_orig(CPU *restrict c) {{")
+        if _INL:
+            hdr, body = code.split('{', 1)
+            body = _INL_CALL.sub(lambda m: (used.add(int(m.group(1), 16)) or f"inl_{m.group(1)}(c)")
+                                 if int(m.group(1), 16) in _INL else m.group(0), body)
+            code = hdr + '{' + body
         parts.append(code); defined.append(a)
         refs |= {t for t in tg if L.in_text(t)}
         traps += L.traps; trunc += L.truncated
@@ -82,6 +114,9 @@ def _shard(args):
     path=f"{OUT}/shard_{idx:04d}.c"
     with open(path,'w') as f:
         f.write('#include "cpu.h"\n#include "decls.h"\n#include <math.h>\n\n')
+        for x in sorted(used):
+            f.write(_INL[x].replace(f"void sub_{x:08x}(CPU *restrict c) {{",
+                    f"static inline __attribute__((always_inline)) void inl_{x:08x}(CPU *restrict c) {{") + "\n")
         f.write("\n".join(parts))
         f.write("\n")
     return idx, defined, sorted(refs), traps, trunc, dict(kinds), os.path.getsize(path)
@@ -99,8 +134,14 @@ if __name__=='__main__':
           + (f"  [kanca: {hk}]" if hk else "")
           + ("  [KAPSAMA olcumu]" if os.environ.get('COVERAGE','')=='1' else "") + ("  [WATCHPOINT enstrumantasyonu]" if wt=='1' else ""))
     t1=time.time()
+    inl = {}
+    if INLINE_MAX:
+        with mp.Pool(mp.cpu_count(), initializer=_init) as pool:
+            for a, code in pool.imap_unordered(_inlprobe, funcs, chunksize=64):
+                if code: inl[a] = code
+        print(f"  [satir ici: {len(inl)} yaprak fonksiyon <= {INLINE_MAX} komut]  ({time.time()-t1:.0f}s)")
     defined=set(); refs=set(); traps=0; trunc=0; kinds=collections.Counter(); bytes_=0
-    with mp.Pool(mp.cpu_count(), initializer=_init) as pool:
+    with mp.Pool(mp.cpu_count(), initializer=_init, initargs=(inl,)) as pool:
         for n,(idx,d,r,tp,tr,kk,sz) in enumerate(pool.imap_unordered(_shard, chunks)):
             defined |= set(d); refs |= set(r); traps+=tp; trunc+=tr
             kinds.update(kk); bytes_+=sz

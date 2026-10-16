@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/event.h>
 #include <sched.h>
 
 void dispatch_indirect(CPU*,uint32_t);
@@ -93,9 +94,30 @@ void guest_unlock(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took(); }
 /* Buyuk kilidi birakarak uyu (win32.c: oyunun kare bekleme dongusu). */
-void guest_sleep_ns(long ns){
+uint64_t g_sleep_late_ns, g_sleep_gil_ns, g_sleep_n;    /* tani: uyku gecikmesi / kilit bekleme */
+/* nanosleep macOS'ta zamanlayici birlestirme payiyla uyaniyor: oyunda 3 ms
+ * istekte ortalama 447 us gec (ayri olcum: medyan ~770 us, QoS fark etmiyor).
+ * kevent zamanlayicisi NOTE_CRITICAL ile birlestirilmez: medyan ~45 us. */
+static void sleep_precise_ns(long ns){
+    static _Thread_local int kq = -1;
+    if (kq < 0) kq = kqueue();
+    if (kq >= 0){
+        struct kevent ev, out;
+        EV_SET(&ev, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL, ns, 0);
+        if (kevent(kq, &ev, 1, &out, 1, NULL) == 1) return;
+    }
     struct timespec ts = { (time_t)(ns / 1000000000L), ns % 1000000000L };
-    guest_yield_begin(); nanosleep(&ts, 0); guest_yield_end();
+    nanosleep(&ts, 0);
+}
+void guest_sleep_ns(long ns){
+    struct timespec a, b, d;
+    guest_yield_begin();
+    clock_gettime(CLOCK_MONOTONIC, &a); sleep_precise_ns(ns); clock_gettime(CLOCK_MONOTONIC, &b);
+    guest_yield_end();
+    clock_gettime(CLOCK_MONOTONIC, &d);
+    int64_t sl = (int64_t)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec) - ns;
+    int64_t gl = (int64_t)(d.tv_sec - b.tv_sec) * 1000000000LL + (d.tv_nsec - b.tv_nsec);
+    g_sleep_late_ns += sl > 0 ? (uint64_t)sl : 0; g_sleep_gil_ns += (uint64_t)gl; g_sleep_n++;
 }
 
 /* --- kare hizi sabitleme (60 Hz) ------------------------------------
@@ -309,6 +331,9 @@ static void *guest_thread_main(void *p){
         fprintf(stderr,"      [thread] BASLADI entry=0x%08x arg=0x%08x teb=0x%08x tid=%u\n",
                 t->entry, t->arg, t->teb, t->ob?t->ob->tid:0); } }
     tl_obj = t->ob;
+    /* tani: thread listelerinde (perflog thread.csv, sample) taninsin */
+    { char nm[32]; snprintf(nm, sizeof nm, "konuk %u @%06x", t->ob ? t->ob->tid : 0u, t->entry & 0xFFFFFFu);
+      pthread_setname_np(nm); }
     guest_lock(&cpu);
     dispatch_indirect(&cpu, t->entry);
     guest_unlock();

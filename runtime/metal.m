@@ -16,6 +16,7 @@
 
 #import <Metal/Metal.h>
 #include "enhance.h"
+#include "perflog.h"
 #include <stdatomic.h>
 #include <math.h>
 #include <string.h>
@@ -854,7 +855,7 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     unsigned id_ = g_texn++;
     g_tex[id_] = t;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
-    atomic_fetch_add(&g_tex_created, 1);
+    atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
 }
 /* Guest (Reset): simdiye kadarki render hedefleri olu. */
@@ -2795,7 +2796,7 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
     g_tex[id_] = t;
     g_tex_cube[id_] = 1;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
-    atomic_fetch_add(&g_tex_created, 1);
+    atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
 }
 int metal_tex_is_cube(unsigned id_){
@@ -2811,6 +2812,7 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
     unsigned lw = w >> level, lh = h >> level;
     if (!lw) lw = 1; if (!lh) lh = 1;
     MTLRegion rg = MTLRegionMake2D(0, 0, lw, lh);
+    struct timespec _u0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_u0);
     if (g_tex_cube[id_]){
         if (face > 5u) face = 0u;
         [g_tex[id_] replaceRegion:rg mipmapLevel:level slice:face
@@ -2818,6 +2820,9 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
     } else {
         [g_tex[id_] replaceRegion:rg mipmapLevel:level withBytes:data bytesPerRow:pitch];
     }
+    if (g_perflog){ struct timespec _u1; clock_gettime(CLOCK_MONOTONIC, &_u1);
+        perflog_event(PL_TEXUP, (uint64_t)(_u1.tv_sec - _u0.tv_sec) * 1000000000ull + (uint64_t)_u1.tv_nsec - (uint64_t)_u0.tv_nsec,
+                      (uint64_t)pitch * (blk == 1 ? lh : (lh + blk - 1) / blk)); }
     if (level < 16u) g_tex_lvlmask[id_] |= 1u << level;
     atomic_fetch_add(&g_tex_uploaded, 1);
 }
@@ -3232,7 +3237,10 @@ void metal_register_vs(int vsid, const char *msl){
         NSString *src = [kPrelude stringByAppendingString:
                          [NSString stringWithUTF8String:msl]];
         NSError *err = nil;
+        struct timespec _c0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_c0);
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
+        if (g_perflog){ struct timespec _c1; clock_gettime(CLOCK_MONOTONIC, &_c1);
+            perflog_event(PL_VS, (uint64_t)(_c1.tv_sec - _c0.tv_sec) * 1000000000ull + (uint64_t)_c1.tv_nsec - (uint64_t)_c0.tv_nsec, 0); }
         if (!lib){
             static int shown = 0;
             if (shown < 5){ shown++;
@@ -3433,7 +3441,10 @@ void metal_register_ps(int psid, const char *msl){
         NSString *src = [kPrelude stringByAppendingString:
                          [NSString stringWithUTF8String:msl]];
         NSError *err = nil;
+        struct timespec _c0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_c0);
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
+        if (g_perflog){ struct timespec _c1; clock_gettime(CLOCK_MONOTONIC, &_c1);
+            perflog_event(PL_PS, (uint64_t)(_c1.tv_sec - _c0.tv_sec) * 1000000000ull + (uint64_t)_c1.tv_nsec - (uint64_t)_c0.tv_nsec, 0); }
         if (!lib){
             static int shown = 0;
             if (shown < 3){ shown++;
@@ -3567,6 +3578,64 @@ void metal_present(void){
 }
 
 long metal_frames_dropped(void){ return atomic_load(&g_frames_dropped); }
+unsigned long long metal_wait_present_ns(void){ return atomic_load(&g_wait_present_ns); }
+int metal_thermal_state(void){ return (int)[[NSProcessInfo processInfo] thermalState]; }
+
+/* PERFLOG ekran goruntusu: drawable'in tam boy kopyasi (GPU blit, paylasimli
+ * doku); tamamlaninca arka plan kuyrugunda her k. piksel okunup ~480 piksel
+ * genisliginde JPEG yazilir.  Oyun thread'lerinde is yok; onceki goruntu
+ * yazilmadan yenisi alinmaz. */
+static id<MTLTexture> g_pl_tex;
+static _Atomic int g_pl_busy = 0;
+static void pl_thumb(id<MTLCommandBuffer> cb, id<MTLTexture> src, long fno){
+    if (atomic_load(&g_pl_busy)) return;
+    NSUInteger W = src.width, H = src.height;
+    if (g_pl_tex && (g_pl_tex.width != W || g_pl_tex.height != H)) g_pl_tex = nil;
+    if (!g_pl_tex){
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                       width:W height:H mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+        g_pl_tex = [g_dev newTextureWithDescriptor:td];
+        if (!g_pl_tex) return;
+    }
+    atomic_store(&g_pl_busy, 1);
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+             sourceSize:MTLSizeMake(W, H, 1) toTexture:g_pl_tex destinationSlice:0
+       destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+    [bl endEncoding];
+    id<MTLTexture> tex = g_pl_tex;
+    double tms = perflog_now_us() / 1e3;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b){
+        (void)b;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSUInteger k = (W + 479) / 480, w = W / k, h = H / k;
+            uint8_t *row = malloc(W * 4), *out = malloc(w * h * 4);
+            if (row && out){
+                for (NSUInteger y = 0; y < h; y++){
+                    [tex getBytes:row bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, y * k, W, 1) mipmapLevel:0];
+                    for (NSUInteger x = 0; x < w; x++) memcpy(out + (y * w + x) * 4, row + x * k * 4, 4);
+                }
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                CGContextRef cg = CGBitmapContextCreate(out, w, h, 8, w * 4, cs,
+                    kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+                if (cg){
+                    CGImageRef img = CGBitmapContextCreateImage(cg);
+                    char path[1100];
+                    snprintf(path, sizeof path, "%s/ekran/%09.0f_%ld.jpg", g_pl_dir, tms, fno);
+                    CFStringRef sp = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
+                    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, sp, kCFURLPOSIXPathStyle, false);
+                    CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.jpeg"), 1, NULL);
+                    if (dst){ CGImageDestinationAddImage(dst, img, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); }
+                    CFRelease(url); CFRelease(sp); CGImageRelease(img); CGContextRelease(cg);
+                }
+                CGColorSpaceRelease(cs);
+            }
+            free(row); free(out);
+            atomic_store(&g_pl_busy, 0);
+        });
+    }];
+}
 
 /* Ana thread'den, guest baslamadan ONCE cagrilir.
  * Oyun ilk dokularini pencere acilmadan yaratiyor; cihaz o an hazir
@@ -3812,7 +3881,10 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
 #endif
 
     NSError *e2 = nil;
+    struct timespec _o0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_o0);
     id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e2];
+    if (g_perflog){ struct timespec _o1; clock_gettime(CLOCK_MONOTONIC, &_o1);
+        perflog_event(PL_PSO, (uint64_t)(_o1.tv_sec - _o0.tv_sec) * 1000000000ull + (uint64_t)_o1.tv_nsec - (uint64_t)_o0.tv_nsec, 0); }
     if (!ps) return g_pso;
     g_psocache[g_pson].key = key;
     g_psocache[g_pson].pso = ps;
@@ -5304,6 +5376,7 @@ void metal_run_main_loop(void){
                                 [cb renderCommandEncoderWithDescriptor:rp];
                             [e3 endEncoding];
                         }
+                        if (g_perflog && atomic_exchange(&g_pl_thumb_req, 0)) pl_thumb(cb, d.texture, fno_pre);
                         /* Sunumdan ONCE okunabilir bir kopya al: sunulmus bir
                          * drawable'in dokusundan geri okuma guvenilir degil. */
                         if (dumpnow){
@@ -5354,6 +5427,7 @@ void metal_run_main_loop(void){
                                 if (ab_mode >= 0 && ab_count){ atomic_fetch_add(&g_ab_ns[ab_mode], ns); atomic_fetch_add(&g_ab_cnt[ab_mode], 1ull); }
                                 atomic_fetch_add(&g_gpu_ns, ns);
                                 atomic_fetch_add(&g_gpu_n, 1ull);
+                                if (g_perflog) perflog_gpu(fno_pre, g);
                                 unsigned long long mx = atomic_load(&g_gpu_max_ns);
                                 while (ns > mx &&
                                        !atomic_compare_exchange_weak(&g_gpu_max_ns, &mx, ns)) {}
@@ -5361,6 +5435,21 @@ void metal_run_main_loop(void){
                         [cb presentDrawable:d];
                         [cb commit];
                         long fno = atomic_fetch_add(&g_frames_drawn, 1) + 1;
+                        if (g_perflog){ struct timespec _p1; clock_gettime(CLOCK_MONOTONIC, &_p1);
+                            /* karede baglanan farkli doku (+ hedef) sayisi: komut tamponu
+                             * gonderiminin cekirdek maliyeti kaynak sayisiyla buyur */
+                            static uint32_t pl_st[MAXTEX]; static uint32_t pl_gen = 0;
+                            unsigned pl_nt = 0; pl_gen++;
+                            for (unsigned q = 0; rb >= 0 && q < g_dn[rb]; q++){
+                                const MDraw *x = &g_dbuf[rb][q];
+                                unsigned ids[5] = { x->tex, x->tex1, x->tex2, x->tex3, TGT_ID(x->target) };
+                                for (int w = 0; w < 5; w++){ unsigned id_ = ids[w];
+                                    if (id_ && id_ < MAXTEX && pl_st[id_] != pl_gen){ pl_st[id_] = pl_gen; pl_nt++; } }
+                            }
+                            perflog_render_frame(fno, pl_nt,
+                                (uint64_t)(_d1.tv_sec - _d0.tv_sec) * 1000000000ull + (uint64_t)_d1.tv_nsec - (uint64_t)_d0.tv_nsec,
+                                (uint64_t)(_p1.tv_sec - _e0.tv_sec) * 1000000000ull + (uint64_t)_p1.tv_nsec - (uint64_t)_e0.tv_nsec,
+                                rb >= 0 ? g_dn[rb] : 0u, rb >= 0 ? g_vn[rb] : 0u); }
                         /* FPSCSV=<yol>: kare basina sure + is yuku.  Kasmanin
                          * NEREDE oldugunu tahmin etmeden gormek icin. */
                         { static FILE *fp = NULL; static int init = 0;
