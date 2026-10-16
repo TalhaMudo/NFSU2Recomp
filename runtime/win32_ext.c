@@ -92,6 +92,11 @@ void guest_lock(CPU *c){ pthread_mutex_lock(&g_guest); tl_cpu=c; g_cur_cpu=c; re
 void guest_unlock(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took(); }
+/* Buyuk kilidi birakarak uyu (win32.c: oyunun kare bekleme dongusu). */
+void guest_sleep_ns(long ns){
+    struct timespec ts = { (time_t)(ns / 1000000000L), ns % 1000000000L };
+    guest_yield_begin(); nanosleep(&ts, 0); guest_yield_end();
+}
 
 /* --- kare hizi sabitleme (60 Hz) ------------------------------------
  * Sanal saat kare basina TAM 16.667 ms ilerliyor, yani oyunun hizi =

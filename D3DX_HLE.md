@@ -295,11 +295,93 @@ başına gerçekten değişiyor. Tasarruf ancak shader/sampler kısmında var.
    bayt karşılaştırması yerine). Beklenen kazanç küçük: görüntünün büyük
    kısmı statik durum kaydı.
 
-### Aşama 4 — tam yerel ID3DXEffect (uzun vade)
+### Aşama 3c — yerel yardımcılar ✅ / daha ucuz Aşama 2 kontrolü ❌ (2026-10-15)
 
-`.efx` ayrıştırma (`tools/efxparse.py` başlangıç noktası), teknik/geçiş/durum
-modeli, preshader VM'in yerel C karşılığı. Bu aşamada D3DX'in iç veri
-yapılarına bağımlılık tamamen kalkar.
+* **Yerel yardımcılar** (lift edilmiş x87/bayrak kodunun bit‑aynı C karşılığı):
+  `67193e` D3DXMatrixMultiply (32 girdi sonluysa NaN denetimsiz hızlı yol,
+  FMA kapalı; aksi/kısmi örtüşmede orijinal), `66056c` havuz bildirimi
+  (yazmaç ve yığın düzeni birebir), `65cf44` SetMatrix devrik dönüşümü
+  (tür 3/1; tür 2 `__ftol` orijinalde). `D3DXNVERIFY=n`: ~1 milyon
+  karşılaştırma, 0 fark. D3DX öz süresi −%12.5 (profil), oyun thread'i ~−%5.
+* **Aşama 2 kontrolünü daraltmak** (durum kaydının yalnızca okunan alanları,
+  sıcak/soğuk yuva ayrımı): doğrulama temiz ama profilde süre **değişmedi**
+  (1070 → 1065 örnek) — maliyet bayt karşılaştırmasında değil. Geri alındı.
+
+### Aşama 4 — D3DX'in sıcak yolunun yerel C'ye taşınması (2026-10-15, sürüyor)
+
+**Envanter** (`EFXSTAT=<kare>`, `D3DXCreateEffectFromResourceA` = `640c12`
+sarmalayıcısı oluşturmayı da yazar):
+* 23 efekt, hepsi açılışta, tek paylaşılan havuzla (`[0x870914]`), PE
+  kaynaklarındaki derlenmiş fx_2_0 ikililerinden (`RT_RCDATA`, `IDI_*_FX`).
+* 82 metottan 25'i kullanılıyor; kare başına yalnızca 8 Set* + Begin /
+  BeginPass / CommitChanges / EndPass / End. Hiç metin tutamaç yok.
+* Yarışta 13 efekt, 16 geçiş; menü + yarış boyunca 33.
+* Tutamaç = kayıt adresinin bit tersi: parametre `~([this+0x9c] + i*0x50)`,
+  teknik `~([this+0xa4] + i*0xb4)`, geçiş `~([teknik+0x38] + i*0x38)`.
+
+**Format** (`tools/efxdump.py`, 23 blobun hepsi bayt bayt tüketiliyor): 325
+parametre, 35 teknik, 47 geçiş, 871 durum; 92 shader (CTAB ayrıştırılıyor),
+224 ifade — **hepsi tek bileşenli MOV** (sabit/göreli adresleme yok),
+shader'lardaki `PRES` işaretleri boş. İşlem tablosu D3D9 sırası: 0..0x66
+render state (WRAP0–15 bir arada), 0x67.. doku aşaması, 0x7a FVF, 0x7b–0x7e
+transform, 0x92/0x93 VS/PS, 0xa4 Texture, 0xa5.. sampler state. D3DX'in kendi
+durum tablosu `0x7b5834` (işlem başına 28 bayt).
+
+**D3DX mekaniği** (`FXTRACE=<kare>,...` cihaz + efekt çağrı izi; ham D3DX için
+`D3DXMEMO=0 D3DXMEMO2=0` ile):
+* Begin(0) her seferinde ~5 durum bloğu yakalar, End onları uygular (geçiş
+  olmasa bile onlarca cihaz çağrısı).
+* `669296`: kirli değilse (`R+0==0`) değer yenilenmez ama cihaz çağrısı **her
+  BeginPass'te yapılır**; sonu `0x66a1f7` atlama tablosu (tür 1 RS, 2 TSS, 3 SS,
+  9 doku, 14 shader nesnesi, 15 sampler nesnesi …).
+* Set* → `65ab24`: Begin dışında bağımlı durumları kirli işaretler; Begin
+  içinde ayrıca **tüm geçişlerden** kirli listeye (`[this+0x108]`) ekler.
+  CommitChanges listeden `[P+0x3c]` (etkinlik sayacı, `65ae35` ±1, iç içe
+  kayıtlara yayılır) sıfırdan büyük kayıtları uygular — bu yüzden etkin
+  olmayan bir geçişin PS sabit bloğu da yüklenebiliyor. EndPass listeyi
+  uygulamadan siler. Bu defter D3DX belleğinde kaldığı için taşıma onu
+  bozmadan yapıldı.
+
+**Taşınanlar** (D3DX'in kendi bellek yapıları üzerinde birebir; desteklenmeyen
+her yol çağrı başına orijinale düşer):
+
+| adım | fonksiyon | kapsam | doğrulama |
+|---|---|---|---|
+| 4a | `669296` tür 1/2/3 (+ ifade notu) | durum çağrılarının %86'sı; kirliyse `664a2f`, durum başına küçük not (girdi verisi + hedef/değer tamponu bekçisi) | 2.9 M, 0 fark |
+| 4b | `6691b1` geçiş döngüsü | prolog, bayrak 8 / P&8 / P&1 yolları, iki hata kuralı | 4a üzerinden |
+| 4c | `668cd0` sampler'lar | sampler kaydı başına durum + doku | 4 bin, 0 fark |
+| 4d | `668e0d` shader | VS/PS + ham kopya sabit blokları + yükleme; doldurucular konuk | 316 bin, 0 fark |
+| 4e | `66d7e9` SetTexture + `65ccd8` | nesne tablosu + havuz yayılımı | koşu + görüntü |
+
+Ortak kurallar: cihaz çağrısı `com.c` gölge durumuyla aynıysa hiç yapılmaz
+(tür 1–3 satır içi; durum bloğu kaydı/tekrarı, açık `dxrec` kaydı ya da iz
+karesinde her zaman yapılır). Doku AddRef/Release `com.c`'de etkisiz olduğu
+için atlanır (kare başına ~3900 dağıtım). Doğrulayıcı (`nat_verify`): yerel
+kuru çalışır (cihaz çağrıları kaydedilir), bellek geri alınır, orijinal `dxrec`
+kaydıyla çalışır; bellek penceresi + ek kayıtlar, çağrı dizisi, eax/esp
+karşılaştırılır. Konuk alt çağrısı gereken yollar kuru doğrulanamaz.
+
+**Ölçüm** (`PACE60=1 CPUWIN=6200,8800`, aynı oturumda temel `k21` ikilisiyle,
+iki koşu ortalaması):
+
+| durum | temel | yeni | fark |
+|---|---|---|---|
+| yerel yardımcılar | 6.76 | 6.68 | −%1.2 |
+| + 4a | 6.68 | 6.11 | −%8.5 |
+| + ifade notu, 4b | 6.70 | 5.64 | −%15.8 |
+| + 4c, 4d | 6.58 | 5.68 | −%13.8 (gürültü içinde) |
+| + 4e, satır içi denetim | 6.97 | 5.34 | **−%23.4** |
+
+Görüntü: yarış karesi 6600 yan yana aynı (fark yalnızca zamanlayıcı/kare
+anı kaynaklı). Profilde D3DX + yerel kod hâlâ oyun thread'inin ~%29'u; en
+büyük kalemler ifade notu (`n4_eval`), durum çekirdeği, ifade
+değerlendirmesi kaçanları (`663a42`/`660a52`/`688e89`), Set* yolu
+(`66056c`, `66d13a`, `66d303`, `65ab24`).
+
+**Sıradaki:** geçiş başına derlenmiş durum listesi (kirli olmayan durumlar
+için yalnızca değer + gölge karşılaştırması), Set* yolu (`65ab24`
+mod A), ifade değerlendirmesinin MOV‑özel yerel karşılığı, Begin/End durum
+bloklarının gölgeden süzülmüş uygulanması.
 
 ---
 
@@ -317,6 +399,14 @@ yapılarına bağımlılık tamamen kalkar.
 | `D3DXMEMO3=1` | Aşama 3 geçiş notu (araştırma; varsayılan KAPALI, doğrulamada yanlış çıktı) |
 | `D3DXVERIFY3=<n>` | Aşama 3 isabetlerinin 1/n'inde orijinali çalıştırıp karşılaştırır, etkili çağrıları yazar |
 | `COMSTAT=<kare>` | cihaz metot sayıları, BeginPass içi/dışı, gereksiz oranı (`D3DXSTAT` ile birlikte) |
+| `D3DXNATIVE=0` | yerel yardımcıları (`67193e`, `66056c`, `65cf44`) kapatır |
+| `D3DXNVERIFY=<n>` | yerel yardımcıların her n. çağrısında orijinalle karşılaştırma |
+| `D3DXNATIVE4=0` | yerel durum yolunu (4a) ve geçiş döngüsünü (4b) kapatır |
+| `D3DXN4MEMO=0` | durum başına ifade notunu kapatır |
+| `D3DXN4VERIFY=<n>` | 4a/4c/4d yollarında kuru yerel + orijinal karşılaştırması (`D3DXMEMO=0` ile) |
+| `D3DXNATIVE5/6/7/8=0` | sırasıyla geçiş döngüsü, sampler, shader, SetTexture yerel yolunu kapatır |
+| `EFXSTAT=<kare>` | ID3DXEffect vtable envanteri + efekt oluşturma satırları |
+| `FXTRACE=<kare>[,…]` | o karelerde her cihaz çağrısı (argüman/sabit verisi) ve efekt metodu sırayla |
 
 Hepsi ölçüm/tanı amaçlı; `run.sh` bunları temizlemiyor. Ölçümde tarif:
 `AUTOSEQ` Quick Race + `QUITFRAMES=9000`, pencere 5900–8990. Bkz.
@@ -331,7 +421,7 @@ CPU kazancı kaybolur. CPU değişikliklerini `CPUWIN` ile ölçün, kare süres
 ## Yeniden üretim
 
 Sarmalanan her fonksiyon `sub_XXXX_orig` olarak üretilmeli. Tam OVERRIDE
-listesi (overrides.c + d3dx_hle.c; 29 adres, `PROJECT.md` → "Komutlar" ile
+listesi (overrides.c + d3dx_hle.c; 35 adres, `PROJECT.md` → "Komutlar" ile
 aynı olmalı). İlk üçü `overrides.c`'deki yağmur / günün-saati sarmalayıcıları;
 biri eksik olursa `sub_XXXX_orig` üretilmez ve link kırılır:
 
@@ -357,4 +447,6 @@ Tam üretim yerine mevcut shard'lara uygulamak için:
 | 2026-09-24 | 1 | not tam kopya + `memcmp` | 8.10–8.11 | −%29 (aynı gece referans 10.9–12.0), yarış 118.9 fps |
 | 2026-09-24 | 2 | durum atama notu (`669296`), çağrı kaydı + etkisizlik denetimi | 7.45–7.50 (`PACE60`) | −%5 (`PACE60` referansı 7.80–7.94); 120 Hz'de fark yok, zaten sınırda |
 | 2026-09-24 | 3 | parametre sürümleri + geçiş notu | — | olumsuz: doğrulamada isabetlerin %78'i yanlış (doku nesne tablosu, çizim başına doku değişimi); varsayılan kapalı |
+| 2026-10-15 | 3c | yerel yardımcılar; daha ucuz Aşama 2 kontrolü | 6.76 → 6.68 (`PACE60`) | yardımcılar kalıcı; Aşama 2 daraltması kazançsız, geri alındı |
+| 2026-10-15 | 4a–4e | `669296`/`6691b1`/`668cd0`/`668e0d`/SetTexture yerel | 6.97 → 5.34 (`PACE60`, aynı oturum) | −%23; tüm doğrulamalar 0 fark, görüntü aynı |
 | | | | | |

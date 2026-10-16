@@ -193,6 +193,83 @@ static uint64_t tick0;
 
 static uint32_t ARG(CPU*c,int i){ return MR32(c->esp + 4u*(uint32_t)i); }  /* ret adresi POP edildikten sonra */
 
+/* QPCWHO=1: QueryPerformanceCounter'i kim (thread, donus adresi, bir ust
+ * cerceve) cagiriyor.  120 fps'te kare basina ~21 bin cagri goruldu (60 fps
+ * PACE60'ta ~2 bin): zamana bagli bir bekleme dongusu.  Cagri GIL altinda,
+ * tablo kilitsiz. */
+typedef struct { uint32_t tid, ra, ra2; uint64_t n; } QpcWho;
+static QpcWho g_qw[128];
+static void qpc_report(void){
+    fprintf(stderr, "\n=== QPCWHO: QueryPerformanceCounter cagiranlar ===\n");
+    for (int k = 0; k < 128; k++){
+        int b = -1;
+        for (int i = 0; i < 128; i++) if (g_qw[i].n && (b < 0 || g_qw[i].n > g_qw[b].n)) b = i;
+        if (b < 0 || k >= 24) break;
+        fprintf(stderr, "  %12llu  thread %5u  donus 0x%08x  ust 0x%08x\n",
+                (unsigned long long)g_qw[b].n, g_qw[b].tid, g_qw[b].ra, g_qw[b].ra2);
+        g_qw[b].n = 0;
+    }
+}
+/* ---- Oyunun kare bekleme dongusu: donme yerine uyku ----
+ * sub_0057eae0 (0x57eb5e..0x57eb8e), kare suresi dt hedefin altindaysa:
+ *     start = GetTicks(); hedef = (X - dt) * k;
+ *     do { gecen = Fark(start, GetTicks()); } while (gecen < hedef);
+ * GetTicks = sub_0043bdf0 = QPC >> [0x8284e4]; Fark = sub_0043be20 =
+ * (now - start) * 2^S * [0x828028] saniye.  Dongu yalnizca saate bakiyor;
+ * 120 fps'te kare basina ~19 bin QPC ve oyun thread'inin TUM bos zamani
+ * (kare basina 8.2 ms CPU, %98) burada yaniyordu: D3DX'te kazanilan her
+ * ms buraya gidiyor, guc degismiyordu.
+ * Donguden gelen QPC'de (donus 0x43bdfe, onu cagiran 0x57eb79) kalan
+ * sure oyunun kendi formuluyle hesaplanir ve (kalan - pay) kadar uyunur;
+ * son pay yine donerek beklenir.  Cikis kosulu ve saat ayni oldugu icin
+ * oyunun zamanlamasi degismez, yalnizca CPU bos kalir.
+ * SPINSLEEP=<pay us> (varsayilan 400), SPINSLEEP=0 kapatir.
+ * Yigin: POP32 sonrasi [esp+0xc] = 0x57eb79, E = esp+0x14 (0057eae0'nun
+ * yerel taban), hedef float [E+0xc] = [esp+0x20], start = EBX. */
+static int g_spin_pay = -1;
+static uint64_t g_spin_n, g_spin_us;
+static void spin_report(void){
+    fprintf(stderr, "\n=== SPINSLEEP: kare bekleme dongusu %llu kez uyudu, toplam %.2f sn (pay %d us) ===\n",
+            (unsigned long long)g_spin_n, g_spin_us / 1e6, g_spin_pay);
+}
+static void qpc_spin_sleep(CPU *c){
+    if (MR32(c->esp + 0xcu) != 0x57eb79u) return;
+    if (g_spin_pay < 0){ const char *e = getenv("SPINSLEEP"); g_spin_pay = e ? atoi(e) : 400;
+                         if (g_spin_pay && ENVC("QPCWHO")) atexit(spin_report); }
+    if (!g_spin_pay) return;
+    /* oyunun birimi: F = [0x828028] QPC tiki basina (olculen 0.001 = ms,
+     * k = [0x784550] = 1000), X = [0x865558] = 1/120 sn kare hedefi */
+    uint32_t S = MR32(0x8284e4u) & 31u;
+    float F = MRF32(0x828028u), hedef = MRF32(c->esp + 0x20u);
+    if (!(F > 0.0f) || !(hedef > 0.0f)) return;
+    uint64_t now = host_qpc();
+    int32_t d = (int32_t)((uint32_t)(now >> S) - c->ebx); if (d < 0) d = 0;
+    double kalan = (double)hedef - (double)d * (double)(1u << S) * (double)F;
+    double us = kalan / (double)F - (double)g_spin_pay;      /* QPC tiki = us (QPF 1 MHz) */
+    if (us < 50.0 || us > 100000.0) return;                  /* kisa: don; >0.1 sn: beklenmedik */
+    void guest_sleep_ns(long ns);
+    guest_sleep_ns((long)(us * 1000.0));
+    g_spin_n++; g_spin_us += (uint64_t)us;
+}
+static void qpc_who(CPU *c){
+    static int init = 0; static uint64_t tot = 0;
+    if (!init){ init = 1; atexit(qpc_report); }
+    if ((++tot & 0xFFFFFu) == 0){ long metal_frames(void);
+        fprintf(stderr, "  [qpc] %llu M cagri, kare %ld\n", (unsigned long long)(tot >> 20), metal_frames()); }
+    uint32_t tid = (c->fs_base && mem_is_committed(c->fs_base+0x24u)) ? MR32(c->fs_base+0x24u) : 0u;
+    uint32_t ra = c->eip;                       /* POP32 sonrasi: donus adresi */
+    /* sub_0043bdf0 (oyunun zaman sarmalayicisi): sub esp,8; push arg; call.
+     * POP32 sonrasi [esp]=arg, [esp+4..0xb]=yerel, [esp+0xc]=onu cagiran. */
+    uint32_t ra2 = ra == 0x43bdfeu ? MR32(c->esp+0xcu)
+                 : (c->ebp && mem_is_committed(c->ebp+4u)) ? MR32(c->ebp+4u) : 0u;
+    uint32_t h = (tid * 2654435761u ^ ra * 40503u ^ ra2) & 127u;
+    for (int i = 0; i < 128; i++, h = (h + 1) & 127u){
+        QpcWho *w = &g_qw[h];
+        if (!w->n){ w->tid = tid; w->ra = ra; w->ra2 = ra2; w->n = 1; return; }
+        if (w->tid == tid && w->ra == ra && w->ra2 == ra2){ w->n++; return; }
+    }
+}
+
 int win32_call(CPU *c, uint32_t idx){
     if (idx >= g_imp_count) return 0;
     const ImpEnt *e = &g_imp[idx];
@@ -314,6 +391,8 @@ int win32_call(CPU *c, uint32_t idx){
     else if (!strcmp(n,"GetTickCount")) r = host_ms();
     else if (!strcmp(n,"QueryPerformanceFrequency")){ uint32_t p=ARG(c,0); if(p){MR32(p)=1000000;MR32(p+4)=0;} r=1; }
     else if (!strcmp(n,"QueryPerformanceCounter")){
+        if (ENVC("QPCWHO")) qpc_who(c);
+        if (c->eip == 0x43bdfeu) qpc_spin_sleep(c);
         uint64_t v = host_qpc(); uint32_t p=ARG(c,0);
         if(p){ MR32(p)=(uint32_t)v; MR32(p+4)=(uint32_t)(v>>32); } r=1; }
     else if (!strcmp(n,"SetUnhandledExceptionFilter")) r = 0;
