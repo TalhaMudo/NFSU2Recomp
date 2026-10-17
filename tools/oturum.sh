@@ -1,8 +1,10 @@
 #!/bin/bash
 # Gercek oyun oturumu kaydi (kullanici oynarken).
 #
-#   ./tools/oturum.sh        normal surum
-#   ./tools/oturum.sh hd     HD surum
+#   ./tools/oturum.sh            normal surum
+#   ./tools/oturum.sh hd         HD surum
+#   ./tools/oturum.sh opt6       opt6 surumu (./link_opt6.sh + ./pack.sh --opt6 --embed)
+#   ./tools/oturum.sh hd opt6    HD opt6 surumu
 #
 # Oyun kayit acik (PERFLOG) baslar; normal oyna, bitince oyundan cik.  Ayni anda
 # powermetrics CPU/GPU watt'ini saniyede bir yazar (yonetici parolasi bir kez
@@ -10,10 +12,14 @@
 # Kayit: ~/nfs_oturum/<tarih>[_hd]   Cozumleme: python3 tools/oturum_analiz.py <dizin>
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HD=0; [ "${1:-}" = hd ] && HD=1
-if [ $HD = 1 ]; then AD="NFSU2 HD.app"; EK=_hd; else AD="NFSU2.app"; EK=""; fi
+HD=0; O6=0
+for a in "$@"; do case "$a" in hd) HD=1 ;; opt6) O6=1 ;; *) echo "bilinmeyen: $a"; exit 1 ;; esac; done
+AD="NFSU2"; EK=""; PK=""
+[ $HD = 1 ] && { AD="$AD HD"; EK="${EK}_hd"; PK="$PK --hd"; }
+[ $O6 = 1 ] && { AD="$AD opt6"; EK="${EK}_opt6"; PK="$PK --opt6"; }
+AD="$AD.app"
 APP="$ROOT/out/kisisel/$AD"; [ -d "$APP" ] || APP="$ROOT/out/$AD"
-[ -d "$APP" ] || { echo "uygulama yok: $APP  (once ./pack.sh --embed${EK:+ --hd})"; exit 1; }
+[ -d "$APP" ] || { echo "uygulama yok: $APP  (once ./pack.sh --embed$PK)"; exit 1; }
 DIR="$HOME/nfs_oturum/$(date +%Y%m%d_%H%M%S)$EK"
 mkdir -p "$DIR"
 echo "uygulama : $APP"
