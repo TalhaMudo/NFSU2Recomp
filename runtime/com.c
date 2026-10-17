@@ -3093,6 +3093,8 @@ int com_call(CPU *c, uint32_t magic){
                     ? metal_create_texture_ex(medge,medge,lev?lev:1u,fmt?fmt:22u,1u)
                     : metal_create_texture_cube(medge,lev?lev:1u,fmt?fmt:22u,1u);
             }
+            if (ENVC("CUBELOG")) fprintf(stderr,"  [kup] CreateCubeTexture kenar=%u seviye=%u kullanim=0x%x bicim=%u havuz=%u -> metal %u\n",
+                                          edge, lev, usage, fmt, A(c,5), MR32(t2+28));
             cube_mark(t2);                          /* KUP DOKU kaydi */
             if(pp) MR32(pp)=t2; r=0; }
         else if (MID(GetCubeMapSurface)){
@@ -3240,6 +3242,11 @@ int com_call(CPU *c, uint32_t magic){
                     int id = ++g_psn;
                     void metal_register_ps(int, const char *);
                     if (ps_to_msl(pp3, id, msl, sizeof msl) > 0){
+                        { const char *pm = ENVC("PSMSL");   /* PSMSL=<id>[,<id>...] */
+                          for (const char *q = pm; q && *q; ){ while (*q == ',') q++;
+                              if (atoi(q) == id){ fprintf(stderr, "--- MSL ps %d ---\n", id); vs_disasm(pp3, stderr);
+                                                  fprintf(stderr, "%s\n", msl); break; }
+                              while (*q && *q != ',') q++; } }
                         metal_register_ps(id, msl);
                         MR32(h+12) = (uint32_t)id;
                     }
@@ -3250,8 +3257,12 @@ int com_call(CPU *c, uint32_t magic){
                      * Metal cizimi reddediyor (validateCommonDrawErrors).
                      * Cizim aninda bagli dokuya gore varyant seciliyor. */
                     if (id < PSCUBE &&
-                        ps_to_msl_ex(pp3, id + PSCUBE, msl, sizeof msl, 1u) > 0)
+                        ps_to_msl_ex(pp3, id + PSCUBE, msl, sizeof msl, 1u) > 0){
+                        /* PSMSL=<id>: o kimligin (kup varyanti dahil) MSL'ini yaz */
+                        if (ENVC("PSMSL") && atoi(ENVC("PSMSL")) == id + PSCUBE)
+                            fprintf(stderr, "--- MSL ps %d ---\n%s\n", id + PSCUBE, msl);
                         metal_register_ps(id + PSCUBE, msl);
+                    }
 #if NFS_ENHANCED
                     /* HD: yansima ayristirma varyanti cizim aninda, ihtiyac
                      * olunca uretilir (com_ps_refl_variant); program saklanir. */

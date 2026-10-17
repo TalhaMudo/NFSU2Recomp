@@ -3897,6 +3897,38 @@ static void dump_one_texture(unsigned id_, long frame){
     if (!g_dev || !g_pso || id_ >= MAXTEX || !g_tex[id_]) return;
     NSUInteger w = g_tex[id_].width, h = g_tex[id_].height;
     if (!w || !h) return;
+    /* BGRA8 doku: HAM baytlari blit ile oku.  Asagidaki cizim yolu g_pso'yu
+     * kullaniyor ve onda ALFA KARISIMI acik: alfasi 1'den kucuk her doku
+     * karartilarak dokuluyordu (ornek: alfa=0 yazan parlak bolge ayiklama
+     * hedefi tamamen siyah gorunuyordu).  Bu yol RGB'yi aynen yazar, alfa
+     * istatistigini ayrica basar. */
+    if (g_tex[id_].pixelFormat == MTLPixelFormatBGRA8Unorm && !ENVC("DUMPOLD")){
+        NSUInteger slice = 0; long tg = 90000 + (long)id_;
+        if (g_tex[id_].textureType == MTLTextureTypeCube){
+            const char *fe = ENVC("DUMPFACE"); slice = fe ? (NSUInteger)atoi(fe) : 0; if (slice > 5) slice = 0;
+            tg = 96000 + (long)id_*10 + (long)slice; }
+        MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                         width:w height:h mipmapped:NO];
+        sd.storageMode = MTLStorageModeShared; sd.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> shd = [g_dev newTextureWithDescriptor:sd];
+        if (shd){
+            id<MTLCommandBuffer> cbb = [g_queue commandBuffer];
+            id<MTLBlitCommandEncoder> bl = [cbb blitCommandEncoder];
+            [bl copyFromTexture:g_tex[id_] sourceSlice:slice sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                     sourceSize:MTLSizeMake(w,h,1) toTexture:shd destinationSlice:0 destinationLevel:0
+              destinationOrigin:MTLOriginMake(0,0,0)];
+            [bl endEncoding]; [cbb commit]; [cbb waitUntilCompleted];
+            uint8_t *px = malloc(w*h*4);
+            if (px){ [shd getBytes:px bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+                double sa = 0; unsigned amin = 255, amax = 0;
+                for (NSUInteger q = 0; q < w*h; q++){ unsigned a = px[q*4+3]; sa += a; if (a < amin) amin = a; if (a > amax) amax = a; }
+                fprintf(stderr, "metal: doku %u (%lux%lu) HAM dokum, alfa ort %.1f min %u max %u\n", id_,
+                        (unsigned long)w, (unsigned long)h, sa/(double)(w*h), amin, amax);
+                free(px); }
+            dump_texture(shd, tg);
+            return;
+        }
+    }
     MTLTextureDescriptor *td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                               width:w height:h mipmapped:NO];
@@ -4741,9 +4773,21 @@ void metal_run_main_loop(void){
                         if (rb >= 0 && g_pso){
                             for (unsigned i = 0; i < g_dn[rb]; i++){
                                 MDraw *dr = &g_dbuf[rb][i];
-                                { static int sk = -2;
-                                  if (sk == -2){ const char *e=ENVC("SKIPDRAW"); sk = e?atoi(e):-1; }
-                                  if (sk >= 0 && (int)i == sk) continue; }
+                                /* SKIPDRAW=<n>[,<n>...] ya da <a>-<b>: bu cizim indekslerini atla
+                                 * (dokum karesinde bir ara hedefin icerigini gormek icin). */
+                                { static int skinit = 0; static int sklo[16], skhi[16]; static int skn = 0;
+                                  if (!skinit){ skinit = 1;
+                                    for (const char *q = ENVC("SKIPDRAW"); q && *q && skn < 16; ){
+                                        while (*q == ',') q++;
+                                        if (!*q) break;
+                                        sklo[skn] = atoi(q); skhi[skn] = sklo[skn];
+                                        while (*q && *q != ',' && *q != '-') q++;
+                                        if (*q == '-'){ q++; skhi[skn] = atoi(q); }
+                                        skn++;
+                                        while (*q && *q != ',') q++; } }
+                                  int skip = 0;
+                                  for (int q = 0; q < skn; q++) if ((int)i >= sklo[q] && (int)i <= skhi[q]) skip = 1;
+                                  if (skip) continue; }
                                 /* SKIPPS=<n>[,<n>...]: bu piksel gölgelendiricisini
                                  * kullanan TUM cizimleri atla.  Bir gecisin katkisini
                                  * ayirmanin en dogrudan yolu. */
@@ -4972,12 +5016,28 @@ void metal_run_main_loop(void){
                                     rp.colorAttachments[0].texture = tgt;
                                     if (TGT_FACE(dr->target))
                                         rp.colorAttachments[0].slice = TGT_FACE(dr->target) - 1u;
-                                    rp.colorAttachments[0].loadAction =
-                                        first_use ? MTLLoadActionClear : MTLLoadActionLoad;
+                                    /* D3D9'da ekran disi hedefler kareler arasi KORUNUR; yalnizca
+                                     * oyunun acik Clear'i temizler.  Eskiden her hedef karede ilk
+                                     * kullaniminda temizleniyordu: on yuzun parlama izi (RT4 her
+                                     * karede renk tonuyla carpilip uzerine ekleniyor) geri
+                                     * beslemesini kaybediyor, mor-mavi hale hic birikmiyordu.
+                                     * Olculdu (menu, kare 1650): RT4 = 0.314*RT5 (birikimsiz);
+                                     * Windows referansinda parlak bolgeler mavide +12.
+                                     * Ekran (drawable) her kare yeni ve tanimsiz: temizlenir.
+                                     * OFFCLEAR=1 eski davranis. */
+                                    { static int oc = -1; if (oc < 0) oc = ENVC("OFFCLEAR") ? 1 : 0;
+                                      int color_clear = dr->is_clear && (dr->clr_flags & 1u);
+                                      int do_clear = first_use && (!dr->target || color_clear || oc);
+                                      rp.colorAttachments[0].loadAction = do_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+                                      if (dr->target && color_clear && !oc)
+                                          rp.colorAttachments[0].clearColor = MTLClearColorMake(
+                                              ((dr->clear_argb >> 16) & 0xFFu) / 255.0, ((dr->clear_argb >> 8) & 0xFFu) / 255.0,
+                                              (dr->clear_argb & 0xFFu) / 255.0, ((dr->clear_argb >> 24) & 0xFFu) / 255.0);
+                                      else
+                                          rp.colorAttachments[0].clearColor = MTLClearColorMake(
+                                              atomic_load(&g_clear_r), atomic_load(&g_clear_g),
+                                              atomic_load(&g_clear_b), 1.0); }
                                     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-                                    rp.colorAttachments[0].clearColor = MTLClearColorMake(
-                                        atomic_load(&g_clear_r), atomic_load(&g_clear_g),
-                                        atomic_load(&g_clear_b), 1.0);
                                     c_ms = 0;
 #if NFS_ENHANCED
                                     int c_ml = 0;                   /* bkz. BELLEKSIZ MSAA EKLERI */
@@ -5191,6 +5251,19 @@ void metal_run_main_loop(void){
                                                       i, pn, zz, nd, nz, nzt, na, dr->ps, dr->tex); } } }
                                     enc = [cb renderCommandEncoderWithDescriptor:rp];
                                     atomic_fetch_add(&g_pass_n, 1ull);
+                                    /* D3D9 piksel merkezi TAM SAYIDA, Metal'de +0.5'te.
+                                     * Oyun tam ekran dortgenlerini -0.5 kaydiriyor;
+                                     * kaydirmasiz Metal'de son satir/sutun hic
+                                     * yazilmiyordu.  Ceyrek cozunurluklu parlama
+                                     * hedefinde bu, buyutmeden sonra alt ve sag
+                                     * kenarda 4 piksellik kararmaydi (Windows'ta yok).
+                                     * Viewport'u yarim piksel kaydirmak D3D9 kapsama
+                                     * ve interpolasyon kuralini birebir verir.
+                                     * HALFPX=0 eski davranis. */
+                                    { static int hp = -1;
+                                      if (hp < 0){ const char *e = ENVC("HALFPX"); hp = (e && *e == '0') ? 0 : 1; }
+                                      if (hp){ MTLViewport vp = { 0.5, 0.5, (double)tgt.width, (double)tgt.height, 0.0, 1.0 };
+                                               [enc setViewport:vp]; } }
                                     [enc setVertexBuffer:g_mtlvb offset:0 atIndex:0];
                                     [enc setFragmentSamplerState:g_samp atIndex:0];
                                     /* yeni kodlayici = tum durum sifirlandi */
@@ -5215,13 +5288,13 @@ void metal_run_main_loop(void){
                                  * hedefini/dokusunu/karisimini bas. */
                                 { static int pi = -2; static int shown = 0;
                                   if (pi == -2){ const char *e=ENVC("PSINFO"); pi = e?atoi(e):-1; }
-                                  if (pi >= 0 && dr->ps == pi && shown < 6){ shown++;
+                                  if (pi >= 0 && dr->ps == pi && shown < 24){ shown++;
                                     fprintf(stderr,"  [psinfo] ps=%d hedef=%u doku=%u(%lux%lu) doku1=%u"
-                                            " karisim=%05x kose=%u  c0=(%.3f %.3f %.3f %.3f)\n",
+                                            " karisim=%05x bcol=%08x kose=%u  c0=(%.3f %.3f %.3f %.3f)\n",
                                             dr->ps, dr->target, dr->tex,
                                             (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].width:0ul,
                                             (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].height:0ul,
-                                            dr->tex1, dr->blend, dr->count,
+                                            dr->tex1, dr->blend, dr->bcol, dr->count,
                                             (double)dr->c0[0],(double)dr->c0[1],
                                             (double)dr->c0[2],(double)dr->c0[3]); } }
 #if NFS_ENHANCED

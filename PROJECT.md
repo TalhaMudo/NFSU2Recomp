@@ -1242,34 +1242,125 @@ her şey "4" çıkıyor).
 
 ## Kalan grafik maddeleri: neyin ölçülebildiği, neyin ölçülemediği
 
-Bu oturumda araba yansımaları çözüldü (yukarı bkz.). Diğer dört madde için
-**nesnel bir sinyal bulunamadı** — kayıt altına alıyorum ki tekrar aynı yol
-yürünmesin.
+Bu oturumda araba yansımaları çözüldü (yukarı bkz.). Diğer dört madde için o
+zaman **nesnel bir sinyal bulunamadı**. 2026-10-17 güncellemesi: Windows
+referansı (aşağıda "Windows referansıyla karşılaştırma") geldikten sonra
+HUD dikişleri ve ışık çizgileri kapandı. Kalabalık ve TRAX hâlâ açık.
 
 Çalışma raporu bu sahnede tamamen temiz: 0 desteklenmeyen komut, 0
 çözülemeyen dolaylı çağrı, `[matris] bozuk=0`, `mip seviyeleri: 0 EKSIK`,
 `kose shader: 0 bilinmeyen`, 0 düşen kare, Metal doğrulama katmanı sessiz.
 
-- **HUD satır dikişleri.** Tur listesi satırlarının sınırında ince yatay
-  çizgiler var. `LODMAX=0` ile **kaybolmuyor**, yani daha önce şüphelenilen
-  mip/türev sıçraması DEĞİL. Ama gerçek NFSU2 HUD'unda o satırların arasında
-  zaten ince ayraç çizgileri var; Windows referansı olmadan "hata mı, tasarım
-  mı" ayırt edilemiyor. **Referans gerekiyor.**
+- **HUD satır dikişleri — KAPANDI (2026-10-17): tasarım, hata değil.**
+  Windows referans karesi (NFSRef, kare 5800, 1280x960) ile tur listesi 2x
+  büyütülüp yan yana kondu: yatay satır ayraçları ve numara/isim sütunu
+  arasındaki dikey dikiş Windows'ta da aynı yerde, aynı yoğunlukta var.
 - **Kalabalık / karakterler düz levha.** Kemikli (skinned) mesh gerekir; bu
   sahnede kalabalık gölgelendiricisi HİÇ yüklenmiyor (`VSDUMP` çıktısında
   BLENDINDICES/BLENDWEIGHT yok, yalnızca 2 köşe gölgelendiricisi dökülüyor).
   Otomatik tuş sürücüsü arabayı hareket ettiremiyor (gaz tuşu DirectInput
   eylem eşlemesinden geliyor, DIK_UP çalışmıyor), yani kalabalığın olduğu
   yere programatik olarak ulaşılamıyor. **Oynayarak ulaşmak gerekiyor.**
-- **TRAX hayalet dikdörtgeni** ve **ışık çizgilerinin aşırı kaplaması.**
-  İkisi de belirli ekran/sahne gerektiriyor. Işık çizgileri için
-  `g_LightStreaksEnable` 1/0 A/B'si denendi ama iki ayrı koşu aynı oyun
-  anında olmadığı için piksel farkı anlamsız çıktı (kamera kayıyor);
-  bu ayar için **tek koşu içinde** anahtarlanabilir bir yol gerekir.
+- **Işık çizgilerinin aşırı kaplaması — KAPANDI (2026-10-17): fark yok.**
+  Windows yarış karesiyle (5800) lamba bölgeleri yan yana kondu. Hale ve
+  çizgi boyu/yoğunluğu aynı: >200 parlaklıkta piksel sayısı iki bölgede
+  664'e 695 ve 146'ya 119. Trafik lambasının yanıp yanmaması faz farkı
+  (Windows'un kendi iki koşusunda da değişiyor).
+- **TRAX hayalet dikdörtgeni — hâlâ AÇIK.** Kutu, müzik başlarken geri
+  sayımda çıkıyor (~kare 4100–4700). Windows referans setinde 3050 ile 5000
+  arasında kare yok, kare 5000'de iki koşuda da kutu yok. Ayrıca port
+  koşuları `NOSOUND=1`, yani müzik ve TRAX tetiklenmeyebilir. Doğrulamak
+  için o aralıkta ve sesli bir referans karesi gerekiyor.
 
 **Sonraki oturum için en verimli yol:** kullanıcıdan Windows'ta aynı
 sahnelerin ekran görüntüsü, ya da oyunu o noktaya sürüp `DUMPFRAME` ile
 kare aldırmak.
+
+## Windows referansıyla karşılaştırma (NFSRef, 2026-10-17)
+
+`tools/nfsref/` Windows'ta oyunun yanına konan bir ASI eklentisi (Ultimate
+ASI Loader / `dinput8.dll`). Sanal saat (kare x 16667 µs), DirectInput
+eylem eşlemesi üzerinden tuş sentezi ve `kare_NNNNN.bmp` dökümü yapıyor.
+Port aynı koşullarda koşturuluyor: `NFSRES=1280x960 VCLOCK=fixed PACE60=1`,
+aynı `AUTOSEQ`, aynı `DUMPFRAME` listesi. Windows menüleri deterministik.
+Yarış kareleri Windows'un **kendi** iki koşusu arasında da değişiyor
+(yükleme süresi, RNG): parlaklık Y 74.8'e karşı 67.1. Yarışta piksel farkı
+değil, görsel öğelerin varlığı karşılaştırılmalı.
+
+Bulunan ve düzeltilen iki gerçek hata:
+
+1. **Küp doku yüz yüklemesi** (`com.c`, commit dbd21e0). `UnlockRect`
+   küp dokuda yüzü yok sayıp her şeyi 0. yüze yazıyordu.
+   `GetCubeMapSurface` yüz indisini yüzeye kaydetmiyordu. Menüdeki araba
+   yansıması bu yüzden yanlıştı.
+2. **Ekran dışı hedefler karenin ilk kullanımında temizleniyordu**
+   (`metal.m`, ana geçişin yükleme eylemi). D3D9'da render hedefi kareler
+   arasında **korunur**, yalnızca açık `Clear` temizler. Oyunun parlama
+   zinciri bir geri besleme: RT4 her kare (0.47, 0.35, 0.67) tonuyla
+   çarpılıp üstüne ekleniyor. Port her kare `MTLLoadActionClear` verdiği
+   için geri besleme sıfırlanıyordu. Sonuç: pembe/mor haleler ve lavanta
+   yansımalar yoktu. Artık hedef ancak bu çizim açık bir renk `Clear`'ı ise
+   ve onun rengiyle temizleniyor, aksi halde `Load`. `OFFCLEAR=1` eski
+   davranışı geri getirir (A/B için).
+3. **Yarım piksel: D3D9 piksel merkezi tam sayıda, Metal'de +0.5'te**
+   (`metal.m`, ana geçiş kodlayıcısında `setViewport`). Oyun tam ekran
+   dörtgenlerini D3D9 kuralına göre −0.5 kaydırıyor. Kaydırmasız Metal'de
+   iki sonucu vardı:
+   - Her son işlem geçişi texel'lerin **arasından** örnekliyor ve bilinear
+     filtre her geçişte yarım texel bulanıklık ekliyordu. Zincirde birkaç
+     geçiş var, sonuç tüm görüntünün yumuşaması.
+   - Son satır ve sütun hiç yazılmıyordu. Çeyrek çözünürlüklü parlama
+     hedefinde bu, büyütmeden sonra alt ve sağ kenarda 4 piksellik
+     kararmaydı (yarışta alt satır 96'ya karşı 49).
+
+   Düzeltme: viewport kökeni (0.5, 0.5). Bu, D3D9 kapsama ve interpolasyon
+   kuralını kaydırıcı eklemeden birebir verir. Port'un kendi blit
+   dörtgenleri ayrı kodlayıcıda, onlar kaydırılmıyor. `HALFPX=0` eski
+   davranış.
+
+   Ölçüm, kenar ve son işlem zinciri olan karelerin keskinliğinin
+   (ortalama |gradyan|) Windows'unkine eşitlendiğini gösteriyor:
+
+   | kare | Windows | port eski | port yeni | piksel farkı eski → yeni |
+   |---|---|---|---|---|
+   | 1300 (2B, zincirsiz) | 1.31 | 1.31 | 1.31 | 1.09 → 0.10 |
+   | 1650 menü | 3.22 | 2.51 | 3.20 | 6.79 → **0.70** |
+   | 2000 menü | 2.98 | 2.27 | 2.98 | 6.62 → **0.31** |
+   | 3050 menü | 3.16 | 2.57 | 3.14 | 6.75 → **0.44** |
+   | 5800 yarış | 4.39 | 2.96 | 4.39 | 19.0 → 18.3 |
+
+   Daha önce menüdeki ~6.7'lik farkı "döner tabladaki arabanın açısı"
+   sanmıştım. **Yanlıştı**: farkın tamamı bu bulanıklıktı. Yarışta kalan
+   fark, Windows'un kendi iki koşusu arasındaki farkla aynı türden (farklı
+   rakipler, farklı ışık anı); keskinlik orada da birebir.
+   (Not: `HALFPX` adı daha önce "ekranı kesen çizgiler" için denenip etkisiz
+   bulunmuştu. O hata başkaydı; bu anahtar yeniden ve varsayılan açık
+   eklendi.)
+
+Sonuç olarak menü ortalama renkleri birebir tutuyor (R G B):
+
+| kare | Windows | port |
+|---|---|---|
+| 1650 | 45 43 39 | 45 43 39 |
+| 2000 | 44 42 37 | 44 42 38 |
+| 3050 | 43 41 40 | 43 41 40 |
+
+**Ölçüm tuzağı — `DUMPTEX` alfa karışımı:** eski doku dökümü dokuyu
+alfa karışımlı `g_pso` ile çiziyordu. Alfası < 1 olan hedefler (RT4/RT5)
+bu yüzden **siyah** görünüyordu ve yanlış bir "t2 siyah" teorisine götürdü.
+Döküm artık ham blit kopyası alıyor, alfa istatistiğini de basıyor.
+`DUMPOLD=1` eski yolu verir.
+
+Yeni teşhis anahtarları:
+
+| anahtar | işlev |
+|---|---|
+| `PSMSL=<id>[,..]` | ps'nin disasm + üretilen MSL'ini basar (küp varyantı `id+256`) |
+| `DUMPFACE=<0..5>` | `DUMPTEX` küp dokuda hangi yüzü döksün |
+| `SKIPDRAW=a-b,n` | çizim atlama artık aralık ve liste kabul ediyor |
+| `OFFCLEAR=1` | ekran dışı hedefleri her kare temizle (eski, yanlış davranış) |
+| `HALFPX=0` | D3D9 yarım piksel kaydırmasını kapat (eski, bulanık davranış) |
+| `DUMPOLD=1` | eski (alfa karışımlı) doku dökümü |
 
 ## macOS uygulama paketi (`./pack.sh`)
 
