@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """x86-32 -> C lifter.  Bir fonksiyonu CPU durumu uzerinde calisan C'ye cevirir."""
 import sys, struct, collections
+import os as _os
 import pefile
 from capstone import *
 from capstone.x86 import *
@@ -590,7 +591,6 @@ class Lifter:
             # RETEIP=0: donus adresi c->eip'e yazilmaz (yalniz yigindan atilir).
             # Lift edilmis cagiran hep cagrinin arkasinda devam eder; c->eip'i
             # okuyan tek yer (genexec) artik ittigi adresi kullaniyor.
-            import os as _os
             if _os.environ.get('RETEIP','1') == '0':
                 return [f"c->esp += {4 + n}u; return;"]
             return [f"POP32(c->eip);" + (f" c->esp += {n}u;" if n else "") + " return;"]
@@ -670,12 +670,13 @@ class Lifter:
             if len(o)==0: src="ST(1)"
             elif is_st(0): src=f"ST({sti(0)})"
             else: src=fmem(0)
-            return [f"fcompare(c, ST(0), {src});"] + ["FPOP();"]*npop
+            fc = 'fcompare_bl' if _os.environ.get('FCMPBL','') == '1' else 'fcompare'
+            return [f"{fc}(c, ST(0), {src});"] + ["FPOP();"]*npop
         if m in ('fcomi','fcomip','fcompi','fucomi','fucomip','fucompi'):
             src=f"ST({sti(1)})" if len(o)>1 and is_st(1) else (f"ST({sti(0)})" if is_st(0) else fmem(0))
             pops = m.endswith('ip') or m.endswith('pi')
             return [f"FCOMI(ST(0), {src});"] + (["FPOP();"] if pops else [])
-        if m=='ftst':   return ["fcompare(c, ST(0), 0.0);"]
+        if m=='ftst':   return [("fcompare_bl" if _os.environ.get('FCMPBL','')=='1' else "fcompare") + "(c, ST(0), 0.0);"]
         if m=='fchs':   return ["ST(0) = -ST(0);"]
         if m=='fabs':   return ["ST(0) = fabs(ST(0));"]
         if m=='fsqrt':  return ["{ double _a=ST(0); ST(0)=x87_r1(_a, sqrt(_a)); }"]
@@ -852,8 +853,9 @@ class Lifter:
             if m=='fisubr': return [f"ST(0) = ({src}) - ST(0);"]
             if m=='fidiv':  return [f"ST(0) = ST(0) / ({src});"]
             if m=='fidivr': return [f"ST(0) = ({src}) / ST(0);"]
-            if m=='ficom':  return [f"fcompare(c, ST(0), {src});"]
-            return [f"fcompare(c, ST(0), {src});", "FPOP();"]
+            fc = 'fcompare_bl' if _os.environ.get('FCMPBL','') == '1' else 'fcompare'
+            if m=='ficom':  return [f"{fc}(c, ST(0), {src});"]
+            return [f"{fc}(c, ST(0), {src});", "FPOP();"]
 
         # ---------------- MMX / SSE ----------------
         MM = {X86_REG_MM0:0,X86_REG_MM1:1,X86_REG_MM2:2,X86_REG_MM3:3,

@@ -3940,6 +3940,17 @@ static void dump_one_texture(unsigned id_, long frame){
             if (vw){ srct = vw; tag = 95000 + (long)id_*10 + (long)lv; }
         } else fprintf(stderr,"metal: doku %u seviye %lu yok (toplam %lu)\n",
                        id_,(unsigned long)lv,(unsigned long)g_tex[id_].mipmapLevelCount); } }
+    /* Kup doku: g_pso 2B ornekler; Metal kupu 2B olarak baglamayi reddeder.
+     * Ilk yuzu (ya da DUMPFACE=<0..5>) 2B gorunumle goster. */
+    if (srct.textureType == MTLTextureTypeCube){
+        const char *fe = ENVC("DUMPFACE"); NSUInteger fc = fe ? (NSUInteger)atoi(fe) : 0;
+        if (fc > 5) fc = 0;
+        id<MTLTexture> vw = [srct newTextureViewWithPixelFormat:srct.pixelFormat
+                                textureType:MTLTextureType2D
+                                     levels:NSMakeRange(0,1)
+                                     slices:NSMakeRange(fc,1)];
+        if (vw){ srct = vw; tag = 96000 + (long)id_*10 + (long)fc; }
+    }
     [enc setFragmentTexture:srct atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
     [enc endEncoding];

@@ -3380,9 +3380,20 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t fmt = self?MR32(self+20):21u, mid = self?MR32(self+28):0;
             uint32_t buf = self ? (is_cube2 ? MR32(self + 104u + 4u*(face2 & 7u))
                                             : MR32(self + 32u + 4u*level)) : 0;
-            if (metal_available() && mid && buf && w && h)
-                metal_upload_texture(mid, level, g_mem+buf,
-                                     metal_level_pitch(w,level,fmt), w, h, fmt);
+            /* Kup dokuda YUZE yukle.  Eskiden yuz bilgisi okunup atiliyordu:
+             * alti yuzun hepsi 0. dilime yaziliyor, 0. yuz en son yuklenen
+             * yuzu tasiyor, 1-5 siyah kaliyordu.  Olculdu (menu, kare 1650,
+             * yansima kupu doku 11): yuz parlakliklari 43.8/0/0/0/0/0; Windows
+             * referansinda araba tavani +Y yuzundeki tavan isigini yansitiyor. */
+            if (metal_available() && mid && buf && w && h){
+                void metal_upload_texture_face(unsigned,unsigned,unsigned,const void*,unsigned,unsigned,unsigned,unsigned);
+                if (is_cube2)
+                    metal_upload_texture_face(mid, level, (face2 < 6u) ? face2 : 0u, g_mem+buf,
+                                              metal_level_pitch(w,level,fmt), w, h, fmt);
+                else
+                    metal_upload_texture(mid, level, g_mem+buf,
+                                         metal_level_pitch(w,level,fmt), w, h, fmt);
+            }
             if (ENVC("LOCKLOG") && w==640 && h==480){
                 static int nl=0;
                 if (nl<3){ nl++;
@@ -3410,6 +3421,11 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t pp = cube3 ? A(c,3) : A(c,2);
             uint32_t sf=com_new(IF_SURF,64);
             MR32(sf+40)=2;
+            /* +44: KUP YUZ indeksi + 1.  Kup doku 2B ile ayni vtable'i
+             * paylastigi icin GetCubeMapSurface bu dala (GetSurfaceLevel
+             * adiyla) dusebilir; yuz yazilmazsa SetRenderTarget alti yuzu de
+             * 0. dilime cizer (DAL1 ile ayni anlam). */
+            if (cube3){ uint32_t face = A(c,1); MR32(sf+44) = (face < 6u) ? face + 1u : 1u; }
             uint32_t self=A(c,0);
             if (self && mem_is_committed(self+31)){
                 MR32(sf+4)=MR32(self+4); MR32(sf+8)=MR32(self+8);

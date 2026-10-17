@@ -1,0 +1,59 @@
+NFSRef - orijinal oyundan referans görüntü alma
+================================================
+
+Bu kit, Mac portundaki otomatik testin aynısını Windows'taki orijinal oyunda
+çalıştırır ve aynı karelerin görüntüsünü kaydeder. Elle ekran görüntüsü
+almaya gerek yoktur.
+
+1. OYUN KLASÖRÜ
+   Mac'teki oyun klasörünün ("Need for Speed Underground 2" - içinde
+   SPEED2.EXE olan) birebir kopyasını kullanın. Başka bir kurulum farklı exe
+   ya da veri dosyası içerebilir. Klasörü herhangi bir yere koyabilirsiniz,
+   kurulum gerekmez.
+
+2. KİTİ ÇIKARIN
+   Bu zip'in içeriğini oyun klasörüne (SPEED2.EXE'nin yanına) çıkarın.
+   SCRIPTS klasörüne üç dosya eklenir: nfsref.asi, nfsref.ini, nfsref_kayit.txt.
+   Mevcut dosyaların üzerine bir şey yazılmaz.
+
+3. ÖNCE TEŞHİS (40 saniye)
+   NFSRef_teshis.bat dosyasına çift tıklayın. Oyun açılır, ilk menüleri
+   kendisi geçmeye çalışır ve yaklaşık 40 saniye sonra kendini kapatır.
+   "NFSRef_cikti" klasörünü gönderin. Kare sayımı ve tuş gönderimi
+   doğrulanınca 4. adıma geçilir.
+
+4. TAM KOŞU
+   NFSRef_baslat.bat dosyasına çift tıklayın.
+   - Oyun tam ekran açılır. Menülerden yarışa kendisi girer.
+   - Oyun 60 fps hızında akar ve yaklaşık 2.5 dakika sonra (8950. kare)
+     kendini kapatır.
+   - Bu sürede klavyeye ve fareye dokunmayın, başka pencereye geçmeyin.
+   - Bağlı bir gamepad varsa çıkarın.
+   - Ses açık kalabilir.
+   - Bir şey ters giderse oyun en geç 7 dakika sonra kendini kapatır;
+     Görev Yöneticisi gerekmez.
+
+5. GÖNDERİN
+   Oyun klasöründe "NFSRef_cikti" klasörü oluşur (yaklaşık 300-400 MB).
+   Klasörü zipleyip gönderin. İçinde:
+   - kare_XXXXX.bmp      : seçilen karelerin görüntüsü
+   - kareler.csv         : her kare için çizim sayısı, kamera
+   - cagri_XXXXX.txt     : dört karede bütün D3D çağrıları ve durum blokları
+   - rt_XXXXX_*.bmp      : o karelerdeki ara görüntüler (yansıma küpü vb.)
+   - golge\             : oyunun gölgelendiricileri
+   - ses_log.txt, ses_veri.bin : oyunun DirectSound'a yazdıkları
+   - nfsref_log.txt      : çalışma kaydı (bir sorun olursa nedeni burada)
+
+NE YAPIYOR (değişiklik oyunun belleğinde, yalnızca bu çalıştırma için)
+   - Oyunun saati her karede tam 1/60 saniye ilerler. Böylece "kare N",
+     PC'nin hızından bağımsız olarak oyunun hep aynı anıdır.
+   - Tuşları kendisi basar. Gerçek klavye ve fare yok sayılır.
+   - Grafik ayarlarını nfsref_kayit.txt'den okur. Windows kayıt defterine
+     hiçbir şey yazmaz.
+   - Kayıt/profil dosyaları NFSRef_cikti\kayit_001 içine gider. Mevcut
+     profiliniz kullanılmaz ve değişmez.
+   - WidescreenFix'i çalışma süresince geçici olarak kenara alır, bitince
+     geri koyar.
+
+Antivirüs bilinmeyen bir .asi dosyası için uyarı verebilir. Kaynak kodu
+depoda: tools/nfsref/nfsref.c

@@ -66,6 +66,29 @@ _INL_CALL = _re.compile(r'\bsub_([0-9a-f]{8})\(c\)')
 _INL_YASAK = ('dispatch_indirect', 'unsupported_insn', 'cpuid_shim', 'guest_hook', 'rdtsc_shim', 'cov_hit')
 OVERRIDES = {int(x,16) for x in os.environ.get('OVERRIDE','').replace('0x','').split(',') if x.strip()}
 
+# MEMARG=1: misafir bellek tabani PARAMETRE olarak.  Her lift fonksiyonu
+#   void sub_X_m(CPU *restrict c, uint8_t *restrict _mb)
+# olur; lift kodu birbirini _m surumuyle cagirir, g_mem makrolari _mb'ye gider.
+# Disariya acik void sub_X(CPU*) ince sarmalayici olarak kalir (fntab, dolayli
+# cagri, runtime -> lift cagrilari, override'lar degismez).
+# Neden: g_mem bellekten okunan bir isaretci ve c cagrilara gecirildigi icin
+# "kacmis"; derleyici misafir bellegine her yazmadan sonra c-> alanlarini (ve
+# -fno-strict-aliasing ile g_mem'in kendisini) yeniden okumak zorunda.  Iki ayri
+# noalias parametre LLVM'de kesin olarak cakismaz (kacis analizi gerekmez).
+# Dogruluk icin bu uretim -fno-strict-aliasing ile derlenmeli: lift kodu ayni
+# misafir adresine farkli tiplerle erisiyor (MR32 yazip MRF32 okuma).
+MEMARG = os.environ.get('MEMARG','') == '1'
+_MA_HDR = _re.compile(r'void sub_([0-9a-f]{8})(_orig)?\(CPU \*(?:restrict )?c\) ?\{')
+def _memarg(code):
+    h = _MA_HDR.search(code)
+    if not h: return code
+    name = f"sub_{h.group(1)}{h.group(2) or ''}"
+    body = _INL_CALL.sub(lambda m: f"sub_{m.group(1)}_m(c, _mb)", code[h.end():])
+    return (code[:h.start()] + f"void {name}_m(CPU *restrict c, uint8_t *restrict _mb) {{" + body
+            + f"\nvoid {name}(CPU *c) {{ {name}_m(c, _gm()); }}\n")
+_MA_PRO = ('static inline uint8_t *_gm(void){ return g_mem; }\n'
+           '#define g_mem _mb\n')
+
 def _init(inl=None):
     global _L, _INL
     if inl: _INL = inl
@@ -97,11 +120,14 @@ def _shard(args):
         try:
             code,tg = L.lift(a)
         except Exception as e:
-            parts.append(f"void sub_{a:08x}(CPU *c){{ unsupported_insn(c,0x{a:x}u,\"lift-hatasi\"); POP32(c->eip); }}")
+            fb = f"void sub_{a:08x}(CPU *c){{ unsupported_insn(c,0x{a:x}u,\"lift-hatasi\"); POP32(c->eip); }}"
+            parts.append(_memarg(fb) if MEMARG else fb)
             defined.append(a); kinds[f"<lift:{type(e).__name__}>"]+=1; continue
         if a in OVERRIDES:
             code = code.replace(f"void sub_{a:08x}(CPU *restrict c) {{",
                                 f"void sub_{a:08x}_orig(CPU *restrict c) {{")
+        if MEMARG:
+            code = _memarg(code)
         if _INL:
             hdr, body = code.split('{', 1)
             body = _INL_CALL.sub(lambda m: (used.add(int(m.group(1), 16)) or f"inl_{m.group(1)}(c)")
@@ -114,6 +140,7 @@ def _shard(args):
     path=f"{OUT}/shard_{idx:04d}.c"
     with open(path,'w') as f:
         f.write('#include "cpu.h"\n#include "decls.h"\n#include <math.h>\n\n')
+        if MEMARG: f.write(_MA_PRO + '\n')
         for x in sorted(used):
             f.write(_INL[x].replace(f"void sub_{x:08x}(CPU *restrict c) {{",
                     f"static inline __attribute__((always_inline)) void inl_{x:08x}(CPU *restrict c) {{") + "\n")
@@ -150,11 +177,14 @@ if __name__=='__main__':
 
     missing = sorted(refs - defined)
     print(f"\n  tanimli: {len(defined)}   referans verilen: {len(refs)}   EKSIK: {len(missing)}")
-    if missing:
+    if missing or (MEMARG and OVERRIDES):
         with open(f"{OUT}/stubs.c",'w') as f:
             f.write('#include "cpu.h"\n#include "decls.h"\n\n')
             for a in missing:
                 f.write(f"void sub_{a:08x}(CPU *c){{ unsupported_insn(c,0x{a:x}u,\"stub\"); POP32(c->eip); }}\n")
+            if MEMARG:   # lift kodu herkesi _m ile cagirir: eksikler ve override'lar icin kopru
+                for a in sorted(set(missing) | OVERRIDES):
+                    f.write(f"void sub_{a:08x}_m(CPU *restrict c, uint8_t *restrict _mb){{ (void)_mb; sub_{a:08x}(c); }}\n")
         print(f"  -> stubs.c ({len(missing)} stub)")
 
     allf = sorted(defined | set(missing))
@@ -164,6 +194,9 @@ if __name__=='__main__':
         f.write("void cpuid_shim(CPU*);\nuint64_t rdtsc_shim(void);\n")
         for a in allf: f.write(f"void sub_{a:08x}(CPU*);\n")
         for a in sorted(OVERRIDES): f.write(f"void sub_{a:08x}_orig(CPU*);\n")
+        if MEMARG:
+            for a in allf: f.write(f"void sub_{a:08x}_m(CPU *restrict, uint8_t *restrict);\n")
+            for a in sorted(OVERRIDES): f.write(f"void sub_{a:08x}_orig_m(CPU *restrict, uint8_t *restrict);\n")
         f.write("#endif\n")
     with open(f"{OUT}/fntab.c",'w') as f:
         f.write('#include "cpu.h"\n#include "decls.h"\ntypedef void(*guest_fn)(CPU*);\n')

@@ -157,6 +157,15 @@ static inline void fcompare(struct CPU *c, double a, double b){
     else if (a < b)            c->fsw |= FSW_C0;
     else                       c->fsw |= FSW_C3;
 }
+/* FCMPBL: dalsiz fcompare.  Oyun kodunun karsilastirmalari veriye bagli; dalli
+ * surum (NaN, >, <) sik yanlis tahmin ediliyordu.  Bitler ayni: sirasiz ->
+ * C0|C2|C3, a<b -> C0, a==b -> C3, a>b -> hicbiri. */
+static inline void fcompare_bl(struct CPU *c, double a, double b){
+    uint32_t un = (uint32_t)__builtin_isunordered(a, b);
+    uint32_t lt = (uint32_t)(a < b), eq = (uint32_t)(a == b);
+    c->fsw = (uint16_t)((c->fsw & (uint16_t)~(FSW_C0|FSW_C2|FSW_C3))
+                        | ((lt | un) << 8) | (un << 10) | ((eq | un) << 14));
+}
 /* fcomi / fucomi: dogrudan EFLAGS yazar */
 #define FCOMI(a,b) do{ double _x=(a),_y=(b); \
     if(_x!=_x||_y!=_y){ c->zf=1;c->pf=1;c->cf=1; } \
