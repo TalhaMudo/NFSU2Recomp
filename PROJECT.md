@@ -1652,6 +1652,7 @@ env FIXMAT=1 FIXMAT_MODE=3 NOMOVIES=1 SNDSYNC=1 GPUVS=1 WINDOW=1 ALARM=0 \
 | ALFA TESTİ VARYANTI (`ALFAVAR`) | **−6.32 ± 0.48 (−%17)** | −2.8 ± 1.1 / −0.3 ± 0.8 | −1.8 ± 1.7 / +0.8 ± 1.7 | varsayılan açık (HD: −%27) |
 | EKRAN YÖNLENDİRME (`SCRREDIR`) | −0.02 ± 0.88 | −10.7 ± 1.1 / −10.1 ± 0.8 | **−20.4 ± 1.9 / −21.0 ± 1.8** | varsayılan açık |
 | GEÇİŞ YÜKLEMESİ (DontCare / karalama Z) | +0.6 ± 0.8 | +0.9 ± 1.1 / +0.6 ± 0.6 | +1.6 ± 1.8 / +1.2 ± 1.4 | elendi, kod kaldırıldı |
+| SON İŞLEM ZİNCİRİ (`FBZINCIR`), 2 koşu | −1.07 ± 0.53 / +2.39 ± 1.44 (ort. ≈ −0.7 ± 0.5) | −11.1 / −9.6 okuma, −5.8 / −4.2 yazma | **−12.6 / −9.8 okuma, −12.9 / −10.8 yazma** | varsayılan açık |
 
 GPU süresi (DVFS'li, yalnız bilgi): `ALFAVAR` açık 5.28 / kapalı 6.08 ms/kare.
 
@@ -1755,6 +1756,59 @@ gradyanı):
 Gözle: kaputun karbon dokusu, jant telleri ve fren diski delikleri artık keskin.
 `UVFIX=0` eski (bulanık) davranış.
 
+### SIRALI DOKU YÜKLEME (`TEXORD`) — doku yarışı (2026-10-19)
+
+Oyun bazı dokuları her karede yeniden yazıyor: son işlem renk tabloları #8 ve
+#9, 5467 karede 5467 yükleme (`TEXUPSAY=1` sayar). Yükleme `replaceRegion` ile
+anında dokuya gidiyordu. Konuk thread kare N+1'i kaydederken ana thread kare
+N'i kodluyor ya da GPU onu çiziyor. Kare N bu yüzden bazen kare N+1'in
+tablosunu, hatta yarım yazılmış tabloyu görüyordu. D3D9'da her çizim
+gönderildiği andaki içeriği görür.
+
+Belirtisi şuydu: aynı karede aynı çizimi iki kez kodlamak bile farklı sonuç
+veriyordu (son işlem zinciri doğrulamasında 0.6 M piksel, en çok 2/255).
+
+Düzeltme: bir dokunun ikinci ve sonraki yüklemeleri çizim listesine sıralı kayıt
+olarak giriyor. Veri karenin yükleme alanına kopyalanıyor (çift tampon, 8 MB),
+kodlamada çizimlerle sıralı bir blit (tampondan dokuya) oluyor. İlk yükleme
+(yükleme ekranı, henüz kullanılmamış doku) eskisi gibi anında. Atlanan
+(kodlanmayan) karenin bekleyen yüklemeleri, tampon yeniden kullanılmadan önce
+anında uygulanıyor. Kare başına ~2.3 yükleme, taşma 0. Sonra aynı çizim iki kez
+kodlanınca **0 piksel fark**. `TEXORD=0` eski davranış.
+
+### SON İŞLEM ZİNCİRİ (`FBZINCIR`) — üç geçiş tek geçişte (2026-10-19)
+
+Son işlem üç tam ekran geçişle renk tablosu uyguluyor: `#3 = ps28(#2)`,
+`#2 = ps27(#3)`, `#3 = ps26(#2)`. Her adımın girdisi bir öncekinin aynı
+pikseldeki çıktısı. Ölçüldü (`ABTEST=SKIPPS` + `SKIPPS=26,27,28`): üç geçiş GPU
+enerjisinin ~%16'sı, DRAM'de ~33 MB/kare.
+
+Zincir şimdi iki hedefi birden bağlayan tek bir geçişte çiziliyor. Her adım
+girdisini dokudan değil karo belleğinden okuyor (`[[color(n)]]`, Apple GPU'da
+çizim sırasıyla). Gölgelendirici varyantı (`vsemu.c` `ps_to_msl_fb`) aşama 0
+örneğini karo bellek girdisiyle değiştiriyor; arka planda derleniyor, hazır
+olana kadar eski yol kullanılıyor.
+
+Koşullar (kayıt başına):
+- tek dörtgen, hedefi tam kaplıyor;
+- Z, karışım ve alfa testi yok;
+- aşama 0 dokusu diğer zincir hedefi, aynı boyut ve biçimde;
+- UV teksel merkezine 1:1 (UV ÖLÇEĞİ sonrası);
+- ps aşama 0'ı tek yerde `TCRD(0)` ile örnekliyor;
+- diğer aşamalar zincir hedeflerini okumuyor;
+- ardışık kayıtlar iki hedef arasında gidip geliyor.
+
+Doğrulama: `FBZINCIR=2` zinciri eski yoldan çiziyor, aynı girdiyle birleşik
+yolu karalama dokularına çiziyor ve ikisini GPU'da piksel piksel
+karşılaştırıyor. Sonuç: 5454 zincirde **0 fark**, hem son çıktıda hem ara
+hedefte. `FBZCTRL=1` yardımcıyı normal boru hattıyla, `FBZCTRL=2` iki kez
+çalıştırıp kendisiyle karşılaştırıyor; determinizm testi bu ikisi.
+Doku yarışı düzeltilmeden önce sonuç 1–3/255'lik farklar veriyordu. O
+farkların kaynağı zincir değil, yukarıdaki yarıştı.
+
+Kazanç: DRAM −23 MB/kare (iki koşu); GPU çekirdek enerjisi ölçüm gürültüsü
+içinde (ort. ≈ −0.7 ± 0.5 mJ/kare). Kare başına ~1.3 zincir (yarış + menü).
+
 ### Elenenler
 
 - **GEÇİŞ YÜKLEMESİ:** tam ekran kaplayan çizimle başlayan geçişte renk
@@ -1778,3 +1832,8 @@ Yeni anahtarlar:
 | `ALFAVAR=0/2/3` | testsiz varyantı kapat / sayaçlı tanı (ps başına; ayrıca [0,1] dışı köşe rengi sayımı) / tanının pozitif kontrolü |
 | `RENKSAT=0` | köşe rengi kırpmasını kapat (eski, D3D9'a aykırı) |
 | `UVFIX=0` | ölçekli hedeflerde yarım teksel düzeltmesini kapat (eski, bulanık) |
+| `TEXORD=0` | tekrar yüklenen dokuları anında yaz (eski, yarışlı) |
+| `TEXUPSAY=1` | çıkışta doku başına yükleme sayısı (en çok 12) |
+| `FBZINCIR=0/2` | son işlem zinciri birleştirmesini kapat / birebirlik doğrulaması |
+| `FBZCTRL=1/2` | (`FBZINCIR=2` ile) yardımcıyı normal boru hattıyla çalıştır / kendisiyle karşılaştır |
+| `SKIPPS=…` + `ABTEST=SKIPPS` | o ps'lerin bedelini koşu içinde ölç (yalnız KAPALI dilimlerde atlar) |

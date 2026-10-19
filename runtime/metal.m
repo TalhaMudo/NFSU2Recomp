@@ -4415,7 +4415,11 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
  * okumuyor.  Ardisik kayitlar iki hedef arasinda gidip geliyor.
  * FBZINCIR=0 kapatir; FBZINCIR=2 dogrulama: zincir eski yoldan cizilir, ayni
  * girdiyle birlesik yol karalama dokularina cizilir ve ikisi GPU'da piksel
- * piksel karsilastirilir (rapor: "fark eden piksel", 0 olmali). */
+ * piksel karsilastirilir (rapor: "fark eden piksel", 0 olmali; olculdu
+ * 2026-10-19: 5454 zincirde 0).  FBZCTRL=1 yardimciyi normal boru hattiyla,
+ * FBZCTRL=2 iki kez calistirip kendisiyle karsilastirir (determinizm; SIRALI
+ * DOKU YUKLEME'den once burada 1-3/255 fark cikiyordu).
+ * Kazanc (ABTEST=FBZINCIR, iki kosu): DRAM -23 MB/kare, GPU enerjisi gurultu icinde. */
 static int fbz_mode(void){
     static int m = -1; if (m < 0){ const char *e = ENVC("FBZINCIR"); m = (e && *e) ? atoi(e) : 1; }
     return m;

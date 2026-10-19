@@ -1,10 +1,15 @@
-# NFSU2 on Apple Silicon — static recompilation of a Win32/x86 game to native ARM64
+# Need for Speed: Underground 2 on Mac — native Apple Silicon port, no Wine
 
-This repository contains the tools and runtime that turn the original Windows
-executable of *Need for Speed: Underground 2* (2004, 32-bit x86, Direct3D 9)
-into a **native ARM64 macOS binary**. The game's x86 machine code is lifted to
-C ahead of time and compiled with clang. There is no Wine, no emulator, no JIT
-and no Windows involved at run time.
+**Play *Need for Speed: Underground 2* (NFSU2, 2004) natively on Apple Silicon
+Macs (M1 and later): no Wine, no CrossOver, no emulator, no virtual machine.**
+
+NFSU2Recomp is a static recompiler and runtime that turn the original Windows PC
+executable of the game (`SPEED2.EXE`, 32-bit x86, Direct3D 9) into a **native
+ARM64 macOS app**. The game's x86 machine code is lifted to C ahead of time and
+compiled with clang; Direct3D 9 is translated to Metal, DirectSound to
+CoreAudio. There is no Wine, no emulator, no JIT and no Windows involved at run
+time. On an M1 Pro, races run at **119 fps** (the display's limit), against
+**10–15 fps** for the same game under Wine.
 
 > **This repository contains no game code and no game assets.** It contains the
 > recompiler and the runtime only. You need your own copy of the game; the C
@@ -167,6 +172,47 @@ OVERRIDE=60fab0,61e390,61f130,5c7ed0,50d510,65ae35,6623ea,66aa3f,66ace2,6691b1,6
 ```
 
 `run.sh` documents the environment switches; most are diagnostics.
+
+## FAQ
+
+**Can I play Need for Speed: Underground 2 on a Mac?**
+Yes, on an Apple Silicon Mac (M1 or later) with your own copy of the PC game.
+Build the port as described above; `./pack.sh` produces a double-clickable
+`NFSU2.app`. Menus, races and sound work.
+
+**Do I need Wine, CrossOver, Whisky, Parallels or a virtual machine?**
+No. The game's code is recompiled to native ARM64 and runs directly on macOS.
+Rosetta 2 is not used to run the game (only, optionally, by one test tool).
+
+**Is it faster than Wine or CrossOver?**
+On an M1 Pro at 1280×960: 119 fps in races (capped by the 120 Hz display)
+against 10–15 fps under Wine 11.18 with Rosetta 2, and 119 fps against 45 fps
+in the 3D menus. Method and raw numbers are in `WINE_KIYAS.md`.
+
+**Is there a ready-made download?**
+No. The recompiled program is derived from EA's executable, so it is built on
+your own Mac from your own copy of the game and is not distributed.
+
+**Which version of the game does it need?**
+The Windows PC version, with the exact `SPEED2.EXE` listed under
+[Requirements](#requirements). Other builds, including the console versions,
+are not supported.
+
+**Does it work on Intel Macs?**
+No. Only Apple Silicon is targeted and tested.
+
+**What does not work yet?**
+Videos are skipped, there is no gamepad or wheel support and no online play.
+See [Known limitations](#known-limitations).
+
+**How is this different from other NFSU2 projects?**
+
+| Project | Approach | Platforms |
+|---|---|---|
+| **NFSU2Recomp** (this) | Recompiles the PC executable with its own x86 → C lifter; own Direct3D 9 → Metal renderer | macOS (Apple Silicon) |
+| [OpenUG2](https://github.com/whoismept/OpenUG2) | Reimplements the engine from scratch and reads the game's data files; does not run the original code | Linux, macOS, Windows |
+| [nfsu2-recompiled](https://github.com/codepdbh/nfsu2-recompiled) | Recompiles the PC executable with pcrecomp; Direct3D 9 through DXVK | Windows, Android |
+| [nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw) | Recompiles the original Xbox version with xboxrecomp | Nintendo Switch, Linux |
 
 ## Related work
 
