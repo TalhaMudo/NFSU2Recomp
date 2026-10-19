@@ -14,7 +14,10 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 #                    "daha yeni surum gerekiyor" diyerek hic acilmaz.
 MCPU="${MCPU:-apple-m1}"
 MINOS="${MINOS:-11.0}"
-OPT="${OPT:--O3 -mcpu=$MCPU -mmacosx-version-min=$MINOS}"
+# -fno-strict-aliasing ZORUNLU (v2'den itibaren varsayilan): lift kodu misafir
+# bellegine ayni adresten farkli tiplerle erisir (MR32 yazip MRF32 okumak);
+# bayraksiz clang GVN bunu yanlis derleyebiliyor.  Bkz. LIFTER_VERIMLILIK.md bolum 4.
+OPT="${OPT:--O3 -mcpu=$MCPU -mmacosx-version-min=$MINOS -fno-strict-aliasing}"
 J="${J:-$(sysctl -n hw.ncpu)}"
 mkdir -p "$ROOT/out/obj"
 cd "$ROOT/gen/all"

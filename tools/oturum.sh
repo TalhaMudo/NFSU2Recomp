@@ -3,8 +3,6 @@
 #
 #   ./tools/oturum.sh            normal surum
 #   ./tools/oturum.sh hd         HD surum
-#   ./tools/oturum.sh opt6       opt6 surumu (./link_opt6.sh + ./pack.sh --opt6 --embed)
-#   ./tools/oturum.sh hd opt6    HD opt6 surumu
 #
 # Oyun kayit acik (PERFLOG) baslar; normal oyna, bitince oyundan cik.  Ayni anda
 # powermetrics CPU/GPU watt'ini saniyede bir yazar (yonetici parolasi bir kez
@@ -12,11 +10,12 @@
 # Kayit: ~/nfs_oturum/<tarih>[_hd]   Cozumleme: python3 tools/oturum_analiz.py <dizin>
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HD=0; O6=0
-for a in "$@"; do case "$a" in hd) HD=1 ;; opt6) O6=1 ;; *) echo "bilinmeyen: $a"; exit 1 ;; esac; done
-AD="NFSU2"; EK=""; PK=""
+HD=0
+for a in "$@"; do case "$a" in hd) HD=1 ;; *) echo "bilinmeyen: $a"; exit 1 ;; esac; done
+# kayit dizini surumle etiketlenir: hangi surumle oynandigi her zaman belli olsun
+SURUM="$(tr -cd '0-9' < "$ROOT/SURUM" 2>/dev/null)"; SURUM="${SURUM:-0}"
+AD="NFSU2"; EK="_v$SURUM"; PK=""
 [ $HD = 1 ] && { AD="$AD HD"; EK="${EK}_hd"; PK="$PK --hd"; }
-[ $O6 = 1 ] && { AD="$AD opt6"; EK="${EK}_opt6"; PK="$PK --opt6"; }
 AD="$AD.app"
 APP="$ROOT/out/kisisel/$AD"; [ -d "$APP" ] || APP="$ROOT/out/$AD"
 [ -d "$APP" ] || { echo "uygulama yok: $APP  (once ./pack.sh --embed$PK)"; exit 1; }
@@ -37,7 +36,14 @@ fi
 
 echo
 echo "oyun aciliyor: normal oyna (~5 dk), bitince oyundan cik."
-open -W -n "$APP" --env PERFLOG="$DIR" --stderr "$DIR/oyun.log"
+# Pil / guc modu: performans dususlerinin bir kismi oyundan degil sistemden geliyor
+# (2026-10-18: uykudan %4 pille uyanip sarja takilinca CPU+GPU kisildi).
+{ date; pmset -g batt; pmset -g | grep -i lowpowermode; } > "$DIR/pil_bas.txt" 2>&1
+# DLINK=2: gercek ekran tazeleme hizini 5 sn'de bir oyunun loguna yazar
+open -W -n "$APP" --env PERFLOG="$DIR" --env DLINK=2 --stderr "$DIR/oyun.log"
+{ date; pmset -g batt; pmset -g | grep -i lowpowermode; } > "$DIR/pil_son.txt" 2>&1
+LG=nfsu2; [ $HD = 1 ] && LG="$LG-hd"
+cp "$HOME/Library/Logs/NFSU2/$LG.log" "$DIR/oyun_tam.log" 2>/dev/null
 
 if [ $PM = 1 ]; then
   sudo -n pkill -INT -f "powermetrics.*$DIR" 2>/dev/null || sudo pkill -INT -f "powermetrics.*$DIR"

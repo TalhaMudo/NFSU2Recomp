@@ -786,6 +786,16 @@ static int hd_gpack(void){
     return v;
 }
 int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask, int reflk);
+/* SON ISLEM ZINCIRI (metal.m): karo bellegi okuma varyanti.  g_fb_in >= 0 iken
+ * asama 0'in ornegi [[color(g_fb_in)]] girdisinden gelir (teksel merkezine 1:1
+ * oturan tam ekran dortgen icin ayni deger) ve sonuc [[color(g_fb_out)]]'a yazilir. */
+static int g_fb_in = -1, g_fb_out = -1;
+int ps_to_msl_fb(const VSProg *p, int id, char *out, size_t cap, int in_idx, int out_idx){
+    g_fb_in = in_idx; g_fb_out = out_idx;
+    int r = ps_to_msl_ex2(p, id, out, cap, 0u, -1);
+    g_fb_in = g_fb_out = -1;
+    return r;
+}
 int ps_to_msl_ex(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask){
     return ps_to_msl_ex2(p, id, out, cap, cubemask, -1);
 }
@@ -806,7 +816,12 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
                   id, p->smptype[0], p->smptype[1], p->smptype[2], p->smptype[3],
                   anycube ? "   <- KUP VAR" : "");
       } }
-    EMIT("fragment %s ps_%d(VOut i [[stage_in]],\n", NFS_ENHANCED ? "PSOut" : "float4", id);
+    if (g_fb_in >= 0)
+        EMIT("struct PSFB%d { float4 c [[color(%d)]]; };\n"
+             "fragment PSFB%d ps_%d(VOut i [[stage_in]], float4 fbin [[color(%d)]],\n",
+             id, g_fb_out, id, id, g_fb_in);
+    else
+        EMIT("fragment %s ps_%d(VOut i [[stage_in]],\n", NFS_ENHANCED ? "PSOut" : "float4", id);
     for (int k = 0; k < 4; k++)
         EMIT("    %s<float> s%d [[texture(%d)]],\n",
              ((cubemask >> k) & 1u) ? "texturecube" : "texture2d", k, k);
@@ -817,10 +832,20 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
      * zemin bastan basa patlak parliyordu. */
     EMIT("    sampler sm0 [[sampler(0)]], sampler sm1 [[sampler(1)]],\n");
     EMIT("    sampler sm2 [[sampler(2)]], sampler sm3 [[sampler(3)]],\n");
-    EMIT("    constant PSPar &P [[buffer(0)]]) {\n");
+    EMIT("    constant PSPar &P [[buffer(0)]],\n");
+    /* alfa testi tanisi (kAT 2): atilacak parca sayaci, yalniz o varyantta var */
+    EMIT("    device atomic_uint *atdbg [[buffer(6), function_constant(kATD)]]) {\n");
     EMIT("  float4 r[16]; for (int q=0;q<16;q++) r[q]=float4(0.0);\n");
     EMIT("  float4 t[4]; for (int q=0;q<4;q++) t[q]=float4(0.0);\n");
-    EMIT("  float4 v[2] = { i.col0, i.col1 };\n");
+    /* D3D9: ps_1_1 - ps_2_0'da renk girdileri (v0/v1) gölgelendirici kullanmadan
+     * once [0,1]'e kirpilir ("diffuse and specular colors are saturated").  Kose
+     * gölgelendiricisi oD0/oD1'e [0,1] disi yazabiliyor (olculdu 2026-10-19:
+     * yaris + menude 1.18 milyar parca, cogu araba boyasi ps 265).  kCS islev
+     * sabiti (metal.m RENK KIRPMA; RENKSAT=0 eski davranis). */
+    if (((p->version >> 8) & 0xFFu) < 3u)
+        EMIT("  float4 v[2] = { kCS ? saturate(i.col0) : i.col0, kCS ? saturate(i.col1) : i.col1 };\n");
+    else
+        EMIT("  float4 v[2] = { i.col0, i.col1 };\n");
     EMIT("  float4 oC = float4(0.0);\n");
     /* Asama -> koordinat kumesi eslemesi D3DTSS_TEXCOORDINDEX ile degisir
      * (izde 422 bin cagride asama 1 ve 2 koordinat 0'i kullaniyor) ve
@@ -882,7 +907,9 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
 #endif
     /* Asama basina ornekleme: 2B'de uv2, kupte uv3 kullanilir. */
     for (int k = 0; k < 4; k++){
-        if (hdblur && !((cubemask >> k) & 1u))
+        if (g_fb_in >= 0 && k == 0)
+            EMIT("#define SMP0(uv2, uv3) fbin\n");
+        else if (hdblur && !((cubemask >> k) & 1u))
             EMIT("#define SMP%d(uv2, uv3) (P.pad0 > 0.0 ? s%d.sample(sm%d, uv2, level(P.pad1)) : s%d.sample(sm%d, uv2))\n",
                  k, k, k, k, k);
         else
@@ -1000,11 +1027,22 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
     }
     /* ps_1_x sonucu r0'da, ps_2_0 oC0'da.  Hangisi yazildiysa onu dondur. */
     EMIT("  float4 res = %s;\n", ps_uses_colorout(p) ? "oC" : "r[0]");
-    EMIT("  if (res.a < P.aref) discard_fragment();\n");
+    /* Alfa testi bir islev sabitiyle (kAT, metal.m kPrelude): testsiz cizim
+     * discard_fragment icermeyen varyantla cizilir ki GPU gizli yuzey
+     * elemesini (HSR) yapabilsin.  kAT 2 = tani: atilacak parca macenta. */
+    EMIT("  if (kAT == 1 && res.a < P.aref) discard_fragment();\n");
+    EMIT("  bool at_kill = (kAT == 2 && res.a < P.aref);\n");
     EMIT("#undef TSEL\n#undef TPICK\n#undef TCRD\n");
     /* D3D9 sis: C = f*Cs + (1-f)*Cfog, yalnizca RGB.  P.fog.a = FOGENABLE. */
     EMIT("  res.rgb = mix(P.fog.rgb, res.rgb, mix(1.0, saturate(i.fog), P.fog.a));\n");
-    if (reflk >= 0){
+    EMIT("  if (kATD) { if (at_kill) { atomic_fetch_add_explicit(&atdbg[%d], 1u, memory_order_relaxed);"
+         " res = float4(1.0, 0.0, 1.0, 1.0); }\n", id);
+    /* tani: [0,1] disinda kose rengi gelen parca (D3D9 oD0/oD1'i kirpar) */
+    EMIT("    if (any(i.col0 < 0.0) || any(i.col0 > 1.0) || any(i.col1 < 0.0) || any(i.col1 > 1.0))"
+         " atomic_fetch_add_explicit(&atdbg[4096 + %d], 1u, memory_order_relaxed); }\n", id);
+    if (g_fb_in >= 0){
+        EMIT("  PSFB%d fbo; fbo.c = res; return fbo;\n}\n", id);
+    } else if (reflk >= 0){
         if (!hd_seen) return 0;             /* asama farkli bicimde: varyant yok */
         int cls = ((cubemask >> reflk) & 1u) ? 2 : 1;
         EMIT("  hd_o[hd_ev] = res;\n  }\n");
@@ -1254,6 +1292,12 @@ int vs_writes_fog(const VSProg *p){
     return 0;
 }
 
+/* bkz. metal.m RENK KIRPMA */
+int vs_colsat_on(void){
+    static int on = -1; if (on < 0){ const char *e = getenv("RENKSAT"); on = (e && *e == '0') ? 0 : 1; }
+    return on;
+}
+int vs_version_major(const VSProg *p){ return p ? (int)((p->version >> 8) & 0xFFu) : 0; }
 int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t cap){
     if (!p || !out || cap < 1024) return 0;
     g_cbuf = "K";                       /* kose: K.c[0..255] */
@@ -1268,7 +1312,8 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
       VEMIT("               float4 c[%d]; };\n", nk); }
     VEMIT("vertex VOut vs_%d(uint vid [[vertex_id]],\n", id);
     VEMIT("    device const uchar *VB [[buffer(1)]],\n");
-    VEMIT("    constant VSPar &K [[buffer(2)]]) {\n");
+    VEMIT("    constant VSPar &K [[buffer(2)]],\n");
+    VEMIT("    constant float4 &UVB [[buffer(3)]]) {\n");     /* UV OLCEGI (metal.m) */
     VEMIT("  device const uchar *B = VB + vid * K.stride;\n");
     VEMIT("#define LDF(x)  (as_type<float>(*(device const uint*)(B+(x))))\n");
     VEMIT("#define LDB(x)  ((float)(B[(x)]))\n");
@@ -1397,9 +1442,17 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
     size_t body_b = o;
     VEMIT("  VOut O;\n");
     VEMIT("  O.pos = oPos;\n");
-    VEMIT("  O.col0 = oD[0]; O.col1 = oD[1];\n");
+    /* D3D9 vs_1_1 - vs_2_x: oD0/oD1 [0,1]'e kirpilir (ps tarafinda v0/v1 "8 bit
+     * isaretsiz, (0, +1)"); kirpma kose basina, enterpolasyondan ONCE -- donanim
+     * renk enterpolatorleri [0,1] tasiyordu.  RENKSAT=0 eski (kirpmasiz). */
+    if (vs_colsat_on() && ((p->version >> 8) & 0xFFu) < 3u)
+        VEMIT("  O.col0 = saturate(oD[0]); O.col1 = saturate(oD[1]);\n");
+    else
+        VEMIT("  O.col0 = oD[0]; O.col1 = oD[1];\n");
     /* D3DTSS_TEXCOORDINDEX: asama k, oT[sel] okur.  Secim BURADA yapilir ki
      * piksel golgelendiricisinde koordinat saf interpolant kalsin. */
+    /* UV OLCEGI (metal.m): K.pad1 = duzeltilecek oT kumeleri, UVB.xy = fark */
+    VEMIT("  for (int q = 0; q < 4; q++) if ((K.pad1 >> q) & 1u) oT[q].xy += UVB.xy;\n");
     VEMIT("  O.uv0 = oT[(K.tsel      ) & 3u]; O.uv1 = oT[(K.tsel >>  8) & 3u];\n");
     VEMIT("  O.uv2 = oT[(K.tsel >> 16) & 3u]; O.uv3 = oT[(K.tsel >> 24) & 3u];\n");
     VEMIT("  O.fog = oFog.x;\n");

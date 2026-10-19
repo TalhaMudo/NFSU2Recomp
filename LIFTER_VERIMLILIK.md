@@ -2,18 +2,25 @@
 
 Amaç: x86 → C statik çevirisinin ürettiği kodun maliyetini **ölçmek**, kaynağını
 **komut düzeyinde** bulmak ve çeviriciyi iyileştirmek. Her adım ayrı dizinde
-üretilir; temel kod (`gen/all`) değişmez, adımlar `diff` ile karşılaştırılabilir.
+üretilir ve `diff` ile karşılaştırılabilir; ana sürüme alınan adım `gen/all` olur,
+önceki sürüm `arsiv/vN/` altına taşınır (sürüm numarası: depo kökündeki `SURUM`).
+
+**Sürümler:** v1 = temel (arşiv: `arsiv/v1/`). **v2 = opt6, 2026-10-18'den beri ana
+sürüm** (`gen/all`, `out/nfsu2_boot`, `out/nfsu2_hd_boot`; üretim `tools/uret_v2.sh`).
+
+Aşağıdaki tablo o tarihe kadarki adımlardır. Dizinlerin hepsi şimdi `arsiv/v1/gen/` ve
+`arsiv/v1/out/` altında; opt6 = bugünkü `gen/all`.
 
 | dizin | ikili | içerik |
 |---|---|---|
-| `gen/all` | `out/nfsu2_boot` | temel (üretim) |
+| `gen/all` (v1) | `out/nfsu2_boot` | temel (o günkü üretim) |
 | `gen/prof` | `out/nfsu2_prof_boot` | temel + her x86 komutu yorum (`COMMENTS=1`), `-gline-tables-only` — yalnız profil |
 | `gen/opt` | `out/nfsu2_opt_boot` | + FLAGABI |
 | `gen/opt2` | `out/nfsu2_opt2_boot` | + FLAGABI + X87OPT |
 | `gen/opt3` | `out/nfsu2_opt3_boot` | opt2 + INLINE=50 (olumsuz sonuç, karşılaştırma için) |
 | `gen/opt4` | `out/nfsu2_opt4_boot` | opt2 + RETEIP=0 |
 | `gen/opt5` | `out/nfsu2_opt5_boot` | opt4 + FCMPBL=1 (dalsız fcompare) |
-| `gen/opt6` | `out/nfsu2_opt6_boot`, `out/nfsu2_opt6_hd_boot` | opt4 + MEMARG=1, `-fno-strict-aliasing` ile derlenir; `./link_opt6.sh` (bkz. bölüm 6) |
+| `gen/opt6` → **v2** | `out/nfsu2_opt6_boot` | opt4 + MEMARG=1, `-fno-strict-aliasing` ile derlenir |
 | `gen/cov` | `out/nfsu2_cov_boot` | opt2 + çağrı sayacı (`COVERAGE=1`) — yalnız ölçüm |
 | (aynı kaynaklar) | `out/nfsu2_{nsa,opt4nsa,opt5nsa}_boot` | `gen/all`/opt4/opt5, `-fno-strict-aliasing` ile (runtime da: `out/obj_rtnsa`) |
 
@@ -26,7 +33,8 @@ OVERRIDE=... GENOUT=gen/opt2 FLAGABI=out/flagabi.json X87OPT=1 \
 # gen/opt2 -> out/obj_opt2 (build.sh ile aynı bayraklar), runtime nesneleri out/obj'dan
 ```
 
-Anahtarlar varsayılan olarak kapalı: anahtarsız `genall.py` bugünkü `gen/all`'ı aynen üretir.
+Anahtarlar varsayılan olarak kapalı: anahtarsız `genall.py` **v1**'i üretir. v2'yi üretmek için
+`tools/uret_v2.sh` (dört anahtar + override listesi; `gen/all`'ı birebir üretir).
 
 ## Ölçüm yöntemi
 
@@ -183,35 +191,32 @@ MEMARG doğruluk düzeltmesinin bedelini geri almakla kalmıyor, üstüne çık�
 | temel (`gen/all`, katı takma ad UB'si açık) | 42.61 M | 14.34 M | 46.1 MB |
 | opt6 (FLAGABI + X87OPT + RETEIP + MEMARG, `-fno-strict-aliasing`) | **35.50 M (−%16.7)** | **11.51 M (−%19.7)** | **34.8 MB (−%25)** |
 
-## 6. opt6 oynanabilir build'i (2026-10-18)
+## 6. v2: opt6 ana sürüm (2026-10-18)
 
-opt6 artık üretim build'inin yanında, **güncel runtime ile** (bütün görüntü düzeltmeleri
-dahil) ayrı bir build olarak üretiliyor. Üretim build'ine (`gen/all`, `out/obj`) dokunulmaz.
+opt6 önce güncel runtime ile ayrı bir build olarak oynandı. Kullanıcı onaylayınca ana
+sürüm (v2) oldu: `gen/opt6` → `gen/all`, v1 `arsiv/v1/` altına taşındı.
 
 ```bash
-./link_opt6.sh                       # gen/opt6 -> out/obj_opt6, runtime -> out/obj_opt6rt{,_hd}
-./pack.sh --opt6 --embed             # out/kisisel/NFSU2 opt6.app
-./pack.sh --opt6 --embed --hd        # out/kisisel/NFSU2 HD opt6.app
-./tools/oturum.sh opt6               # oynarken ölçüm (hd opt6 da olur)
+tools/uret_v2.sh <SPEED2.EXE>        # gen/all (131 dosya, gen/opt6 ile 0 fark)
+./build.sh && ./link.sh              # her şey -fno-strict-aliasing ile
+./pack.sh --embed [--hd]             # out/kisisel/NFSU2[ HD].app, sürüm "2.0"
 ```
 
-- Shard'lar ve runtime `-fno-strict-aliasing` ile derlenir. Betik yalnızca kaynağı ya da
-  `runtime/*.h`'ı nesneden yeni olan shard'ı derler (sıfırdan ~1.5 dk). Önceki opt6
-  nesneleri bu betikle yeniden derlenince 130/130 bayt bayt aynı çıktı.
-- Paketin kimliği (`org.nfsu2.nativeport.opt6`) ve günlüğü (`nfsu2-opt6.log`) ayrı.
-  Kayıtlar normal sürümle ortak.
+- `tools/uret_v2.sh` tarifi `gen/opt6`'yı birebir yeniden üretti; `build.sh` ile
+  derlenen 130 nesne, opt6 nesneleriyle bayt bayt aynı. `impargs.c` v1'dekiyle aynı.
+- Testler v2 üzerinde: 439/439 ISA, 15/15 fonksiyon doğrulama.
 
 **Doğrulama, görüntü** (Windows NFSRef koşulları, 16 kare): Windows referansına fark
-menüde 0.18–0.55. Bu, üretim build'inin 0.18–0.70 değeriyle aynı düzeyde ve farkı
-animasyon fazından geliyor. Keskinlik ve kenar profili birebir. HD opt6, HD üretime göre
+menüde 0.18–0.55. Bu, v1 build'inin 0.18–0.70 değeriyle aynı düzeyde ve farkı
+animasyon fazından geliyor. Keskinlik ve kenar profili birebir. HD v2, HD v1'e göre
 0.07–0.64. Komut tamponu hatası 0, çözülemeyen dolaylı çağrı 0.
 
-**Doğrulama, işlemci** (güncel runtime, `PACE60 CPUWIN=6200,8800`, 3024x1964, dönüşümlü 3+3 koşu):
+**Doğrulama, işlemci** (aynı runtime, `PACE60 CPUWIN=6200,8800`, 3024x1964, dönüşümlü 3+3 koşu):
 
 | | CPU ms/kare | komut/kare | çevrim/kare |
 |---|---|---|---|
-| üretim (`out/nfsu2_boot`) | 5.71 | 41.99 M | 15.49 M |
-| opt6 (`out/nfsu2_opt6_boot`) | **4.44 (−%22.3)** | **34.17 M (−%18.6)** | **11.19 M (−%27.7)** |
+| v1 | 5.71 | 41.99 M | 15.49 M |
+| v2 (opt6) | **4.44 (−%22.3)** | **34.17 M (−%18.6)** | **11.19 M (−%27.7)** |
 
 Oyun 120 fps sınırında olduğu için kazanç fps'te görünmez. Görüneceği yer, oyun
 thread'inin uykuda geçen süresi ve watt (bkz. `tools/oturum.sh`, powermetrics).

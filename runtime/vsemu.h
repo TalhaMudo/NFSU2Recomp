@@ -34,6 +34,11 @@ int  vs_input_reg(const VSProg *p, int usage, int usage_index);
 
 /* v: 16 giris kaydi. Basarida 1. */
 int  vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o);
+/* D3D9 vs_1_1 - vs_2_x renk cikisi kirpmasi (RENKSAT=0 kapatir); surum ana numarasi */
+int  vs_colsat_on(void);
+/* SON ISLEM ZINCIRI: asama 0 ornegi [[color(in)]], sonuc [[color(out)]] (metal.m) */
+int  ps_to_msl_fb(const VSProg *p, int id, char *out, size_t cap, int in_idx, int out_idx);
+int  vs_version_major(const VSProg *p);
 
 /* Piksel gölgelendiricisini MSL kaynagina cevir (0 = basarisiz).
  * Uretilen fonksiyonun adi "ps_<id>".  Cagiran taraf VOut/PSPar

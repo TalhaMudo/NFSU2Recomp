@@ -11,8 +11,6 @@
 #                             DAGITILAMAZ; dagitim klasoru / zip uretilmez.
 #   ./pack.sh --hd            HD build'den "NFSU2 HD.app" (grafik iyilestirmeleri;
 #                             ayri paket kimligi, ayri log, orijinalle yan yana durur)
-#   ./pack.sh --opt6          verimli lifter build'i (./link_opt6.sh) -> "NFSU2 opt6.app";
-#                             --hd ile "NFSU2 HD opt6.app".  Ayri kimlik ve log, kayitlar ortak.
 #
 # Oyun verisi VARSAYILAN OLARAK pakete girmez: uygulama ilk acilista
 # klasoru sorar ve secimi hatirlar.  Boylece paket kucuk kalir ve herkes
@@ -20,14 +18,13 @@
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"; cd "$ROOT"
 
-WITH_DATA=0; MAKE_ZIP=0; HD=0; EMBED=0; OPT6=0; SIGN_ID="${SIGN_ID:-}"
+WITH_DATA=0; MAKE_ZIP=0; HD=0; EMBED=0; SIGN_ID="${SIGN_ID:-}"
 for a in "$@"; do
   case "$a" in
     --with-data) WITH_DATA=1 ;;
     --zip)       MAKE_ZIP=1 ;;
     --hd)        HD=1 ;;
     --embed)     EMBED=1 ;;
-    --opt6)      OPT6=1 ;;
     *) echo "bilinmeyen secenek: $a"; exit 1 ;;
   esac
 done
@@ -38,11 +35,6 @@ if [ "$HD" = 1 ]; then
 else
   BIN="$ROOT/out/nfsu2_boot";    NAME="NFSU2";    DISP="Need for Speed Underground 2"
   BID="org.nfsu2.nativeport";    TAG=""
-fi
-if [ "$OPT6" = 1 ]; then
-  if [ "$HD" = 1 ]; then BIN="$ROOT/out/nfsu2_opt6_hd_boot"; else BIN="$ROOT/out/nfsu2_opt6_boot"; fi
-  NAME="$NAME opt6"; DISP="$DISP (opt6)"; BID="$BID.opt6"; TAG="$TAG-opt6"
-  [ -x "$BIN" ] || { echo "once derleyin: ./link_opt6.sh  ($BIN yok)"; exit 1; }
 fi
 [ -x "$BIN" ] || { echo "once derleyin: ./build.sh && ./link.sh  ($BIN yok)"; exit 1; }
 
@@ -83,6 +75,8 @@ if [ "$EMBED" = 1 ]; then
 fi
 
 VER="$(date +%Y.%m.%d)"
+# Surum takibi (bkz. link.sh): Finder'da "2.0 (2026.10.18)" gibi gorunur.
+SURUM="$(tr -cd '0-9' < "$ROOT/SURUM" 2>/dev/null)"; SURUM="${SURUM:-0}"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -94,7 +88,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key>          <string>${BID}</string>
   <key>CFBundleIconFile</key>            <string>AppIcon</string>
   <key>CFBundlePackageType</key>         <string>APPL</string>
-  <key>CFBundleShortVersionString</key>  <string>${VER}</string>
+  <key>CFBundleShortVersionString</key>  <string>${SURUM}.0</string>
   <key>CFBundleVersion</key>             <string>${VER}</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>LSMinimumSystemVersion</key>      <string>11.0</string>

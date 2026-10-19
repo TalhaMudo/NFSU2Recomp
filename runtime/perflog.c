@@ -286,6 +286,10 @@ __attribute__((constructor)) static void perflog_init(void){
                 (long long)slide, (unsigned long long)img_lo, (unsigned long long)img_hi);
         fprintf(m, "baslangic_epoch_us %llu\n", (unsigned long long)tv.tv_sec * 1000000ull + (unsigned long long)tv.tv_usec);
         fprintf(m, "zaman_tabani %u %u\n", tb.numer, tb.denom);
+#ifndef NFS_SURUM
+#define NFS_SURUM 0
+#endif
+        fprintf(m, "surum %d\n", NFS_SURUM);
 #if NFS_ENHANCED
         fprintf(m, "build HD\n");
 #else

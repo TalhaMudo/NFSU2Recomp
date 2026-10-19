@@ -13,9 +13,12 @@
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"; cd "$ROOT"
 MCPU="${MCPU:-apple-m1}"; MINOS="${MINOS:-11.0}"   # bkz. build.sh
-OPT="${OPT:--O3 -mcpu=$MCPU -mmacosx-version-min=$MINOS}"
+OPT="${OPT:--O3 -mcpu=$MCPU -mmacosx-version-min=$MINOS -fno-strict-aliasing}"   # bkz. build.sh
 LDOPT="${LDOPT} -mmacosx-version-min=$MINOS"
 WHICH="${1:-both}"
+# Surum takibi: depo kokundeki SURUM dosyasi (v1 arsivi: arsiv/v1/).  Runtime
+# acilista ve PERFLOG meta.txt'de yazar, pack.sh paketin surum bilgisine koyar.
+SURUM="$(tr -cd '0-9' < "$ROOT/SURUM" 2>/dev/null)"; SURUM="${SURUM:-0}"
 case "$WHICH" in both|orig|hd) ;; *) echo "kullanim: ./link.sh [orig|hd]"; exit 1 ;; esac
 
 CSRC="mem dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance perflog"
@@ -29,10 +32,10 @@ build_rt(){
   mkdir -p "$od"
   for f in $CSRC; do
     [ -f "runtime/$f.c" ] || continue
-    clang $OPT -DNFS_ENHANCED=$enh -Iruntime -Igen/all -c -o "$od/$f.o" "runtime/$f.c" & pids="$pids $!"
+    clang $OPT -DNFS_ENHANCED=$enh -DNFS_SURUM=$SURUM -Iruntime -Igen/all -c -o "$od/$f.o" "runtime/$f.c" & pids="$pids $!"
   done
   for f in $MSRC; do
-    clang $OPT -DNFS_ENHANCED=$enh -fobjc-arc -Iruntime -Igen/all -c -o "$od/$f.o" "runtime/$f.m" & pids="$pids $!"
+    clang $OPT -DNFS_ENHANCED=$enh -DNFS_SURUM=$SURUM -fobjc-arc -Iruntime -Igen/all -c -o "$od/$f.o" "runtime/$f.m" & pids="$pids $!"
   done
   clang $OPT -Iruntime -Igen/all -c -o "$od/impargs.o" gen/all/impargs.c & pids="$pids $!"
   clang $OPT -DNFS_ENHANCED=$enh -Iruntime -Igen/all -c -o "$od/boot.o" tests/boot.c & pids="$pids $!"

@@ -689,6 +689,18 @@ hesaplanabilir ve gerçekle karşılaştırılabilir.
 
 ## Komutlar
 
+**Sürümler:** depo kökündeki `SURUM` dosyası (şu an `2`). Paket bunu sürüm
+bilgisine yazar (Finder'da "2.0"), ikili açılışta günlüğe yazar, oturum kayıtları
+`~/nfs_oturum/<tarih>_v2` diye etiketlenir.
+- **v1:** temel çevirici, `-fno-strict-aliasing` yok. Arşiv: `arsiv/v1/` (git dışı,
+  içeriği `arsiv/v1/OKUBENI.txt`).
+- **v2 (2026-10-18):** FLAGABI + X87OPT + RETEIP=0 + MEMARG=1, her şey
+  `-fno-strict-aliasing` ile. Oyun kodu kare başına −%22 işlemci süresi
+  (`LIFTER_VERIMLILIK.md`).
+
+Yeni bir lifter adımı önce ayrı bir `gen/<ad>` dizininde denenir. Ana sürüme
+alınınca eski sürüm `arsiv/vN/` altına taşınır ve `SURUM` bir artırılır.
+
 ### Çalıştırma
 ```bash
 ./run.sh window      # pencereli (Metal)
@@ -709,17 +721,16 @@ Ayrıntı ve sonuçlar: `GRAFIK_ARASTIRMA.md` §6 (yansıma çözünürlüğü),
 # tam yeniden uretim + derleme (~2.5 dk).  Depo kokunden calistirin.
 # 1) reloc tablosu -> out/relocs.txt  (genall.py ve argcount.py bunu okur)
 ./.venv/bin/python tools/reloc2.py <SPEED2.EXE>
-# 2) 23k fonksiyonu C'ye cevir -> gen/all/
-# DIKKAT: OVERRIDE listesi runtime/overrides.c + runtime/d3dx_hle.c ile AYNI
-# olmali, yoksa sub_XXXX_orig sembolleri uretilmez ve link kirilir.
+# 2) v2: bayrak canliligi + 23k fonksiyonu C'ye cevir -> gen/all/, import
+#    arguman tablosu -> gen/all/impargs.c.  Hepsi tek betikte; tarif gen/all'i
+#    birebir uretir (2026-10-18 dogrulandi: 131 dosya, 0 fark).
+# DIKKAT: betikteki OVERRIDE listesi runtime/overrides.c + runtime/d3dx_hle.c
+# ile AYNI olmali, yoksa sub_XXXX_orig sembolleri uretilmez ve link kirilir.
 # d3dx_hle.c sarmalayicilari makroyla uretiyor (grep bulamaz); guncel liste
 # D3DX_HLE.md "Yeniden uretim" bolumunde.
-OVERRIDE=60fab0,61e390,61f130,5c7ed0,50d510,65ae35,6623ea,66aa3f,66ace2,6691b1,669296,664a2f,663a42,688e89,663275,662edc,660a52,668e0d,664792,66ac27,65addb,65acf5,66d13a,66d303,66d7e9,66e8a9,66f501,66ca38,65ab24,67193e,66056c,65cf44,640c12,668cd0,65ccd8 \
-  ./.venv/bin/python tools/genall.py <SPEED2.EXE> 128
-# 3) import arguman tablosu -> gen/all/impargs.c  (link.sh bunu derler)
-./.venv/bin/python tools/argcount.py <SPEED2.EXE>
-# 4) derle + linkle
-./build.sh && ./link.sh          # OPT varsayilani: -O3 -mcpu=apple-m1
+tools/uret_v2.sh <SPEED2.EXE>
+# 3) derle + linkle
+./build.sh && ./link.sh          # OPT: -O3 -mcpu=apple-m1 -fno-strict-aliasing
 
 # sadece runtime degistiyse (~10 sn)
 ./link.sh
@@ -989,6 +1000,30 @@ medyan alınıyor, iki yapı kova kova eşleştiriliyor. Koşu tekrarı: **10.32
 - **`dispatch_indirect` yama tablosu sırası** ve **`mem_is_committed` satır
   içi**: +%0.3, gürültü içinde. `g_patch_n` aslında 1; kaldırılan tarama iki
   komuttu. (Değişiklikler kod olarak doğru, duruyorlar.)
+
+- **Metal sistem iş parçacıkları (2026-10-18, v2).** Yarışta süreç işlemcisinin
+  ~%30'u macOS'un Metal/CoreAnimation GCD iş parçacıklarında (0.34–0.39 çekirdek,
+  %90'ı çekirdek modu; `sample`: `IOGPUCommandQueueSubmitCommandBuffers`). Denenenler:
+  - **Kalıcı yerleşim kümesi** (`MTLResidencySet`, tüm doku ve tamponlar): etki yok
+    (0.384/0.389 → 0.380/0.362, dönüşümlü 2+2).
+  - **Kareye +20/+40 boş geçiş:** +0.04 / +0.01 çekirdek, yani geçiş başına teslim
+    maliyeti küçük.
+  - **Mikro karşılaştırma** (oyunun deseni: 1400 çizim, 25 geçiş, 200 doku, satır içi
+    548 B sabit, tam ekran hedef + derinlik, 120 Hz `CAMetalLayer` sunumu): 0.39–0.41
+    çekirdek. Bu, oyundaki ~0.45'e (render + GCD) çok yakın; boş kareyi 120 Hz'de
+    sunmak bile 0.15 çekirdek. Yani anormallik yok, desenin bedeli bu.
+  - **`setVertexBufferOffset` + sabitleri kare tamponundan vermek:** en iyi ihtimalle
+    −0.02 çekirdek (~0.05 W), gürültü sınırında; yapılmadı.
+
+  Bulunan tek gerçek kirlilik ölçüm aracıydı: PERFLOG ekran görüntüsü GPU'nun
+  sıkıştırdığı dokuyu satır satır `getBytes` ile okuyordu (~0.08 çekirdek, yalnızca
+  kayıt sırasında). Artık doğrusal `MTLBuffer`'a kopyalanıyor.
+
+- **GEÇİŞ YÜKLEMESİ ve Z SAKLAMA (2026-10-18):** render geçişlerinde gereksiz
+  görünen renk/Z yükleme-saklamayı kesmek. Koşu içi A/B'de GPU enerjisi ve DRAM
+  trafiği değişmedi (Apple GPU bunları zaten atlıyor); Z saklama D3D9 sözleşmesine
+  aykırı (oyun örtük Z'yi kareler arası koruyor). Ayrıntı: "GPU enerjisi ve bellek
+  trafiği".
 
 ## 6. Şu anki profil (konuk thread, yarış)
 
@@ -1572,3 +1607,174 @@ Ek yük (120 fps yarış, `ps -M`): konuk thread +%1.6, süreç +%5 (çoğu
 örnekleyicinin kendisi); fps, en uzun kare ve sapma değişmiyor.
 `task_gpu_utilisation` 0 dönüyor: GPU watt yalnızca powermetrics'ten.
 
+
+## GPU enerjisi ve bellek trafiği (2026-10-18)
+
+Hedef: 120 fps ve özgün görüntü korunarak watt düşürmek. Yarışta (120 fps)
+GPU ~4.9 W, sistemin ~8.8 W'ının yarısından fazlası.
+
+### Ölçüm: neden yeni yöntem gerekti
+
+- **GPU ms/kare iş ölçüsü değil.** macOS GPU saatini yüke göre ayarlıyor (DVFS):
+  iş azalınca saat düşüyor, aynı kare daha UZUN sürebiliyor (bellek trafiğini
+  kesen bir değişiklikte 5.3 → 5.8 / 7.6 ms ölçüldü).
+- **Ayrı koşuların enerjisi karşılaştırılamaz.** Aynı ayarla üç koşu 30.8 /
+  34.9 / 40.0 mJ/kare verdi (DVFS durumu + sistemin geri kalanı).
+- **Sudo'suz sayaçlar** (IOReport, `runtime/metal.m` `ior_read`):
+  - `Energy Model / GPU Energy` (nJ): GPU çekirdeğinin modellenmiş enerjisi
+    (powermetrics'in "GPU Power"ı). **DRAM'i içermez.**
+  - `AMC Stats / Perf Counters`: bellek denetleyicisinde ajan başına bayt.
+    `GFX RD/WR` = GPU'nun bellek sistemine okuma/yazması, `GFX DCS RD/WR` =
+    bunun DRAM'e giden kısmı. DVFS'ten bağımsız bir iş ölçüsü.
+  - SMC `PSTR` (sistem toplam gücü) de sudo'suz okunuyor ama saniyede bir
+    güncelleniyor; A/B için kaba (araç: scratch `smc.c`, kalıcı değil).
+- **Koşu içi A/B: `ABTEST=AD[,N[,ATLA]]`** (`GPUWIN` penceresinde). Pencere N
+  karelik dilimlere bölünür (varsayılan 120; kısa dilim komşu dilimleri daha iyi
+  eşleştiriyor, ölçümlerde `32,4` kullanıldı). Çift dilimde özellik açık, tek
+  dilimde kapalı. Dilimin ilk ATLA karesi atılır (kuyrukta önceki kipin işi).
+  Komşu dilim çiftlerinin farkı ortalama ± standart hata olarak raporlanır.
+  Özellik kendi anahtarını `abt_off("AD")` ile sorar (`SCRREDIR`, `ALFAVAR`).
+  `GPUWIN` raporu da artık enerji ve MB/kare veriyor.
+
+```bash
+# yarış, gerçek çözünürlük, 60 Hz sabit (AUTOSEQ: Quick Race tarifi, gaz basılı)
+env FIXMAT=1 FIXMAT_MODE=3 NOMOVIES=1 SNDSYNC=1 GPUVS=1 WINDOW=1 ALARM=0 \
+    NOFOCUS=2 NOSOUND=1 NFSFULL=0 MOUSEAT=5,5 PACE60=1 \
+    AUTOSEQ="1000:0x1C,1350:0x1C,1700:0x1C,2050:0x1C,2400:0x1C,2750:0x1C,3100:0x1C,3700:0x1C,4000:0x1C,4700:0xC8:5300" \
+    QUITFRAMES=10000 GPUWIN=6200,9800 ABTEST=ALFAVAR,32,4 \
+    out/nfsu2_boot "<SPEED2.EXE>" 2>&1 | grep -a "ABTEST\|PENCERE"
+```
+
+### Sonuçlar (normal sürüm, yarış, 3024x1836, 60 fps, 56 dilim çifti)
+
+| özellik | GPU enerjisi mJ/kare | GPU okuma / yazma MB/kare | DRAM okuma / yazma MB/kare | karar |
+|---|---|---|---|---|
+| ALFA TESTİ VARYANTI (`ALFAVAR`) | **−6.32 ± 0.48 (−%17)** | −2.8 ± 1.1 / −0.3 ± 0.8 | −1.8 ± 1.7 / +0.8 ± 1.7 | varsayılan açık (HD: −%27) |
+| EKRAN YÖNLENDİRME (`SCRREDIR`) | −0.02 ± 0.88 | −10.7 ± 1.1 / −10.1 ± 0.8 | **−20.4 ± 1.9 / −21.0 ± 1.8** | varsayılan açık |
+| GEÇİŞ YÜKLEMESİ (DontCare / karalama Z) | +0.6 ± 0.8 | +0.9 ± 1.1 / +0.6 ± 0.6 | +1.6 ± 1.8 / +1.2 ± 1.4 | elendi, kod kaldırıldı |
+
+GPU süresi (DVFS'li, yalnız bilgi): `ALFAVAR` açık 5.28 / kapalı 6.08 ms/kare.
+
+### ALFA TESTİ VARYANTI (`ALFAVAR`)
+
+Çevrilen her parça gölgelendiricisi alfa testini kendisi yapıyordu:
+`if (res.a < P.aref) discard_fragment()`. Test kapalıyken (aref 0) hiçbir parça
+atılmaz, ama gölgelendiricide `discard` olduğu için Apple GPU çizimi opak
+saymıyor ve **gizli yüzey elemesi (HSR) kapanıyor**: sonradan örtülecek parçalar
+da gölgeleniyor. Şimdi her ps (ve sabit işlevli `fmain`) bir işlev sabitiyle
+(`kAT`) iki kez özelleştiriliyor; aref 0 olan çizim `discard`'sız varyantla
+çiziliyor (boru hattı anahtarında bit 52). Fark yalnız `res.a < 0` üreten
+parçada olabilirdi; D3D9'da alfa testi kapalıyken o parça zaten yazılır, yani
+yeni varyant D3D9'a daha sadık.
+
+Doğrulama: `ALFAVAR=2` testsiz varyantta "atılacak" parçayı GPU'da bir sayaçla
+sayar (parça tampon 6) ve macenta boyar. Tüm koşu (9000 kare, menü + yarış)
+sonucu **0 parça**. `ALFAVAR=3` pozitif kontrol (alfa testli çizimler de tanı
+varyantıyla) 2.98 milyar parça saydı.
+
+**HD sürümü:** kazanç daha büyük (−30.1 ± 1.7 mJ/kare, −%27). `ALFAVAR=2`
+sayacı HD'de önce 12.6 milyon parça farkı buldu. Gölgelendirici başına sayım
+(sayaç dizisi ps kimliğiyle) kaynağı gösterdi: neredeyse tamamı sabit işlevli
+`fmain`, sebep negatif köşe rengi alfası. D3D9 köşe rengini [0,1]'e kırpar
+(aşağıda RENK KIRPMA); kırpmayla HD'de de **0 parça**, iki sürümde açık.
+
+### RENK KIRPMA (`RENKSAT`)
+
+D3D9'da ps_1_1 – ps_2_0 köşe rengini (v0/v1) [0,1]'e kırpılmış görür. Microsoft
+belgesi "8 bit unsigned, range (0, +1)" ve "saturated before use by the shader"
+diyor. Bizim köşe gölgelendiricimiz oD0/oD1'i kırpmadan iletiyordu. Tanı
+sayacı yarış + menüde **1.18 milyar parçanın** [0,1] dışı renkle geldiğini
+gösterdi; çoğu araba boyası (ps 265, küp varyantı), sonra ps 7 ve `fmain`.
+
+Kırpma iki yerde yapılıyor:
+- köşe başına: `vsemu.c` `vs_to_msl` ve `com.c` CPU yolu, vs < 3.0. Dönemin
+  donanımında renk enterpolatörleri zaten [0,1] taşıyordu.
+- parçada: `kCS` işlev sabiti; kayan nokta taşmaları ve gözden kaçan yollar için.
+
+Windows referansı (1280x960, aynı tuş dizisi): menü kareleri değişmedi, Windows'a
+uzaklık öncesiyle aynı (0.1 – 0.5). Yarış kareleri Windows'ta koşudan koşuya
+değiştiği için orada kıyas yok. Bu bir sadakat düzeltmesi: D3D9 sözleşmesine
+uyuyor ve alfa varyantını HD'de birebir yaptı. `RENKSAT=0` eski davranış.
+
+**Macentayı görüntüde aramak yarışta kördür:** son işlem renk tablosu (ps 26/28, LUT) macentayı başka renge
+çeviriyor; menü karesi dışında hiç macenta görünmedi. Sayaç bu yüzden var.
+
+### EKRAN YÖNLENDİRME (`SCRREDIR`)
+
+Yarış (ve menü) karesi sahneyi ekrana çiziyor, sonra aynı boyutta #2'ye
+kopyalıyor (son işlem #2'yi okuyor), ekranı en sonda tam ekran bir dörtgenle
+baştan yazıyor. Kopya 22 MB okuma + 22 MB yazma, 0.59 ms/kare (PASSPROF).
+Koşullar sağlanınca sahne doğrudan #2'ye çiziliyor ve kopya atlanıyor.
+Koşullar: kopya ekranı okuyan ilk blit; hedefi ekranla aynı boyut ve biçimde;
+kopyadan önce #2 ne örnekleniyor ne hedef oluyor; kopyadan sonra ekrana ilk
+dokunan çizim ekranı tamamen eziyor (TAM EKRAN KAPLAMA kuralı). Bu durumda #2
+kopyanın vereceği içeriğin aynısını alıyor: aynı çizimler, boyut, biçim, Z.
+
+Doğrulama: `SCRREDIR=2` kopyadan sonraki ilk ekran geçişini macentayla
+temizler. Kaplama yanlışsa macenta son görüntüye sızar; bu test son işlemden
+SONRA ekrana yazılanı sınadığı için kör değil. 16 karede 0 macenta. Görüntü
+ayrıca gözle kontrol edildi. HD'de ekran çok örnekli ve G-tamponlu olduğu için
+orada kapalı.
+
+Kazanç DRAM'de: kare başına −41 MB (120 fps'te −4.9 GB/s). GPU çekirdek
+enerjisi değişmedi: kopya bellek işi, gölgelendirici işi değil.
+
+### UV ÖLÇEĞİ (`UVFIX`) — yerel çözünürlükte son işlem bulanıklığı (2026-10-19)
+
+NFSRES / Retina'da oyun 1280x960 sandığı için çiziyor; tam ekran hedefler
+(#2/#3/#4, ekran) ise 3024x1836. Son işlem dörtgenleri D3D9 yarım teksel
+kuralıyla `u = (x + 0.5) / 1280` eşlemesini taşıyor (ölçüldü: u 0.0003906 ..
+1.0003906 = 0.5/1280, v 0.0005208 .. 1.0005208 = 0.5/960). Gerçek hedefte bu,
+piksel merkezini teksel merkezinden (0.68, 0.46) teksel kaydırıyor. Her tam
+çözünürlüklü geçiş görüntüyü kaydırıp bilinear ile yumuşatıyordu; ana görüntü 4
+geçişten geçiyor (renk tablosu zinciri + ekrana kopya). 1280x960'ta (Windows
+kıyas çözünürlüğü) eşleme birebir olduğu için bu hiçbir karşılaştırmada
+görünmemişti.
+
+Düzeltme: oyunun niyetindeki eşleme gerçek boyutta kuruluyor. Köşe
+gölgelendiricisi kalıba uyan koordinat kümesine `0.5/Wgerçek − 0.5/Woyun`
+ekliyor, yani `u = (x + 0.5) / Wgerçek`. Koşullar:
+- dörtgen hedefi tam kaplıyor (NDC ±1);
+- hedef ölçekli (oyun boyutu ≠ gerçek);
+- kümenin köşe UV'leri tam bu kalıpta.
+
+Kalıba uymayan kümeye (çok dokunuşlu bulanıklık ofsetleri, 640x480 hedefler)
+dokunulmuyor. Kare başına ~2.5 çizim.
+
+Sonuç (aynı tuş dizisi, yerel çözünürlük; netlik = ortalama parlaklık
+gradyanı):
+
+| kare | önce | sonra |
+|---|---|---|
+| 1650 (3B menü, araba) | 1.367 | 1.637 (+%20) |
+| 2000 | 1.259 | 1.542 (+%22) |
+| 3050 | 1.359 | 1.590 (+%17) |
+| 5000 / 6200 (yarış) | 2.33 / 2.19 | 3.17 / 2.99 |
+| 1300 (2B menü, son işlem yok) | 0.569 | 0.569 |
+
+Gözle: kaputun karbon dokusu, jant telleri ve fren diski delikleri artık keskin.
+`UVFIX=0` eski (bulanık) davranış.
+
+### Elenenler
+
+- **GEÇİŞ YÜKLEMESİ:** tam ekran kaplayan çizimle başlayan geçişte renk
+  `Load` → `DontCare`, Z kullanmayan geçişte gerçek Z yerine karalama derinlik.
+  Zehir testiyle doğruydu ama hiçbir ölçüde etkisi yok (tablo). Apple GPU tam
+  örtülen karonun yüklemesini HSR ile zaten atlıyor, dokunulmayan Z'yi de
+  taşımıyor. Kod kaldırıldı; kaplama hesabı (`com.c` → `metal_set_next_cov_clip`)
+  EKRAN YÖNLENDİRME için duruyor.
+- **Z SAKLAMA:** son kullanımdan sonra Z'yi `DontCare` ile saklamamak. Oyun
+  cihazı `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` olmadan açıyor (sunum
+  parametreleri: takas 1, Z D24S8, bayrak 0; artık açılışta loglanıyor). Yani
+  örtük Z kareler arası korunmalı; kare içinde sonradan temizlenen Z 0/kare
+  çıktı. Uygulanamaz, kod kaldırıldı.
+
+Yeni anahtarlar:
+
+| anahtar | işlev |
+|---|---|
+| `ABTEST=AD[,N[,ATLA]]` | koşu içi A/B (yukarıda) |
+| `SCRREDIR=0/2` | ekran yönlendirmeyi kapat / zehir testi |
+| `ALFAVAR=0/2/3` | testsiz varyantı kapat / sayaçlı tanı (ps başına; ayrıca [0,1] dışı köşe rengi sayımı) / tanının pozitif kontrolü |
+| `RENKSAT=0` | köşe rengi kırpmasını kapat (eski, D3D9'a aykırı) |
+| `UVFIX=0` | ölçekli hedeflerde yarım teksel düzeltmesini kapat (eski, bulanık) |

@@ -947,8 +947,15 @@ static float g_aspfix = 1.f;
 /* Hor+ carpani (kirpma uzayi x'i icin); HD birlestirme gecisi kamerayi
  * ekranda cizilen geometriyle ayni uzaya almak icin kullanir. */
 float com_aspfix(void){ return g_aspfix; }
-#if NFS_ENHANCED
+/* ceviri programlari: varyantlar (HD yansima, son islem zinciri) cizim aninda uretilir */
 static VSProg *g_psprog[256];
+/* SON ISLEM ZINCIRI (metal.m): ps'nin karo bellegi okuma varyantinin MSL'i.
+ * Basarida uzunluk, yoksa 0. */
+int com_ps_fb_msl(int base, int vid, int in_idx, int out_idx, char *msl, size_t cap){
+    if (base <= 0 || base >= 256 || !g_psprog[base]) return 0;
+    return ps_to_msl_fb(g_psprog[base], vid, msl, cap, in_idx, out_idx);
+}
+#if NFS_ENHANCED
 /* Yansima ayristirma varyanti: taban ps (kup varyanti icin cube=1), yansima
  * asamasi k, Metal kimligi vid.  Basarida 1. */
 int com_ps_refl_variant(int base, int cube, int k, int vid){
@@ -1002,9 +1009,12 @@ static void res_pick(uint32_t gw, uint32_t gh, uint32_t *dw, uint32_t *dh){
          * (RT yeniden boyutlama ve GetDisplayMode bunlara bakiyor). */
         g_req_w = g_req_h = 0; g_aspfix = 1.f;
         { void metal_set_ui_aspect(float); metal_set_ui_aspect(1.f); }
+        { void metal_set_uv_scale(unsigned, unsigned, unsigned, unsigned); metal_set_uv_scale(0, 0, 0, 0); }
         return;
     }
     g_req_w = gw; g_req_h = gh;
+    { void metal_set_uv_scale(unsigned, unsigned, unsigned, unsigned);   /* bkz. metal.m UV OLCEGI */
+      metal_set_uv_scale(gw, gh, aw, ah); }
     /* Oyun kendi orani icin cizmeye devam eder; farki kirpma uzayinda
      * telafi ediyoruz.  Oran birebir korunuyorsa bu carpan 1.0 kalir. */
     if (gw && gh){
@@ -1298,6 +1308,28 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
                 }
                 return 0;
             }
+            /* Hedefi tamamen ezen dortgen mi?  (bkz. metal.m GECIS YUKLEMESI)
+             * Yalniz hedefi okumayan adaylar: karisim kapali, 4 kanal yaziliyor,
+             * alfa testi ve Z testi yok, en fazla 6 kose.  Koseler CPU'da
+             * donusturulur; karede son islem zincirinin birkac dortgeni. */
+            { void metal_set_next_cov_clip(const float (*)[4], unsigned, unsigned);
+              if (nv <= 6u && (pt == 4u || pt == 5u || pt == 6u) && !g_rs[27] &&
+                  (g_rs[168] & 15u) == 15u && !g_rs[15] && (!g_rs[7] || (g_rs[23] & 15u) == 8u)){
+                  float cp[6][4], cuv[6][16];
+                  for (uint32_t i = 0; i < nv; i++){
+                      float v[16][4];
+                      for (int r2 = 0; r2 < 16; r2++){ v[r2][0]=v[r2][1]=v[r2][2]=0.f; v[r2][3]=1.f; }
+                      for (int k = 0; k < nel; k++)
+                          decl_fetch(vp + i*stride + el[k].off, el[k].type, v[el[k].reg]);
+                      VSOut so;
+                      vs_run(prog, vsk, (const float (*)[4])v, &so);
+                      memcpy(cp[i], so.pos, sizeof cp[i]);
+                      memcpy(cuv[i], so.tex, sizeof cuv[i]);          /* oT0..oT3 */
+                  }
+                  { void metal_set_next_cov_uv(const float (*)[16], unsigned);
+                    metal_set_next_cov_uv((const float (*)[16])cuv, nv); }
+                  metal_set_next_cov_clip((const float (*)[4])cp, nv, pt);
+              } }
             if (metal_draw_raw(g_mem + vp, nv, stride, pt, g_cur_tex, gid,
                                &vsk->f[0][0], (unsigned)g_gvs_nk[gid])){
                 g_vs_draws++; g_gpuvs_draws++; g_v_xform += nv;
@@ -1364,6 +1396,11 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
             else { uint64_t _v0 = now_ns();
                    vs_run(prog, vsk, (const float (*)[4])v, &so);
                    g_t_vs_ns += now_ns() - _v0; }
+            /* D3D9: vs_1_1 - vs_2_x renk cikislari [0,1]'e kirpilir (GPU yolu ile ayni,
+             * bkz. vsemu.c vs_to_msl) */
+            if (vs_colsat_on() && vs_version_major(prog) < 3)
+                for (int c2 = 0; c2 < 2; c2++) for (int k2 = 0; k2 < 4; k2++){
+                    float x = so.col[c2][k2]; so.col[c2][k2] = !(x > 0.f) ? 0.f : (x > 1.f ? 1.f : x); }
             out->x=so.pos[0]; out->y=so.pos[1]; out->z=so.pos[2]; out->w=so.pos[3];
             out->r=so.col[0][0]; out->g=so.col[0][1];
             out->b=so.col[0][2]; out->a=so.col[0][3];
@@ -1949,6 +1986,13 @@ int com_call(CPU *c, uint32_t magic){
                 uint32_t win4 = mem_is_committed(ppp+35) ? MR32(ppp+32) : 1u;
                 fprintf(stderr,"com: CreateDevice istegi %ux%u (%s)\n",
                         w4, h4, win4 ? "pencereli" : "tam ekran");
+                /* D3DPRESENT_PARAMETERS: SwapEffect@24, EnableAutoDepthStencil@36,
+                 * AutoDepthStencilFormat@40, Flags@44 (2 = DISCARD_DEPTHSTENCIL).
+                 * Olculdu (2026-10-18): takas 1 (DISCARD), Z bicimi 75 (D24S8),
+                 * bayrak 0 -> ortuk Z kareler arasi KORUNMALI. */
+                if (mem_is_committed(ppp+55))
+                    fprintf(stderr,"com: sunum parametreleri: takas %u, ortuk Z %u (bicim %u), bayraklar 0x%x, aralik 0x%x\n",
+                            MR32(ppp+24), MR32(ppp+36), MR32(ppp+40), MR32(ppp+44), MR32(ppp+52));
                 if (w4 > 8192u || h4 > 8192u){      /* oyunun dizi tasmasi */
                     fprintf(stderr,"com: gecersiz boyut yok sayildi, %ux%u korunuyor\n",
                             g_bb_w, g_bb_h);
@@ -3263,13 +3307,10 @@ int com_call(CPU *c, uint32_t magic){
                             fprintf(stderr, "--- MSL ps %d ---\n%s\n", id + PSCUBE, msl);
                         metal_register_ps(id + PSCUBE, msl);
                     }
-#if NFS_ENHANCED
-                    /* HD: yansima ayristirma varyanti cizim aninda, ihtiyac
-                     * olunca uretilir (com_ps_refl_variant); program saklanir. */
+                    /* program saklanir: HD yansima ayristirma ve son islem zinciri
+                     * varyantlari cizim aninda, ihtiyac olunca uretilir */
                     if (id < PSCUBE && !g_psprog[id]) g_psprog[id] = pp3;
-                    else
-#endif
-                    vs_free(pp3);
+                    else vs_free(pp3);
                 }
             }
             if (MID(CreateVertexShader) && copy && sz >= 8 && g_vsprogn < MAXVS){

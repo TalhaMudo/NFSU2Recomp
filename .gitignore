@@ -22,3 +22,6 @@ __pycache__/
 .DS_Store
 *.o
 *.log
+
+# Eski surum arsivi (gen/ ve out/ turevleri; bkz. arsiv/v1/OKUBENI.txt)
+/arsiv/

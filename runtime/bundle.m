@@ -73,10 +73,7 @@ void app_open_log(void){
     mkdir(dir, 0755);
     /* HD build ayri log yazar: iki surum yan yana calistirilinca birbirinin
      * logunu ezmesin. */
-#ifndef NFS_BUILDTAG
-#define NFS_BUILDTAG ""        /* link_opt6.sh: "-opt6" (ayri log) */
-#endif
-    const char *lg = NFS_ENHANCED ? "nfsu2-hd" NFS_BUILDTAG : "nfsu2" NFS_BUILDTAG;
+    const char *lg = NFS_ENHANCED ? "nfsu2-hd" : "nfsu2";
     snprintf(pth, sizeof pth, "%s/%s.log", dir, lg);
     /* "w": her calistirmada bastan.  Onceki kosu tanida lazim olabilir. */
     char prev[1300]; snprintf(prev, sizeof prev, "%s/%s-onceki.log", dir, lg);

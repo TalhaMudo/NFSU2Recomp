@@ -196,8 +196,8 @@ def main():
     yaz = R.append
     sure = (render[-1]['t_ms'] - render[0]['t_ms']) / 1e3 if len(render) > 1 else 0
     yaz('# Oturum raporu: %s\n' % os.path.basename(os.path.normpath(d)))
-    yaz('build **%s**, ikili `%s`, sure %.0f sn, %d kare (render), %d konuk karesi, %d ornek, %d ekran goruntusu\n'
-        % (m.get('build', '?'), os.path.basename(m.get('ikili', '?')), sure, len(render), len(konuk), len(orn), len(ekranlar)))
+    yaz('surum **%s**, build **%s**, ikili `%s`, sure %.0f sn, %d kare (render), %d konuk karesi, %d ornek, %d ekran goruntusu\n'
+        % (('v' + m['surum']) if m.get('surum') else 'etiketsiz', m.get('build', '?'), os.path.basename(m.get('ikili', '?')), sure, len(render), len(konuk), len(orn), len(ekranlar)))
 
     # ---- genel ----
     ar = [r['aralik_us'] / 1e3 for r in render if r['aralik_us'] > 0]
@@ -230,6 +230,21 @@ def main():
             yaz('| powermetrics toplam / CPU / GPU | %.2f / %.2f / %.2f W |'
                 % (ort(g['top'] for g in guc), ort(g['cpu'] for g in guc), ort(g['gpu'] for g in guc)))
             yaz('| GPU frekansi / P0 frekansi | %.0f / %.0f MHz |' % (ort(g.get('gf') for g in guc), ort(g.get('pf') for g in guc)))
+        # oturum.sh: gercek ekran tazeleme hizi (DLINK=2) ve pil/guc modu.  Dusus
+        # oyundan mi sistemden mi, ilk bakista buradan ayrilir.
+        tl = os.path.join(d, 'oyun_tam.log')
+        if os.path.exists(tl):
+            hz = [float(x) for x in re.findall(r'^\[ekran\] ([\d.]+) Hz', open(tl, errors='replace').read(), re.M)]
+            if hz:
+                yaz('| ekran tazeleme (en dusuk / ort / en yuksek) | %.0f / %.0f / %.0f Hz |' % (min(hz), st.mean(hz), max(hz)))
+        for ad, et in (('pil_bas.txt', 'pil / guc modu (bas)'), ('pil_son.txt', 'pil / guc modu (son)')):
+            pp = os.path.join(d, ad)
+            if os.path.exists(pp):
+                t = open(pp, errors='replace').read()
+                p = re.search(r'(\d+)%; ([^;]+);', t); lp = re.search(r'lowpowermode\s+(\d)', t)
+                gk = 'sarj' if 'AC Power' in t else 'pil'
+                yaz('| %s | %s%s, %s (%s), Dusuk Guc Modu %s |' % (et, p.group(1) if p else '?', '%' if p else '',
+                    gk, (p.group(2) if p else '?'), ('acik' if lp and lp.group(1) == '1' else 'kapali')))
         yaz('')
 
     # ---- olaylar ----
