@@ -34,6 +34,11 @@ else
   echo "uyari: parola verilmedi, powermetrics yok; yalniz oyun ici kayit"
 fi
 
+# Sicaklik / fan (sudo gerekmez): kullanicinin gordugu "86 derece" dogrudan olculsun
+SMC="$ROOT/out/smcoku"; SM=0
+[ "$SMC" -nt "$ROOT/tools/smcoku.c" ] || clang -O1 -framework IOKit -o "$SMC" "$ROOT/tools/smcoku.c" 2>/dev/null
+if [ -x "$SMC" ]; then "$SMC" -k 1000 "$DIR/sicaklik.csv" & SM=$!; fi
+
 echo
 echo "oyun aciliyor: normal oyna (~5 dk), bitince oyundan cik."
 # Pil / guc modu: performans dususlerinin bir kismi oyundan degil sistemden geliyor
@@ -45,6 +50,7 @@ open -W -n "$APP" --env PERFLOG="$DIR" --env DLINK=2 --stderr "$DIR/oyun.log"
 LG=nfsu2; [ $HD = 1 ] && LG="$LG-hd"
 cp "$HOME/Library/Logs/NFSU2/$LG.log" "$DIR/oyun_tam.log" 2>/dev/null
 
+[ $SM != 0 ] && kill $SM 2>/dev/null
 if [ $PM = 1 ]; then
   sudo -n pkill -INT -f "powermetrics.*$DIR" 2>/dev/null || sudo pkill -INT -f "powermetrics.*$DIR"
   [ $KA != 0 ] && kill $KA 2>/dev/null

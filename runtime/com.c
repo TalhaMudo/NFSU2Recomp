@@ -2612,6 +2612,13 @@ int com_call(CPU *c, uint32_t magic){
              * farki dt hep 1/1800 kaliyor, on yuz tiki [0x8651a8] hic
              * artmiyor, animasyonlar ve zamanli ekran gecisleri donuyor.
              * Oyunun kendi varsayilani [0x7fb710] = 1/120. */
+            /* LIMFREE=<kare> (yalniz OLCUM, VCLOCK=8333 + NOVSYNC=1 ile): o kareden
+             * sonra hedef kare suresi ~0 -> oyunun 120 fps sinirlayicisi beklemez,
+             * fps = GPU/CPU kapasitesi; oyun zamani sanal saatle kare basina sabit.
+             * Menulerde KULLANMA: on yuz zamanlamasi bozulur, AUTOSEQ kayar. */
+            { const char *lf = ENVC("LIMFREE");
+              if (lf && g_present_no >= (unsigned)atoi(lf) && g_present_no >= 2u && mem_is_committed(0x00865558u))
+                  MRF32(0x00865558u) = 0.0002f; }
             { const char *ff = ENVC("FIXFRAMETIME");
               static int done_ft = 0;
               if (ff && *ff && ff[0] != '0' && !done_ft && g_present_no >= 2u){

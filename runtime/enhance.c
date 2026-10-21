@@ -86,6 +86,7 @@
 
 static int    g_init, g_refl = 1;
 static double g_road = 0.5, g_blur = 0.5;
+static int    g_road_env;                 /* HD_ROAD verildi: otomatik secim yok */
 static uint32_t g_mirror = 1024, g_cube = 512;
 static uint32_t g_hits[4];
 static uint32_t g_last_w[4], g_last_h[4];
@@ -101,15 +102,17 @@ static void enh_init(void){
     g_init = 1;
     const char *e;
     if ((e = getenv("HDREFL"))   && *e == '0') g_refl = 0;
-    if ((e = getenv("HD_ROAD"))   && *e) g_road   = atof(e);
+    if ((e = getenv("HD_ROAD"))   && *e){ g_road = atof(e); g_road_env = 1; }
     if ((e = getenv("HD_MIRROR")) && *e) g_mirror = clampu(atof(e));
     if ((e = getenv("HD_CUBE"))   && *e) g_cube   = clampu(atof(e));
     if ((e = getenv("HD_BLUR"))   && *e) g_blur   = atof(e);
     if (g_blur < 0.0) g_blur = 0.0;
     if (g_blur > 1.0) g_blur = 1.0;
     if (g_road <= 0.0) g_road = 0.5;
-    fprintf(stderr, "[HD] yansima: %s  yol=%.2fx geri tampon  bulaniklik=%.2f  ayna=%u  kup=%u\n",
-            g_refl ? "ACIK" : "KAPALI", g_road, g_blur, g_mirror, g_cube);
+    if (g_road_env) fprintf(stderr, "[HD] yansima: %s  yol=%.2fx geri tampon  bulaniklik=%.2f  ayna=%u  kup=%u\n",
+                            g_refl ? "ACIK" : "KAPALI", g_road, g_blur, g_mirror, g_cube);
+    else fprintf(stderr, "[HD] yansima: %s  yol=%s geri tampon  bulaniklik=%.2f  ayna=%u  kup=%u\n",
+                 g_refl ? "ACIK" : "KAPALI", "otomatik (isin izleme acikken 1/3x, kapaliyken 0.50x)", g_blur, g_mirror, g_cube);
 }
 
 const char *enh_build_name(void){ return "HD"; }
@@ -126,7 +129,16 @@ int enh_rt_size(uint32_t ret, uint32_t bb_w, uint32_t bb_h,
         /* Beklenen boyut degilse (baska bir surum/yama) dokunma. */
         if (*w != 320u || *h != 240u) return ENH_NONE;
         k  = (ret == RET_ROAD) ? 0 : 1; kind = ENH_ROAD;
-        nw = clampu(bb_w * g_road); nh = clampu(bb_h * g_road);
+        /* YOL YANSIMASI OLCEGI: isin izleme acikken oyunun yol yansimasi yalniz
+         * isinin bir seye carpmadigi yerde (gokyuzu, menzil disi) gorunur;
+         * carptigi yerde birlestirme onu G-tamponundaki R0 ile birebir cikarip
+         * RT sonucunu koyar.  Orada 1/3 (3024'te 1008x633, orijinalin 320x240'inin
+         * 3 kati) yeter.  Olculdu (Free Run, sunumsuz kapasite, deterministik):
+         * 5.94 -> 5.72 ms/kare.  Isin izleme kapaliyken (SSR) yansima tum yolda
+         * gorunur: 0.5.  HD_ROAD=<oran> elle. */
+        { int metal_hd_rt_enabled(void);
+          double rs = g_road_env ? g_road : (metal_hd_rt_enabled() ? 1.0 / 3.0 : 0.5);
+          nw = clampu(bb_w * rs); nh = clampu(bb_h * rs); }
         break;
     case RET_MIRROR:
         if (*w != 256u || *h != 256u) return ENH_NONE;

@@ -370,7 +370,13 @@ static long g_gpuw_a = -1, g_gpuw_b = -1;
  *    bir IS olcusu: GPU saati ne olursa olsun karenin tasidigi bayt ayni.
  * Ozel kutuphane oldugu icin calisma aninda dlopen ile. */
 #include <dlfcn.h>
-typedef struct { double j, rd, wr, drd, dwr; } IorS;   /* J ve bayt, ilk cagridan beri */
+#include <mach/mach_time.h>
+/*  - "GPU Stats / GPU Performance States" (GPUPH): P-durumu basina sure.
+ *    Frekans tablosu (pmgr voltage-states9) ile carpinca MESGUL GPU CEVRIMI:
+ *    DVFS'ten bagimsiz is olcusu; en yuksek saate bolunce "o saatte kac ms"
+ *    = 120 fps'i tutup tutamayacagimiz (8.33 ms siniri). */
+typedef struct { double j, rd, wr, drd, dwr, gcy, gact, gtot; } IorS;   /* J, bayt, cevrim, tik; ilk cagridan beri */
+static double g_ior_fmax;                     /* MHz, GPU'nun en yuksek P-durumu (0: tablo yok) */
 static int ior_read(IorS *o){                 /* 1 = gecerli */
     static int st = 0;
     static void *sub; static CFMutableDictionaryRef subch; static CFDictionaryRef s0;
@@ -379,6 +385,9 @@ static int ior_read(IorS *o){                 /* 1 = gecerli */
     static void (*it)(CFDictionaryRef, int (^)(CFDictionaryRef));
     static CFStringRef (*gn)(CFDictionaryRef), (*gu)(CFDictionaryRef);
     static int64_t (*gv)(CFDictionaryRef, int32_t);
+    static int32_t (*sct)(CFDictionaryRef); static CFStringRef (*snm)(CFDictionaryRef, int32_t);
+    static int64_t (*srs)(CFDictionaryRef, int32_t);
+    static double fq[16]; static int nfq; static double tick_mhz = 24.0;
     if (st == 0){
         st = -1;
         void *h = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY);
@@ -400,6 +409,29 @@ static int ior_read(IorS *o){                 /* 1 = gecerli */
         if (!ch) return 0;
         CFMutableDictionaryRef ch2 = cc(CFSTR("AMC Stats"), CFSTR("Perf Counters"), 0, 0, 0);
         if (ch2 && mg) mg(ch, ch2, NULL);
+        sct = (int32_t (*)(CFDictionaryRef))dlsym(h, "IOReportStateGetCount");
+        snm = (CFStringRef (*)(CFDictionaryRef, int32_t))dlsym(h, "IOReportStateGetNameForIndex");
+        srs = (int64_t (*)(CFDictionaryRef, int32_t))dlsym(h, "IOReportStateGetResidency");
+        {   /* GPU P-durumu frekanslari: pmgr "voltage-states9" = (Hz, mV) ciftleri, 0 Hz = KAPALI */
+            unsigned (*gms)(unsigned, CFDictionaryRef) = (unsigned (*)(unsigned, CFDictionaryRef))dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+            CFMutableDictionaryRef (*nmm)(const char *) = (CFMutableDictionaryRef (*)(const char *))dlsym(RTLD_DEFAULT, "IOServiceNameMatching");
+            CFTypeRef (*rcp)(unsigned, CFStringRef, CFAllocatorRef, uint32_t) = (CFTypeRef (*)(unsigned, CFStringRef, CFAllocatorRef, uint32_t))dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
+            int (*orl)(unsigned) = (int (*)(unsigned))dlsym(RTLD_DEFAULT, "IOObjectRelease");
+            unsigned sv = (gms && nmm) ? gms(0, nmm("pmgr")) : 0;
+            CFTypeRef vs = (sv && rcp) ? rcp(sv, CFSTR("voltage-states9"), kCFAllocatorDefault, 0) : NULL;
+            if (vs && CFGetTypeID(vs) == CFDataGetTypeID()){
+                const uint32_t *w = (const uint32_t *)CFDataGetBytePtr((CFDataRef)vs);
+                long nw = CFDataGetLength((CFDataRef)vs) / 4;
+                for (long q = 0; q + 1 < nw && nfq < 16; q += 2) if (w[q]) fq[nfq++] = w[q] / 1e6;
+            }
+            if (vs) CFRelease(vs);
+            if (sv && orl) orl(sv);
+            for (int q = 0; q < nfq; q++) if (fq[q] > g_ior_fmax) g_ior_fmax = fq[q];
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);   /* durum suresi mach tiki */
+            if (tb.numer) tick_mhz = 1e3 * tb.denom / tb.numer;
+        }
+        CFMutableDictionaryRef ch3 = (sct && snm && srs) ? cc(CFSTR("GPU Stats"), CFSTR("GPU Performance States"), 0, 0, 0) : NULL;
+        if (ch3 && mg) mg(ch, ch3, NULL);
         sub = csub(NULL, ch, &subch, 0, NULL);
         if (!sub || !subch) return 0;
         s0 = cs(sub, subch, NULL);
@@ -409,7 +441,7 @@ static int ior_read(IorS *o){                 /* 1 = gecerli */
     if (st < 0) return 0;
     CFDictionaryRef s1 = cs(sub, subch, NULL); if (!s1) return 0;
     CFDictionaryRef dd = cd(s0, s1, NULL); CFRelease(s1); if (!dd) return 0;
-    __block IorS r = { -1, 0, 0, 0, 0 };
+    __block IorS r = { -1, 0, 0, 0, 0, 0, 0, 0 };
     it(dd, ^int(CFDictionaryRef smp){
         CFStringRef n = gn(smp); if (!n) return 0;
         char nm[40]; if (!CFStringGetCString(n, nm, sizeof nm, kCFStringEncodingUTF8)) return 0;
@@ -422,6 +454,15 @@ static int ior_read(IorS *o){                 /* 1 = gecerli */
         else if (!strcmp(nm, "GFX WR"))     r.wr  = (double)gv(smp, 0);
         else if (!strcmp(nm, "GFX DCS RD")) r.drd = (double)gv(smp, 0);
         else if (!strcmp(nm, "GFX DCS WR")) r.dwr = (double)gv(smp, 0);
+        else if (!strcmp(nm, "GPUPH") && sct){
+            int32_t k = sct(smp);
+            for (int32_t q = 0; q < k; q++){
+                double t = (double)srs(smp, q); r.gtot += t;
+                char sn[16] = ""; CFStringRef x = snm(smp, q);
+                if (!x || !CFStringGetCString(x, sn, sizeof sn, kCFStringEncodingUTF8) || sn[0] != 'P') continue;
+                int pi = atoi(sn + 1); r.gact += t;
+                if (pi >= 1 && pi <= nfq) r.gcy += t / tick_mhz * fq[pi - 1];   /* tik / (tik/us) * MHz = cevrim */
+            } }
         return 0; });
     CFRelease(dd);
     *o = r;
@@ -476,7 +517,8 @@ static int abt_frame(long f, int *cnt){
         IorS x; if (g_abt_s0ok && ior_read(&x)){
             IorS *d = &g_abt_d[b - 1];
             d->j = x.j - g_abt_s0.j; d->rd = x.rd - g_abt_s0.rd; d->wr = x.wr - g_abt_s0.wr;
-            d->drd = x.drd - g_abt_s0.drd; d->dwr = x.dwr - g_abt_s0.dwr; g_abt_ok[b - 1] = 1; }
+            d->drd = x.drd - g_abt_s0.drd; d->dwr = x.dwr - g_abt_s0.dwr;
+            d->gcy = x.gcy - g_abt_s0.gcy; d->gact = x.gact - g_abt_s0.gact; d->gtot = x.gtot - g_abt_s0.gtot; g_abt_ok[b - 1] = 1; }
         g_abt_blk = -1; }
     if (f >= g_gpuw_b || (b + 1) * g_abt_n > g_gpuw_b - g_gpuw_a) return -1;   /* yarim dilim: A/B disi */
     if (k == g_abt_skip){ g_abt_s0ok = ior_read(&g_abt_s0); g_abt_blk = b; }
@@ -484,19 +526,21 @@ static int abt_frame(long f, int *cnt){
     *cnt = k >= g_abt_skip;
     return g_abt_cur_off;
 }
-/* olcu q (0 enerji mJ, 1 GPU okuma MB, 2 GPU yazma MB, 3 DRAM okuma MB, 4 DRAM yazma MB) kare basina */
+/* olcu q (0 enerji mJ, 1 GPU okuma MB, 2 GPU yazma MB, 3 DRAM okuma MB, 4 DRAM yazma MB,
+ * 5 mesgul GPU Mcevrim) kare basina */
 static double abt_val(long b, int q){
     double fr = (double)(g_abt_n - g_abt_skip); const IorS *d = &g_abt_d[b];
-    double v = q == 0 ? d->j * 1e3 : q == 1 ? d->rd / 1e6 : q == 2 ? d->wr / 1e6 : q == 3 ? d->drd / 1e6 : d->dwr / 1e6;
+    double v = q == 0 ? d->j * 1e3 : q == 1 ? d->rd / 1e6 : q == 2 ? d->wr / 1e6 : q == 3 ? d->drd / 1e6
+             : q == 4 ? d->dwr / 1e6 : d->gcy / 1e6;
     return v / fr;
 }
 static void abt_report(void){
     if (!g_abt_name || g_gpuw_a < 0) return;
-    static const char *qn[5] = { "GPU enerjisi   mJ/kare", "GPU okuma      MB/kare", "GPU yazma      MB/kare",
-                                 "DRAM okuma     MB/kare", "DRAM yazma     MB/kare" };
+    static const char *qn[6] = { "GPU enerjisi   mJ/kare", "GPU okuma      MB/kare", "GPU yazma      MB/kare",
+                                 "DRAM okuma     MB/kare", "DRAM yazma     MB/kare", "GPU mesgul Mcevrim/kare" };
     long nb = (g_gpuw_b - g_gpuw_a) / g_abt_n; if (nb > ABT_MAXB) nb = ABT_MAXB;
     fprintf(stderr, "ABTEST %s (%ld dilim x %d kare, komsu ciftler ACIK-KAPALI):\n", g_abt_name, nb, g_abt_n);
-    for (int q = 0; q < 5; q++){
+    for (int q = 0; q < 6; q++){
         double sa[2] = {0, 0}, sd = 0, sdd = 0; int na[2] = {0, 0}, np = 0;
         for (long b = 0; b < nb; b++) if (g_abt_ok[b]){ sa[b & 1] += abt_val(b, q); na[b & 1]++; }
         for (long b = 0; b + 1 < nb; b += 2) if (g_abt_ok[b] && g_abt_ok[b + 1]){
@@ -551,6 +595,8 @@ static double g_pp_cb_s;                      /* ayni karelerin komut tamponu GP
 static MTLTimestamp g_pp_c0, g_pp_g0;
 static id<MTLCounterSampleBuffer> g_pp_sb;    /* bu kare (yalniz kodlama thread'i) */
 static int g_pp_np; static uint8_t g_pp_pc[PP_MAXP], g_pp_pk[PP_MAXP];
+static long g_pp_fno;                         /* profillenen karenin numarasi */
+static FILE *g_pp_csv;                        /* PASSPROF_CSV=<yol>: kare,gecis,kose_ms,parca_ms */
 static int pp_cat(const char *name){
     for (int i = 0; i < g_pp_ncat; i++) if (!strcmp(g_pp_cat[i].name, name)) return i;
     if (g_pp_ncat >= PP_MAXC) return PP_MAXC - 1;
@@ -572,6 +618,9 @@ static void pp_begin(long fno){
         }
     }
     if (g_pp_every <= 0 || !gpuw_in(fno) || fno % g_pp_every) return;
+    g_pp_fno = fno;
+    { static int o = 0; if (!o){ o = 1; const char *cp = ENVC("PASSPROF_CSV");
+        if (cp && *cp){ g_pp_csv = fopen(cp, "w"); if (g_pp_csv) fprintf(g_pp_csv, "kare,gecis,kose_ms,parca_ms\n"); } } }
     MTLCounterSampleBufferDescriptor *sd = [MTLCounterSampleBufferDescriptor new];
     sd.counterSet = g_pp_set; sd.storageMode = MTLStorageModeShared; sd.sampleCount = PP_MAXP * 4;
     NSError *er = nil;
@@ -627,6 +676,7 @@ static void pp_end(id<MTLCommandBuffer> cb){
       if (!once){ once = 1; fprintf(stderr, "  --- gecis sirasi (ilk profilli kare) ---\n");
           for (int k = 0; k < np; k++) fprintf(stderr, "  [sira %2d] %s\n", k, g_pp_cat[g_pp_pc[k]].name); } }
     uint8_t *pc = malloc((size_t)np * 2); memcpy(pc, g_pp_pc, (size_t)np); memcpy(pc + np, g_pp_pk, (size_t)np);
+    long pfno = g_pp_fno;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b2){
         NSData *dt = [sb resolveCounterRange:NSMakeRange(0, (NSUInteger)np * 4)];
         if (dt && dt.length >= (NSUInteger)np * 4 * sizeof(MTLCounterResultTimestamp)){
@@ -635,9 +685,11 @@ static void pp_end(id<MTLCommandBuffer> cb){
             for (int k = 0; k < np; k++){
                 uint64_t a = t[k*4].timestamp, b = t[k*4+1].timestamp, c = t[k*4+2].timestamp, d2 = t[k*4+3].timestamp;
                 int ci = pc[k];
-                if (a != MTLCounterErrorValue && b != MTLCounterErrorValue && b >= a) g_pp_cat[ci].v += (double)(b - a);
-                if (!pc[np + k] && c != MTLCounterErrorValue && d2 != MTLCounterErrorValue && d2 >= c) g_pp_cat[ci].f += (double)(d2 - c);
+                double kv = 0, kf = 0;
+                if (a != MTLCounterErrorValue && b != MTLCounterErrorValue && b >= a){ kv = (double)(b - a); g_pp_cat[ci].v += kv; }
+                if (!pc[np + k] && c != MTLCounterErrorValue && d2 != MTLCounterErrorValue && d2 >= c){ kf = (double)(d2 - c); g_pp_cat[ci].f += kf; }
                 g_pp_cat[ci].n++;
+                if (g_pp_csv) fprintf(g_pp_csv, "%ld,%s,%.4f,%.4f\n", pfno, g_pp_cat[ci].name, kv / 1e6, kf / 1e6);   /* ~ns (olcek 1.0) */
             }
             g_pp_frames++; g_pp_cb_s += b2.GPUEndTime - b2.GPUStartTime;
             pthread_mutex_unlock(&g_pp_lock);
@@ -1497,6 +1549,8 @@ void metal_hd_vs_info(int gid, int po, int pty, int cx, int skinned, int fogr, i
     g_hd_vsi[gid].fogr = (int16_t)fogr;
     g_hd_vsi[gid].litr = (int16_t)litr; g_hd_vsi[gid].ramp[0] = ramp0; g_hd_vsi[gid].ramp[1] = ramp1;
     g_hd_vsi[gid].ok = 1;
+    if (ENVC("HD_VSINFO")) fprintf(stderr, "[HD] vs_%d: konum ofs %d tur %d, matris c%d, kemikli %d, sis c%d, isik c%d\n",
+                                   gid, po, pty, cx, skinned, fogr, litr);
 }
 static NSString *kRTSrc = @
 "#include <metal_stdlib>\n"
@@ -1717,7 +1771,9 @@ static void hd_rt_probe(int rb, id<MTLTexture> ref, long frame){
  *      Isabet yoksa oyunun kendi yansimasi (R0) kalir.
  * Malzeme dokulari bagimsiz tablo (arguman tamponu) ile ornekleniyor.   */
 #define RT_MAXV   (600u * 1024u)     /* anlik yakalama: kose */
+/* Sabit depo iki parca: TEMEL + YENI (bkz. SABIT DEPO: TEMEL + YENI). */
 #define RT_SMAXV  (480u * 1024u)     /* sabit depo: kose */
+#define RT_RMAXV  (96u * 1024u)      /* yeni bolge: son birlesmeden beri terfiler (32 bin ucgen) */
 #define RT_SMAXE  8192u              /* sabit malzeme */
 #define RT_MAXREC 8192u
 #define RT_MAXTEX 512u
@@ -1734,6 +1790,22 @@ static id<MTLBuffer> g_rt_pos, g_rt_attr, g_rt_scratch, g_rt_item[3], g_rt_rec[3
  * kesri).  Hareket agaci zamanla gevsettigi icin her RT_REFIT_MAX karede
  * bir yine bastan kurulur.  HD_RT_REFIT=0 eski davranis. */
 #define RT_REFIT_MAX 20u
+/* KONUM DENETIMI: imza (VS, ucgen sayisi, doku, geometri kimligi, yer) ayni
+ * ama ayni modelin baska KOPYALARI (palmiye, direk, ayni model araba) baska
+ * sirayla cizildiyse ucgen i bu karede baska bir yerdedir: refit agaci
+ * korur, kutular sahnenin yarisini kaplar.  Olculdu (Free Run, ust gecit
+ * alti): isin cekirdegi tam cozunurlukte 1.5 -> 15-21 ms, HD_RT_REFIT=0 ile
+ * 1.6 ms.  Simdi her cizimin dunya konumu (VS matrisinden oteleme) son tam
+ * kurulumdakiyle karsilastirilir; RT_REFIT_MOVE birimden (~bir araba boyu)
+ * fazla kayan varsa bastan kurulur: yer degistiren kopya aninda, hizli araba
+ * ~10 karede bir (Free Run: Mcevrim 10 birim 9.84, 1 birim 9.79, refitsiz
+ * 10.09 -- refit kazanci ~%3, esik farki olcu gurultusunde).
+ * HD_RT_REFIT_MOVE=<birim>. */
+#define RT_REFIT_MOVE 4.f
+static float g_rt_dp[MAXD][3]; static uint8_t g_rt_dpok[MAXD];      /* bu karenin cizimleri: oteleme */
+static float g_rt_bpos[RT_MAXREC][3]; static uint8_t g_rt_bpok[RT_MAXREC]; static unsigned g_rt_bn;  /* son tam kurulum */
+static _Atomic unsigned long long g_rt_nmoved;  /* imza ayni, konum kaydi: bastan kurulum */
+static int g_hd_dump_now;                       /* (asagida) bu kare DUMPFRAME ile secildi */
 static uint64_t g_rt_dsig;                      /* son kurulan/uydurulan duzenin imzasi */
 static uint32_t g_rt_dsince = 0xFFFFFFFFu;      /* son tam kurulumdan beri kare */
 static _Atomic unsigned long long g_rt_nbuild, g_rt_nrefit;
@@ -1745,14 +1817,68 @@ static int hd_rt_refit_on(void){
 static MTLAccelerationStructureUsage hd_rt_dyn_usage(void){
     return MTLAccelerationStructureUsagePreferFastBuild | (hd_rt_refit_on() ? MTLAccelerationStructureUsageRefit : 0);
 }
-static id<MTLBuffer> g_rt_sposb[2], g_rt_sattrb[2], g_rt_sscratch, g_rt_tscratch, g_rt_inst;
-static unsigned g_rt_sbuf;           /* etkin sabit tampon cifti (sikistirmada degisir) */
-#define g_rt_spos  g_rt_sposb[g_rt_sbuf]
-#define g_rt_sattr g_rt_sattrb[g_rt_sbuf]
-static id<MTLAccelerationStructure> g_rt_as, g_rt_sas, g_rt_tlas;
+/* Sabit parcalar: hizli kurulum + refit (atilanlar refit ile duser).  HD_RT_SQ=1:
+ * kaliteli kurulum (kurulum ~2x pahali; isin gecisi olculdu, fark yok). */
+static MTLAccelerationStructureUsage hd_rt_part_usage(void){
+    static int q = -1;
+    if (q < 0){ const char *e = ENVC("HD_RT_SQ"); q = (e && *e == '1') ? 1 : 0; }
+    return (q ? MTLAccelerationStructureUsageNone : MTLAccelerationStructureUsagePreferFastBuild)
+           | MTLAccelerationStructureUsageRefit;
+}
+/* ---- SABIT DEPO: MEKANSAL GRUPLAR + YENI -----------------------------------
+ * Gecmis: sabit depo tek alt yapiydi ve her 30 karede bir BASTAN kaliteli
+ * kuruluyordu (uzun oturumda ~10 ms, 30 karede bir kare kaciyordu).  8 esit
+ * zaman sirali yuva sicramayi kaldirdi ama yuvalar ayni bolgede ust uste
+ * biniyordu (isin cekirdegi +%48; kullanici oturumunda 12 ms ustu kare
+ * %1.5 -> %5.1).  TEMEL + YENI cekirdegi geri getirdi ama temel (~130 bin
+ * ucgen) her birlesmede (serbest surusta ~10 sn'de bir) tek seferde
+ * kuruluyordu: o karede GPU +5 ms (olculdu, 15 birlesmenin hepsinde 12-13 ms
+ * kare).  Simdi:
+ *  - Depo IKI YARI (ping-pong).  Etkin yarida: GRUPLAR [0, yeni.lo) + YENI.
+ *  - GRUPLAR: canli girdiler merkezlerine gore en fazla RT_NG uzaysal gruba
+ *    bolunur (en buyuk grup en uzun ekseninde ucgen agirlikli ortancadan),
+ *    hedef ~RT_GTRI ucgen.  Gruplar uzayda ayrik: isin cogunlukla tek grubun
+ *    agacinda gezer, zaman sirali yuvalardaki ust uste binme yok.
+ *  - BIRLESME (yeni bolge dolunca): canlilar GPU'da obur yariya grup grup
+ *    dizilir (hd_rt_gather), yeni gruplarin yapilari KARE BASINA BIRER
+ *    kurulur (~16 bin ucgen, hizli kip, sahneyle ust uste), hepsi bitince
+ *    tek karede degisim: gruplar + bos yeni bolge.  Birlesme suresince
+ *    terfi ve atma bekler (geometri anlik yakalamada kalir), eski gruplar
+ *    ust yapida kalir; eski yari bir sonraki birlesmeye dek dokunulmaz
+ *    (ucustaki kareler okuyabilir; birlesmeler arasi >= 4 kare).
+ *  - Atilan girdinin ucgenleri ilk kosesine cokertilir, grubu refit edilir
+ *    (karede en fazla bir grup, grup basina RT_BREFIT karede bir); malzeme
+ *    yuvasi o parcanin refit / kurulumu kodlaninca serbest.
+ *  - Depo dolu: birlesmede en ESKI (dogum karesi) girdiler birakilir.
+ * Ust yapi = anlik + gruplar + yeni; cekirdek isabetin parcasini ornek
+ * tablosundan (IB: ornek -> depodaki mutlak taban) bilir. */
+#define RT_BREFIT 15u
+#define RT_NG     12u                    /* en fazla grup */
+#define RT_GTRI   16384u                 /* hedef grup boyu, ucgen (HD_RT_GTRI) */
+#define RT_NINST  (2u + RT_NG)           /* anlik + gruplar + yeni */
+static unsigned rt_gtri(void);
+typedef struct {
+    id<MTLAccelerationStructure> as; id<MTLBuffer> scratch;
+    uint32_t lo, built;                  /* depo kose indisi (mutlak); yapidaki kose sayisi */
+    uint32_t built_frame, refit_frame;
+    uint8_t  dirty, refit;
+} RTPart;
+static RTPart g_rt_recent;
+static RTPart g_rt_grp[RT_NG], g_rt_ngrp[RT_NG];          /* etkin gruplar; birlesmede kurulanlar */
+static unsigned g_rt_ng, g_rt_nng, g_rt_mnext;
+static uint32_t g_rt_half, g_rt_scur, g_rt_sdead;          /* etkin yari; kullanilan (mutlak), olu */
+static int g_rt_mstate;                                     /* 1: birlesme suruyor */
+static uint32_t g_rt_mgen, g_rt_mend, g_rt_lastsw;
+static id<MTLBuffer> g_rt_gscr_b, g_rt_gscr_r; static NSUInteger g_rt_gscr_len;   /* grup kurulum / refit karalamasi */
+static id<MTLBuffer> g_rt_spos, g_rt_sattr, g_rt_tscratch, g_rt_inst[3];
+static id<MTLComputePipelineState> g_rt_colk, g_rt_gatk;   /* atilan girdiyi cokertme; birlesme kopyasi */
+static uint32_t g_rt_ib[RT_NINST]; static unsigned g_rt_nib;   /* ornek -> depo tabani (anlik: ~0) */
+static id<MTLAccelerationStructure> g_rt_tl[RT_NINST]; static unsigned g_rt_tln;   /* ust yapidakiler (useResource) */
+static _Atomic unsigned long long g_rt_srefits, g_rt_sdrop, g_rt_merges;
+static id<MTLAccelerationStructure> g_rt_as, g_rt_tlas;
 static int g_rt_cache = 1, g_rt_only_static;
 static id<MTLRenderPipelineState> g_rt_pso, g_rt_pso_ms;
-static id<MTLComputePipelineState> g_rt_kern;
+static id<MTLComputePipelineState> g_rt_kern, g_rt_kern2;   /* 2: RT_V2 degiskeni */
 static id<MTLTexture> g_rt_out;
 static id<MTLArgumentEncoder> g_rt_argenc;
 static unsigned g_rt_ring;
@@ -1767,10 +1893,14 @@ static int hd_rt_on(void){
         fprintf(stderr, "[HD] isin izlemeli yansima: %s\n", g_rt ? "ACIK" : "KAPALI"); }
     return g_rt;
 }
+int metal_hd_rt_enabled(void){ return g_dev ? hd_rt_on() : 0; }   /* enhance.c: yol yansimasi olcegi */
 static id<MTLComputePipelineState> g_rt_fixk;   /* kose denetimi (HD_RT_FIX=0 kapatir) */
 static id<MTLBuffer> g_rt_fixcnt;               /* [0] NaN/sonsuz ucgen, [1] cok uzak ucgen (toplam) */
 static NSString *kRTFSrc = @
 "#include <metal_stdlib>\n"
+"#ifndef RT_V2\n"
+"#define RT_V2 0\n"
+"#endif\n"
 "using namespace metal;\n"
 "using namespace raytracing;\n"
 "struct FSO { float4 pos [[position]]; };\n"
@@ -1778,7 +1908,7 @@ static NSString *kRTFSrc = @
 "  float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
 "  FSO o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o; }\n"
 "struct SSRP { float4x4 vp; float4x4 ivp; float4 cam; float4 prm; float4 sz; float4 cam2;\n"
-"              float4 cb0; float4 cb1; float4 cb2; float4 fogp; };\n"
+"              float4 cb0; float4 cb1; float4 cb2; float4 fogp; float4 rt2; };\n"
 "struct HDMat { uint tex0; uint tex1; uint tex2; uint flags; float4 c0; float4 fogc; float4 prm;\n"
 "               float4 l0; float4 l1; float4 l2; float4 l3; };\n"
 "struct HDAttr { float4 col0; float4 uv1; float4 uv2; float2 uv0; float fog; float pad; };\n"
@@ -1790,11 +1920,11 @@ static NSString *kRTFSrc = @
  * olculdu: GPU ~14 ms/kare (oyun GPU'ya takildi, ~74 fps); cekirdekte ~2 ms. */
 "kernel void hd_rt_kern(uint2 tid0 [[thread_position_in_grid]],\n"
 "    texture2d<float, access::write> outp [[texture(0)]], depth2d<float> dep [[texture(1)]],\n"
-"    texture2d<float> g1 [[texture(2)]], texture2d<float> g3 [[texture(4)]],\n"
+"    texture2d<float> g1 [[texture(2)]], texture2d<float> g2 [[texture(3)]], texture2d<float> g3 [[texture(4)]],\n"
 "    constant SSRP &S [[buffer(0)]], instance_acceleration_structure acc [[buffer(1)]],\n"
 "    device const HDMat *MAT [[buffer(3)]],\n"
 "    device const HDAttr *ATT [[buffer(4)]], constant HDTex &TX [[buffer(6)]],\n"
-"    device const HDAttr *SATT [[buffer(7)]]) {\n"
+"    device const HDAttr *SATT [[buffer(7)]], constant uint *IB [[buffer(8)]]) {\n"
 /* S.cb2.w = 0 tam; 1/2 = satranc tahtasinin o karedeki yarisi (bkz. YARIM ISIN) */
 "  uint par = uint(S.cb2.w + 0.5);\n"
 "  uint2 tid = par == 0u ? tid0 : uint2(tid0.x * 2u + ((tid0.y + par) & 1u), tid0.y);\n"
@@ -1808,9 +1938,19 @@ static NSString *kRTFSrc = @
 "  bool car  = GB_CAR(cls);\n"
 "  float d = dep.read(px);\n"
 "  if ((!road && !car) || d >= 1.0) { outp.write(float4(0.0), tid); return; }\n"
+/* AGIRLIK ESIGI (bkz. hd_composite): birlestirme pikseli B*(R_yeni - R0) kadar
+ * degistirir; oyunun yansima agirligi B esigin altindaysa isin gorunmez */
+"  if (S.rt2.z > 0.0) { float3 bw = GB_B(gb, g2.read(px));\n"
+"    if (max(bw.r, max(bw.g, bw.b)) < S.rt2.z) { outp.write(float4(0.0), tid); return; } }\n"
 "  float2 uv = (float2(px) + 0.5) / S.sz.xy;\n"
 "  float4 wp = S.ivp * float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);\n"
 "  float3 P = wp.xyz / wp.w;\n"
+/* MESAFE SINIRI (bkz. hd_composite): uzaktaki yuzeyde isin yok, oyunun kendi
+ * yansimasi (R0) kalir; sinirdan once yumusak gecis */
+"  float rfade = 1.0;\n"
+"  if (S.rt2.x > 0.0) { float dc = length(P - S.cam.xyz);\n"
+"    if (dc >= S.rt2.x) { outp.write(float4(0.0), tid); return; }\n"
+"    rfade = 1.0 - smoothstep(S.rt2.x * S.rt2.y, S.rt2.x, dc); }\n"
 "  float3 V = normalize(P - S.cam.xyz);\n"
 "  float3 Rd, N = float3(0.0, 0.0, 1.0);\n"
 "  if (road) { Rd = reflect(V, N); if (Rd.z <= 0.0) { outp.write(float4(0.0), tid); return; } }\n"
@@ -1829,13 +1969,20 @@ static NSString *kRTFSrc = @
 "  intersector<triangle_data, instancing> isec;\n"
 "  isec.assume_geometry_type(geometry_type::triangle);\n"
 "  isec.force_opacity(forced_opacity::opaque);\n"
+/* RT_V2 (bkz. hd_rt_init): ornek donusumleri birim (anlik/temel/yeni hep
+ * ozdes) -> izleme isini ornek uzayina cevirmeyi atlar */
+"#if RT_V2\n"
+"  isec.assume_identity_transforms(true);\n"
+"#endif\n"
 "  for (int k = 0; k < 5; k++) {\n"
 "    ray r; r.origin = org; r.direction = Rd; r.min_distance = 0.01; r.max_distance = maxd - tot;\n"
 "    intersection_result<triangle_data, instancing> h = isec.intersect(r, acc);\n"
 "    if (h.type == intersection_type::none) break;\n"
-"    uint g0 = h.primitive_id * 3u;\n"
-/* ornek 0 = anlik yakalama (maske 1), ornek 1 = sabit depo (maske 2; S.cb1.w: yalnizca sabit var) */
-"    bool st = h.instance_id == 1u || S.cb1.w > 0.5;\n"
+/* ornek tablosu (bkz. SABIT DEPO YUVALARI): ~0 = anlik yakalama, aksi halde
+ * yuvanin depodaki ilk kosesi; ucgen numarasi yuvanin icinde */
+"    uint ib = IB[h.instance_id];\n"
+"    bool st = ib != 0xFFFFFFFFu;\n"
+"    uint g0 = (st ? ib : 0u) + h.primitive_id * 3u;\n"
 "    tot += h.distance;\n"
 "    if (S.cam2.w > 1.5) { rc = float3(1.0 / (1.0 + 0.02 * tot)); conf = 1.0; break; }\n"
 "    float2 b = h.triangle_barycentric_coord; float w0 = 1.0 - b.x - b.y;\n"
@@ -1882,7 +2029,7 @@ static NSString *kRTFSrc = @
 "    rc = rgb; conf = 1.0 - smoothstep(0.85, 1.0, tot / maxd);\n"
 "    break;\n"
 "  }\n"
-"  outp.write(float4(rc, conf), tid);\n"
+"  outp.write(float4(rc, conf * rfade), tid);\n"
 "}\n"
 /* KOSE DENETIMI: yakalanan ucgenlerde NaN / sonsuz / akil disi uzak kose
  * varsa ucgeni dejenere et.  TEK bir NaN'li ucgen ivme yapisinin kutularini
@@ -1906,6 +2053,26 @@ static NSString *kRTFSrc = @
 "    atomic_fetch_add_explicit(&CNT[nan ? 0 : 1], 1u, memory_order_relaxed);\n"
 "    atomic_fetch_add_explicit(&CNT[2u + F.slot * 2u + (nan ? 0u : 1u)], 1u, memory_order_relaxed);\n"
 "  }\n"
+"}\n"
+/* ATMA: girdinin ucgenlerini kendi ilk kosesine cokert -- alan 0 (isin
+ * carpmaz), yuvanin kutulari yerinde kalir; ardindan yuva refit edilir. */
+/* BIRLESME KOPYASI: obek (kaynak, hedef, adet <= 256) basina bir is grubu;
+ * konum (12 bayt) + nitelik (64 bayt) obur yariya */
+"struct HDGat { uint src; uint dst; uint n; };\n"
+"kernel void hd_rt_gather(uint tid [[thread_position_in_grid]], device packed_float3 *P [[buffer(0)]],\n"
+"    device float4 *A [[buffer(1)]], device const HDGat *G [[buffer(2)]], constant uint &NG [[buffer(3)]]) {\n"
+"  uint c = tid >> 8u, i = tid & 255u;\n"
+"  if (c >= NG || i >= G[c].n) return;\n"
+"  uint s = G[c].src + i, d = G[c].dst + i;\n"
+"  P[d] = P[s];\n"
+"  for (uint k = 0u; k < 4u; k++) A[d * 4u + k] = A[s * 4u + k];\n"
+"}\n"
+"struct HDCol { uint first; uint n; };\n"
+"kernel void hd_rt_collapse(uint tid [[thread_position_in_grid]], device packed_float3 *P [[buffer(0)]],\n"
+"    constant HDCol *R [[buffer(1)]], constant uint &NR [[buffer(2)]]) {\n"
+"  if (tid >= NR) return;\n"
+"  uint f = R[tid].first; float3 p = P[f];\n"
+"  for (uint i = 1u; i < R[tid].n; i++) P[f + i] = p;\n"
 "}\n"
 /* birlestirme: renk + B * (R_yeni - R0) */
 "static float4 rtc(uint2 px, float4 c, depth2d<float> dep, texture2d<float> g1,\n"
@@ -1976,6 +2143,16 @@ static void hd_rt_init(void){
     id<MTLFunction> ff = [lib newFunctionWithName:@"hd_rtc_frag"];
     id<MTLFunction> kf = [lib newFunctionWithName:@"hd_rt_kern"];
     g_rt_kern = [g_dev newComputePipelineStateWithFunction:kf error:&e];
+    /* Cekirdek DEGISKENI (RT_V2, tani): ayni kaynak + assume_identity_transforms.
+     * Olculdu 2026-10-20 (HD_RTPROBE2, ayni veri, 7 kare): fark yok (+-%2).
+     * HD_RT_V2=1 ile derlenir; ABTEST=RTV2 ayni kosuda karsilastirir. */
+    { const char *ev = ENVC("HD_RT_V2");
+      if (ev && *ev == '1'){
+          NSError *e2 = nil;
+          id<MTLLibrary> l2 = [g_dev newLibraryWithSource:[@"#define RT_V2 1\n" stringByAppendingString:hd_gb_src(kRTFSrc)] options:nil error:&e2];
+          id<MTLFunction> k2 = l2 ? [l2 newFunctionWithName:@"hd_rt_kern"] : nil;
+          if (k2) g_rt_kern2 = [g_dev newComputePipelineStateWithFunction:k2 error:&e2];
+          if (!g_rt_kern2) fprintf(stderr, "[HD] RT cekirdek degiskeni kurulamadi: %s\n", e2 ? [[e2 localizedDescription] UTF8String] : "?"); } }
     { id<MTLFunction> xf = [lib newFunctionWithName:@"hd_rt_fix"];
       if (xf) g_rt_fixk = [g_dev newComputePipelineStateWithFunction:xf error:&e];
       g_rt_fixcnt = [g_dev newBufferWithLength:(2 + 2 * HD_MAXVSI) * 4 options:MTLResourceStorageModeShared];
@@ -1997,51 +2174,61 @@ static void hd_rt_init(void){
     g_rt_argenc = [kf newArgumentEncoderWithBufferIndex:6];
     g_rt_pos   = [g_dev newBufferWithLength:RT_MAXV * 12 options:MTLResourceStorageModePrivate];
     g_rt_attr  = [g_dev newBufferWithLength:RT_MAXV * 64 options:MTLResourceStorageModePrivate];
-    for (int i = 0; i < 2; i++){
-        g_rt_sposb[i]  = [g_dev newBufferWithLength:RT_SMAXV * 12 options:MTLResourceStorageModePrivate];
-        g_rt_sattrb[i] = [g_dev newBufferWithLength:RT_SMAXV * 64 options:MTLResourceStorageModePrivate];
-    }
+    g_rt_spos  = [g_dev newBufferWithLength:2u * RT_SMAXV * 12 options:MTLResourceStorageModePrivate];   /* iki yari */
+    g_rt_sattr = [g_dev newBufferWithLength:2u * RT_SMAXV * 64 options:MTLResourceStorageModePrivate];
+    { id<MTLFunction> cf = [lib newFunctionWithName:@"hd_rt_collapse"];
+      if (cf) g_rt_colk = [g_dev newComputePipelineStateWithFunction:cf error:&e];
+      id<MTLFunction> gf = [lib newFunctionWithName:@"hd_rt_gather"];
+      if (gf) g_rt_gatk = [g_dev newComputePipelineStateWithFunction:gf error:&e];
+      if (!g_rt_colk || !g_rt_gatk){ fprintf(stderr, "[HD] RT depo cekirdekleri kurulamadi\n"); g_rt = 0; return; } }
     for (int i = 0; i < 3; i++){
         g_rt_item[i] = [g_dev newBufferWithLength:RT_MAXV * 4 options:MTLResourceStorageModeShared];
         g_rt_rec[i]  = [g_dev newBufferWithLength:RT_MAXREC * sizeof(HDRecC) options:MTLResourceStorageModeShared];
         g_rt_mat[i]  = [g_dev newBufferWithLength:(RT_SMAXE + RT_MAXREC) * sizeof(HDMatC) options:MTLResourceStorageModeShared];
         g_rt_arg[i]  = [g_dev newBufferWithLength:g_rt_argenc.encodedLength options:MTLResourceStorageModeShared];
+        g_rt_inst[i] = [g_dev newBufferWithLength:RT_NINST * sizeof(MTLAccelerationStructureInstanceDescriptor)
+                                          options:MTLResourceStorageModeShared];
     }
-    /* alt yapilar ve karalama tamponlari en buyuk boyuta gore bir kez ayrilir */
-    for (int k = 0; k < 2; k++){
+    /* alt yapilar ve karalama tamponlari en buyuk boyuta gore bir kez ayrilir;
+     * her birinin kendi karalamasi var: ayni kodlayicidaki kurulumlar ust uste
+     * calisabilsin (ortak karalama yarisirdi) */
+    for (int k = 0; k < 2; k++){                  /* 0 anlik, 1 yeni (gruplar birlesmede tam boyla) */
         MTLAccelerationStructureTriangleGeometryDescriptor *gd =
             [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
         gd.vertexBuffer = k ? g_rt_spos : g_rt_pos; gd.vertexStride = 12;
-        gd.triangleCount = (k ? RT_SMAXV : RT_MAXV) / 3; gd.opaque = YES;
+        gd.triangleCount = (k == 0 ? RT_MAXV : RT_RMAXV) / 3; gd.opaque = YES;
         MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
         ad.geometryDescriptors = @[gd];
-        ad.usage = k ? MTLAccelerationStructureUsageNone : hd_rt_dyn_usage();
+        ad.usage = k ? hd_rt_part_usage() : hd_rt_dyn_usage();
         MTLAccelerationStructureSizes sz = [g_dev accelerationStructureSizesWithDescriptor:ad];
         id<MTLAccelerationStructure> a = [g_dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
         NSUInteger scs = sz.buildScratchBufferSize > sz.refitScratchBufferSize ? sz.buildScratchBufferSize : sz.refitScratchBufferSize;
         id<MTLBuffer> sc = [g_dev newBufferWithLength:scs options:MTLResourceStorageModePrivate];
-        if (k){ g_rt_sas = a; g_rt_sscratch = sc; } else { g_rt_as = a; g_rt_scratch = sc; }
+        if (k == 0){ g_rt_as = a; g_rt_scratch = sc; }
+        else { g_rt_recent.as = a; g_rt_recent.scratch = sc; }
     }
-    g_rt_inst = [g_dev newBufferWithLength:2 * sizeof(MTLAccelerationStructureInstanceDescriptor)
-                                   options:MTLResourceStorageModeShared];
-    { MTLAccelerationStructureInstanceDescriptor *id2 = (MTLAccelerationStructureInstanceDescriptor *)[g_rt_inst contents];
-      memset(id2, 0, 2 * sizeof *id2);
-      for (int k = 0; k < 2; k++){
-          id2[k].transformationMatrix.columns[0] = MTLPackedFloat3Make(1, 0, 0);
-          id2[k].transformationMatrix.columns[1] = MTLPackedFloat3Make(0, 1, 0);
-          id2[k].transformationMatrix.columns[2] = MTLPackedFloat3Make(0, 0, 1);
-          id2[k].transformationMatrix.columns[3] = MTLPackedFloat3Make(0, 0, 0);
-          id2[k].options = MTLAccelerationStructureInstanceOptionOpaque;
-          id2[k].mask = 0xFF; id2[k].accelerationStructureIndex = (uint32_t)k; } }
+    for (int i = 0; i < 3; i++){
+        MTLAccelerationStructureInstanceDescriptor *id2 = (MTLAccelerationStructureInstanceDescriptor *)[g_rt_inst[i] contents];
+        memset(id2, 0, RT_NINST * sizeof *id2);
+        for (unsigned k = 0; k < RT_NINST; k++){
+            id2[k].transformationMatrix.columns[0] = MTLPackedFloat3Make(1, 0, 0);
+            id2[k].transformationMatrix.columns[1] = MTLPackedFloat3Make(0, 1, 0);
+            id2[k].transformationMatrix.columns[2] = MTLPackedFloat3Make(0, 0, 1);
+            id2[k].transformationMatrix.columns[3] = MTLPackedFloat3Make(0, 0, 0);
+            id2[k].options = MTLAccelerationStructureInstanceOptionOpaque;
+            id2[k].mask = 0xFF; id2[k].accelerationStructureIndex = k; } }
     { MTLInstanceAccelerationStructureDescriptor *td = [MTLInstanceAccelerationStructureDescriptor descriptor];
-      td.instancedAccelerationStructures = @[g_rt_as, g_rt_sas];
-      td.instanceCount = 2; td.instanceDescriptorBuffer = g_rt_inst;
+      td.instancedAccelerationStructures = @[g_rt_as, g_rt_recent.as];
+      td.instanceCount = RT_NINST; td.instanceDescriptorBuffer = g_rt_inst[0];
       MTLAccelerationStructureSizes sz = [g_dev accelerationStructureSizesWithDescriptor:td];
       g_rt_tlas = [g_dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
-      g_rt_tscratch = [g_dev newBufferWithLength:sz.buildScratchBufferSize options:MTLResourceStorageModePrivate]; }
+      g_rt_tscratch = [g_dev newBufferWithLength:sz.buildScratchBufferSize ? sz.buildScratchBufferSize : 16
+                                         options:MTLResourceStorageModePrivate]; }
     { const char *e2 = ENVC("HD_RT_CACHE"); g_rt_cache = (e2 && *e2 == '0') ? 0 : 1; }
-    fprintf(stderr, "[HD] RT hazir: anlik en fazla %u ucgen, sabit depo en fazla %u ucgen, onbellek %s\n",
-            RT_MAXV / 3, RT_SMAXV / 3, g_rt_cache ? "ACIK" : "KAPALI");
+    fprintf(stderr, "[HD] RT hazir: anlik en fazla %u ucgen, sabit depo 2 x %u ucgen (en fazla %u mekansal grup x ~%u ucgen + yeni bolge %u, %s kurulum), onbellek %s\n",
+            RT_MAXV / 3, RT_SMAXV / 3, RT_NG, rt_gtri(), RT_RMAXV / 3,
+            (hd_rt_part_usage() & MTLAccelerationStructureUsagePreferFastBuild) ? "hizli" : "kaliteli",
+            g_rt_cache ? "ACIK" : "KAPALI");
 }
 static unsigned hd_rt_slot(unsigned tex, unsigned *nt){
     if (!tex || tex >= MAXTEX || !g_tex[tex] || g_tex_cube[tex] ||
@@ -2067,17 +2254,16 @@ static unsigned hd_rt_slot(unsigned tex, unsigned *nt){
 #define RT_SREBUILD 30u
 #define RT_TABN     16384u
 typedef struct { uint64_t rk, gh; float W[12]; float c[3], r; uint32_t first, n, seen, born, matidx;
+                 uint32_t nfirst, mgen;   /* birlesme: obur yaridaki yer, birlesme kimligi */
                  uint16_t sight; uint8_t state; uint8_t pad; uint8_t vol; } RTEnt;
 /* state: 0 bos, 1 aday, 2 sabit (yapi bekliyor), 3 sabit, 9 silinmis.  pad: depoya kopyalandi.
  * gh: yalniz geometri ozeti (tablo anahtari); rk: gh + doku + VS.  vol: oynaklik (asagida). */
 static RTEnt g_rt_tab[RT_TABN];
 static HDMatC g_rt_smatc[RT_SMAXE]; static uint32_t g_rt_smtex[RT_SMAXE][3];
-static uint32_t g_rt_scur, g_rt_sdead, g_rt_smn, g_rt_sbuilt, g_rt_frame_no, g_rt_last_sbuild, g_rt_tomb;
-static int g_rt_sdirty;
+static uint32_t g_rt_smn, g_rt_frame_no, g_rt_tomb;
 static _Atomic unsigned long long g_rt_promo, g_rt_evict, g_rt_reset, g_rt_sbuilds, g_rt_dynv, g_rt_statv;
 static int g_rt_need_clear = 1;          /* yeni tamponun icerigi tanimsiz */
 static uint32_t g_rt_mfree[RT_SMAXE], g_rt_mfree_n;
-static uint32_t g_rt_mpend[RT_SMAXE], g_rt_mpend_n;   /* atilanlarin yuvalari: yapi yeniden kurulunca serbest */
 static unsigned g_rt_ev_far, g_rt_ev_frus, g_rt_ev_cand;
 static _Atomic unsigned long long g_rt_evsib;
 static _Atomic unsigned long long g_rt_compact, g_rt_rehash;
@@ -2095,55 +2281,223 @@ static void rt_rehash(void){
     }
     atomic_fetch_add(&g_rt_rehash, 1ull);
 }
-/* Bir girdiyi at.  Sabitse depodaki araligi sifirlanir (dejenere ucgen),
- * malzeme yuvasi yapi yeniden kurulunca serbest kalir.  Sifirlama listesi
- * doluysa atma ertelenir (0 doner). */
-static uint32_t g_rt_zr[1024][2]; static unsigned g_rt_nzr;
+/* Bir girdiyi at.  Sabitse ucgenleri cokertme listesine girer (GPU'da ilk
+ * kosesine cokertilir), parcasi (grup ya da yeni) refit icin isaretlenir;
+ * malzeme yuvasi o parcanin refit / kurulumu kodlaninca serbest.  Birlesme
+ * suruyorsa ya da liste doluysa atma ertelenir (0 doner). */
+#define RT_MAXCOL 512u                   /* cokertme listesi setBytes ile (<= 4 KB) */
+static uint32_t g_rt_zr[RT_MAXCOL][2]; static unsigned g_rt_nzr;
+#define RT_PREC 0xFEu                    /* bekleyen malzeme parcasi: yeni bolge */
+#define RT_PSW  0xFFu                    /* bekleyen malzeme parcasi: birlesmenin degisimi */
+static uint32_t g_rt_mpq[RT_SMAXE]; static uint8_t g_rt_mpqp[RT_SMAXE]; static unsigned g_rt_mpq_n;
+static void rt_mpend_add(uint32_t mat, unsigned part){
+    if (g_rt_mpq_n < RT_SMAXE){ g_rt_mpq[g_rt_mpq_n] = mat; g_rt_mpqp[g_rt_mpq_n] = (uint8_t)part; g_rt_mpq_n++; }
+}
+/* done[parca] = 1 olan parcalara bekleyen malzemeleri serbest birak */
+static void rt_mpend_release(const uint8_t *done){
+    unsigned w = 0;
+    for (unsigned q = 0; q < g_rt_mpq_n; q++){
+        if (done[g_rt_mpqp[q]]){ if (g_rt_mfree_n < RT_SMAXE) g_rt_mfree[g_rt_mfree_n++] = g_rt_mpq[q]; }
+        else { g_rt_mpq[w] = g_rt_mpq[q]; g_rt_mpqp[w] = g_rt_mpqp[q]; w++; }
+    }
+    g_rt_mpq_n = w;
+}
+static int rt_grp_of(uint32_t first){
+    for (unsigned k = 0; k < g_rt_ng; k++)
+        if (first >= g_rt_grp[k].lo && first < g_rt_grp[k].lo + g_rt_grp[k].built) return (int)k;
+    return -1;
+}
 static int rt_evict(RTEnt *e){
     if (e->state == 2 || e->state == 3){
+        if (g_rt_mstate) return 0;                     /* birlesme suruyor: degisimden sonra */
         if (e->pad){
-            if (g_rt_nzr >= 1024) return 0;
+            if (g_rt_nzr >= RT_MAXCOL) return 0;
             g_rt_zr[g_rt_nzr][0] = e->first; g_rt_zr[g_rt_nzr][1] = e->n; g_rt_nzr++;
         }
-        g_rt_sdead += e->n; g_rt_sdirty = 1;
-        if (g_rt_mpend_n < RT_SMAXE) g_rt_mpend[g_rt_mpend_n++] = e->matidx;
+        g_rt_sdead += e->n;
+        int k = e->pad ? rt_grp_of(e->first) : -1;
+        if (k >= 0){ g_rt_grp[k].refit = 1; rt_mpend_add(e->matidx, (unsigned)k); }
+        else { if (e->pad && e->first >= g_rt_recent.lo && e->first - g_rt_recent.lo < g_rt_recent.built) g_rt_recent.refit = 1;
+               rt_mpend_add(e->matidx, RT_PREC); }
         atomic_fetch_add(&g_rt_evict, 1ull);
     }
     e->state = 9; g_rt_tomb++;
     return 1;
 }
-/* SIKISTIRMA: olu araliklar deponun %40'ini gectiginde canli girdiler diger
- * tampon ciftine art arda kopyalanir (GPU'da).  Tum depoyu sifirlamak
- * biriktirilen kamera-arkasi geometriyi de siliyordu.  Onceki karelerin
- * komut tamponlari eski cifti okumaya devam eder (ping-pong). */
-static void rt_compact(id<MTLCommandBuffer> cb){
-    unsigned src = g_rt_sbuf, dst = 1u - g_rt_sbuf;
-    uint32_t cur = 0;
-    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+/* Canli depo girdileri, depodaki sirayla */
+static uint32_t g_rt_lv[RT_TABN]; static unsigned g_rt_nlv;
+static int rt_lv_cmp(const void *a, const void *b){
+    uint32_t x = g_rt_tab[*(const uint32_t *)a].first, y = g_rt_tab[*(const uint32_t *)b].first;
+    return x < y ? -1 : x > y;
+}
+static void rt_live_sorted(void){
+    g_rt_nlv = 0;
     for (unsigned q = 0; q < RT_TABN; q++){
         RTEnt *e = &g_rt_tab[q];
         if (e->state != 2 && e->state != 3) continue;
-        if (!e->pad){ e->state = 1; g_rt_mfree[g_rt_mfree_n++] = e->matidx; continue; }   /* henuz kopyalanmamisti */
-        [be copyFromBuffer:g_rt_sposb[src] sourceOffset:(NSUInteger)e->first * 12 toBuffer:g_rt_sposb[dst]
-         destinationOffset:(NSUInteger)cur * 12 size:(NSUInteger)e->n * 12];
-        [be copyFromBuffer:g_rt_sattrb[src] sourceOffset:(NSUInteger)e->first * 64 toBuffer:g_rt_sattrb[dst]
-         destinationOffset:(NSUInteger)cur * 64 size:(NSUInteger)e->n * 64];
-        e->first = cur; cur += e->n; e->state = 2;              /* yapi yeniden kurulana dek anlik yakalamada */
+        if (!e->pad){                     /* kopyasi hic yapilmamis: aday olarak geri */
+            e->state = 1; e->sight = 0;
+            if (g_rt_mfree_n < RT_SMAXE) g_rt_mfree[g_rt_mfree_n++] = e->matidx;
+            continue; }
+        g_rt_lv[g_rt_nlv++] = q;
     }
-    /* kalan kisim eski bir sikistirmanin artigi: kopyasi geciken terfiler cop ucgen gostermesin */
-    if (cur < RT_SMAXV)
-        [be fillBuffer:g_rt_sposb[dst] range:NSMakeRange((NSUInteger)cur * 12, (NSUInteger)(RT_SMAXV - cur) * 12) value:0];
-    [be endEncoding];
-    g_rt_sbuf = dst; g_rt_scur = cur; g_rt_sdead = 0; g_rt_sbuilt = 0; g_rt_sdirty = 1;
-    atomic_fetch_add(&g_rt_compact, 1ull);
+    qsort(g_rt_lv, g_rt_nlv, sizeof g_rt_lv[0], rt_lv_cmp);
 }
-static void rt_cache_reset(void){
-    g_rt_need_clear = 1;                 /* eski geometri dejenere olsun */
-    g_rt_mfree_n = g_rt_mpend_n = 0;
-    memset(g_rt_tab, 0, sizeof g_rt_tab);
-    g_rt_scur = g_rt_sdead = g_rt_smn = g_rt_sbuilt = g_rt_tomb = 0; g_rt_sdirty = 0;
-    atomic_fetch_add(&g_rt_reset, 1ull);
+/* MEKANSAL GRUPLAMA: ix[0,n) girdileri en fazla RT_NG gruba; gs[g]..gs[g+1].
+ * En buyuk (ucgen) grup, merkezlerinin en uzun ekseninde ucgen agirlikli
+ * ortancadan bolunur; hedefin altina inince ya da RT_NG'de durur. */
+static int g_rt_sax;
+static int rt_ax_cmp(const void *a, const void *b){
+    float x = g_rt_tab[*(const uint32_t *)a].c[g_rt_sax], y = g_rt_tab[*(const uint32_t *)b].c[g_rt_sax];
+    return x < y ? -1 : x > y;
 }
+static int rt_born_cmp(const void *a, const void *b){
+    uint32_t x = g_rt_tab[*(const uint32_t *)a].born, y = g_rt_tab[*(const uint32_t *)b].born;
+    return x < y ? -1 : x > y;
+}
+static unsigned rt_partition(uint32_t *ix, unsigned n, unsigned gtri, unsigned *gs){
+    unsigned ng = 1; gs[0] = 0; gs[1] = n;
+    while (ng < RT_NG){
+        int best = -1; uint64_t bt = 0;
+        for (unsigned g = 0; g < ng; g++){
+            if (gs[g + 1] - gs[g] < 2u) continue;
+            uint64_t t = 0; for (unsigned q = gs[g]; q < gs[g + 1]; q++) t += g_rt_tab[ix[q]].n / 3u;
+            if (t > gtri && t > bt){ bt = t; best = (int)g; }
+        }
+        if (best < 0) break;
+        unsigned a = gs[best], b = gs[best + 1];
+        float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        for (unsigned q = a; q < b; q++){ const float *c = g_rt_tab[ix[q]].c;
+            for (int d = 0; d < 3; d++){ if (c[d] < mn[d]) mn[d] = c[d]; if (c[d] > mx[d]) mx[d] = c[d]; } }
+        float ex = mx[0] - mn[0], ey = mx[1] - mn[1], ez = mx[2] - mn[2];
+        g_rt_sax = (ex >= ey && ex >= ez) ? 0 : (ey >= ez) ? 1 : 2;
+        qsort(ix + a, b - a, sizeof ix[0], rt_ax_cmp);
+        uint64_t acc = 0; unsigned m = a;
+        while (m < b - 1u){ acc += g_rt_tab[ix[m]].n / 3u; m++; if (acc * 2u >= bt) break; }
+        if (m <= a) m = a + 1u;
+        memmove(gs + best + 2, gs + best + 1, (size_t)(ng - (unsigned)best) * sizeof gs[0]);
+        gs[best + 1] = m; ng++;
+    }
+    return ng;
+}
+static MTLPrimitiveAccelerationStructureDescriptor *rt_part_desc(uint32_t lo, uint32_t nv){
+    MTLAccelerationStructureTriangleGeometryDescriptor *gd = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+    gd.vertexBuffer = g_rt_spos; gd.vertexBufferOffset = (NSUInteger)lo * 12; gd.vertexStride = 12;
+    gd.triangleCount = nv / 3; gd.opaque = YES;
+    MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    ad.geometryDescriptors = @[gd]; ad.usage = hd_rt_part_usage();
+    return ad;
+}
+static unsigned rt_gtri(void){
+    static unsigned v;
+    if (!v){ const char *e = ENVC("HD_RT_GTRI"); v = e ? (unsigned)atoi(e) : RT_GTRI; if (v < 2048u) v = 2048u; }
+    return v;
+}
+static uint32_t g_rt_gix[RT_TABN];
+static void rt_merge_switch(uint32_t frame);
+/* BIRLESME BASLAT (karenin basinda, siniflandirmadan once).  force_drop:
+ * en eski ceyregi birak (stres testi). */
+static void rt_merge_begin(id<MTLCommandBuffer> cb, uint32_t frame, int force_drop){
+    static int lg = -1; if (lg < 0) lg = ENVC("HD_RT_LOG") != NULL;
+    uint32_t hb = g_rt_half * RT_SMAXV, u0 = g_rt_scur - hb, d0 = g_rt_sdead, r0 = g_rt_scur - g_rt_recent.lo;
+    rt_live_sorted();
+    unsigned n = g_rt_nlv; uint64_t tot = 0;
+    memcpy(g_rt_gix, g_rt_lv, (size_t)n * sizeof g_rt_gix[0]);
+    for (unsigned q = 0; q < n; q++) tot += g_rt_tab[g_rt_gix[q]].n;
+    /* yeni yarida gruplar + yeni bolge + pay sigmali; sigmiyorsa en eskiler */
+    uint64_t cap = (uint64_t)RT_SMAXV - RT_RMAXV - 30000u;
+    int dropped = 0;
+    if (force_drop || tot > cap){
+        uint64_t want = force_drop ? tot - tot / 4u : cap * 3u / 4u;
+        qsort(g_rt_gix, n, sizeof g_rt_gix[0], rt_born_cmp);
+        unsigned sk = 0;
+        while (sk < n && tot > want){
+            RTEnt *e = &g_rt_tab[g_rt_gix[sk]];
+            tot -= e->n; rt_mpend_add(e->matidx, RT_PSW);   /* eski gruplarda degisime dek gorunur */
+            e->state = 9; g_rt_tomb++; sk++;
+        }
+        memmove(g_rt_gix, g_rt_gix + sk, (size_t)(n - sk) * sizeof g_rt_gix[0]); n -= sk;
+        dropped = 1; atomic_fetch_add(&g_rt_sdrop, 1ull);
+    }
+    unsigned gt = rt_gtri();
+    if (tot / 3u > (uint64_t)gt * RT_NG) gt = (unsigned)(tot / 3u / RT_NG) + 1u;
+    unsigned gs[RT_NG + 1];
+    unsigned ng = n ? rt_partition(g_rt_gix, n, gt, gs) : 0;
+    uint32_t cur = (1u - g_rt_half) * RT_SMAXV;
+    unsigned nch = 0;
+    for (unsigned q = 0; q < n; q++) nch += (g_rt_tab[g_rt_gix[q]].n + 255u) / 256u;
+    id<MTLBuffer> chb = nch ? [g_dev newBufferWithLength:(NSUInteger)nch * 12 options:MTLResourceStorageModeShared] : nil;
+    uint32_t *ch = chb ? (uint32_t *)[chb contents] : NULL; unsigned c = 0;
+    uint32_t gen = ++g_rt_mgen;
+    NSUInteger maxscr = 0;
+    for (unsigned g = 0; g < ng; g++){
+        RTPart *pt = &g_rt_ngrp[g];
+        pt->scratch = nil; pt->lo = cur; pt->refit = 0; pt->dirty = 1;
+        for (unsigned q = gs[g]; q < gs[g + 1]; q++){
+            RTEnt *e = &g_rt_tab[g_rt_gix[q]];
+            e->nfirst = cur; e->mgen = gen;
+            for (uint32_t o = 0; o < e->n; o += 256u){
+                ch[c * 3] = e->first + o; ch[c * 3 + 1] = cur + o; ch[c * 3 + 2] = e->n - o < 256u ? e->n - o : 256u; c++; }
+            cur += e->n;
+        }
+        pt->built = cur - pt->lo;
+        MTLAccelerationStructureSizes sz = [g_dev accelerationStructureSizesWithDescriptor:rt_part_desc(pt->lo, pt->built)];
+        pt->as = [g_dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+        NSUInteger s2 = sz.buildScratchBufferSize > sz.refitScratchBufferSize ? sz.buildScratchBufferSize : sz.refitScratchBufferSize;
+        if (s2 > maxscr) maxscr = s2;
+    }
+    if (maxscr > g_rt_gscr_len){
+        g_rt_gscr_b = [g_dev newBufferWithLength:maxscr options:MTLResourceStorageModePrivate];
+        g_rt_gscr_r = [g_dev newBufferWithLength:maxscr options:MTLResourceStorageModePrivate];
+        g_rt_gscr_len = maxscr;
+    }
+    if (c){
+        id<MTLComputeCommandEncoder> ce = pp_compute(cb, "RT: birlesme kopyasi (hesaplama)");
+        [ce setComputePipelineState:g_rt_gatk];
+        [ce setBuffer:g_rt_spos offset:0 atIndex:0];
+        [ce setBuffer:g_rt_sattr offset:0 atIndex:1];
+        [ce setBuffer:chb offset:0 atIndex:2];
+        uint32_t nc = c; [ce setBytes:&nc length:4 atIndex:3];
+        [ce dispatchThreadgroups:MTLSizeMake(c, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [ce endEncoding];
+    }
+    if (lg) fprintf(stderr, "[RT] kare %ld: birlesme, depo %u kose (olu %u, yeni %u)%s -> %u grup, %u kose\n",
+                    atomic_load(&g_frames_drawn), u0, d0, r0, dropped ? ", en eski birakildi" : "", ng,
+                    cur - (1u - g_rt_half) * RT_SMAXV);
+    g_rt_nng = ng; g_rt_mnext = 0; g_rt_mend = cur; g_rt_mstate = 1;
+    atomic_fetch_add(&g_rt_merges, 1ull);
+    if (!ng) rt_merge_switch(frame);                  /* bos depo: kurulacak bir sey yok */
+}
+/* DEGISIM: yeni gruplarin hepsi kuruldu (bu karede ya da once kodlandi). */
+static void rt_merge_switch(uint32_t frame){
+    for (unsigned q = 0; q < RT_TABN; q++){
+        RTEnt *e = &g_rt_tab[q];
+        if (e->state != 2 && e->state != 3) continue;
+        if (e->pad && e->mgen == g_rt_mgen){ e->first = e->nfirst; e->state = 3; }
+        else { rt_mpend_add(e->matidx, RT_PSW); e->state = 9; g_rt_tomb++; }   /* birlesmeye girmemis (olmamali) */
+    }
+    for (unsigned k = 0; k < g_rt_ng; k++) g_rt_grp[k].as = nil;
+    for (unsigned k = 0; k < g_rt_nng; k++){
+        g_rt_grp[k] = g_rt_ngrp[k]; g_rt_ngrp[k].as = nil;
+        g_rt_grp[k].dirty = 0; g_rt_grp[k].refit = 0; g_rt_grp[k].built_frame = g_rt_grp[k].refit_frame = frame;
+    }
+    g_rt_ng = g_rt_nng; g_rt_nng = 0;
+    g_rt_half ^= 1u; g_rt_scur = g_rt_mend; g_rt_sdead = 0; g_rt_nzr = 0;
+    g_rt_recent.lo = g_rt_scur; g_rt_recent.built = 0; g_rt_recent.dirty = 0; g_rt_recent.refit = 0;
+    { uint8_t all[256]; memset(all, 1, sizeof all); rt_mpend_release(all); }   /* eski yapilar ust yapidan cikti */
+    g_rt_mstate = 0; g_rt_lastsw = frame;
+}
+/* Terfi: yeni bolgede n kose yer ac (mutlak indis; ~0 = yer yok / birlesme suruyor). */
+static int g_rt_want_merge;               /* yer yoktu: sonraki karenin basinda birlesme */
+static uint32_t rt_alloc(unsigned n){
+    if (g_rt_mstate) return 0xFFFFFFFFu;
+    uint32_t end = g_rt_half * RT_SMAXV + RT_SMAXV;
+    if (g_rt_scur + n > end || g_rt_scur + n - g_rt_recent.lo > RT_RMAXV){ g_rt_want_merge = 1; return 0xFFFFFFFFu; }
+    uint32_t f = g_rt_scur; g_rt_scur += n; g_rt_recent.dirty = 1;
+    return f;
+}
+static uint32_t rt_depot_used(void){ return g_rt_scur - g_rt_half * RT_SMAXV; }
+static uint32_t rt_depot_dead(void){ return g_rt_sdead; }
 static uint32_t g_rt_slit[RT_SMAXE];      /* sabit malzeme: bu karede far isigi alarak cizildi */
 static inline void rt_mat_of(const MDraw *dr, HDMatC *m){
     int base = dr->ps % PSREFL, cube = base >= PSCUBE, b = base % PSCUBE;
@@ -2268,13 +2622,18 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     fogp[0] = fogp[1] = fogp[2] = fogp[3] = 0.f;
     g_rt_nzr = 0;
     if (g_rt_cache){
-        /* HD_RT_STRESS=N: her N karede sikistirma + yeniden ozetleme (ender yollarin testi) */
+        /* HD_RT_STRESS=N: her N karede yeniden ozetleme + sikistirmali birlesme,
+         * 4N'de bir de en eski ceyregin birakilmasi (ender yollarin testi) */
         static int stress = -1; if (stress < 0){ const char *ev = ENVC("HD_RT_STRESS"); stress = ev ? atoi(ev) : 0; }
-        if (stress > 0 && frame % (uint32_t)stress == 0u){ rt_rehash(); if (g_rt_scur) rt_compact(cb); }
+        if (stress > 0 && frame % (uint32_t)stress == 0u){
+            if (!g_rt_mstate && frame - g_rt_lastsw >= 4u){
+                rt_rehash(); rt_merge_begin(cb, frame, frame % (4u * (uint32_t)stress) == 0u); }
+        }
+        /* BIRLESME: yeni bolge dolmak uzere ya da depo dolu (bkz. SABIT DEPO: MEKANSAL GRUPLAR) */
+        else if (!g_rt_mstate && frame - g_rt_lastsw >= 4u &&
+                 (g_rt_want_merge || g_rt_scur - g_rt_recent.lo > RT_RMAXV - 30000u || rt_depot_used() > RT_SMAXV - 60000u)){
+            g_rt_want_merge = 0; rt_merge_begin(cb, frame, 0); }
         if (g_rt_tomb > RT_TABN / 4u) rt_rehash();
-        if ((g_rt_scur > 30000u && g_rt_sdead * 5u > g_rt_scur * 2u) ||
-            (g_rt_scur > RT_SMAXV - 30000u && g_rt_sdead > 0u)) rt_compact(cb);
-        if (g_rt_scur > RT_SMAXV - 30000u && g_rt_sdead == 0u && frame % 600u == 0u) rt_cache_reset();  /* dolu ve olu yok: en eskiyi birakmanin yolu */
     }
     #define RT_OK(dr) (!(dr)->target && !(dr)->is_clear && !(dr)->is_blit && (dr)->count >= 3 && \
         (dr)->vsid > 0 && (dr)->vsid < HD_MAXVSI && ((dr)->depth & 2u))
@@ -2292,6 +2651,13 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         if (have_m){
             const float *c3 = k + (cx + 3) * 4;
             if (c3[0] == 0.f && c3[1] == 0.f && c3[2] == 0.f) continue;       /* ortografik (ekran) */
+        }
+        g_rt_dpok[i] = (uint8_t)have_m;                  /* bkz. KONUM DENETIMI: W'nin oteleme satiri */
+        if (have_m){
+            double vx = (double)k[cx * 4 + 3] * (double)ipx, vy = (double)k[(cx + 1) * 4 + 3] * (double)ipy,
+                   vz = (double)k[(cx + 3) * 4 + 3];
+            for (int c = 0; c < 3; c++)
+                g_rt_dp[i][c] = (float)(vx * iv[c] + vy * iv[4 + c] + vz * iv[8 + c] + (double)iv[12 + c]);
         }
         { int fr = g_hd_vsi[dr->vsid].fogr;                                   /* oyunun sis sabitleri */
           if (fr >= 0 && fogp[3] == 0.f && (unsigned)(fr + 1) * 16u <= dr->ksz - 16u){
@@ -2333,7 +2699,7 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
                     ent[i] = e; continue;                                      /* sabit yapida: yakalama yok */
                 }
                 if (e->state == 1 && e->sight >= (RT_PROMOTE << e->vol) && npromo < 400u &&
-                    g_rt_scur + n <= RT_SMAXV - 30000u && (g_rt_mfree_n || g_rt_smn < RT_SMAXE - 64u)){
+                    (g_rt_mfree_n || g_rt_smn < RT_SMAXE - 64u)){
                     npromo++;
                     /* TERFI: sinir kuresi ham konumlardan */
                     unsigned po = (unsigned)(g_hd_vsi[dr->vsid].po < 0 ? 0 : g_hd_vsi[dr->vsid].po);
@@ -2350,10 +2716,12 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
                         /* isin menzilinin disinda: depoya alma (gorulmedigi an "uzak" diye atilirdi) */
                         e->sight = 0;
                     } else {
-                    e->state = 2; e->first = g_rt_scur; e->n = n; e->pad = 0;
-                    e->matidx = g_rt_mfree_n ? g_rt_mfree[--g_rt_mfree_n] : g_rt_smn++;
-                    g_rt_scur += n; g_rt_sdirty = 1;
-                    atomic_fetch_add(&g_rt_promo, 1ull);
+                    uint32_t f0 = rt_alloc(n);              /* bkz. SABIT DEPO: TEMEL + YENI */
+                    if (f0 != 0xFFFFFFFFu){
+                        e->state = 2; e->first = f0; e->n = n; e->pad = 0;
+                        e->matidx = g_rt_mfree_n ? g_rt_mfree[--g_rt_mfree_n] : g_rt_smn++;
+                        atomic_fetch_add(&g_rt_promo, 1ull);
+                    }
                     }
                 }
             }
@@ -2372,6 +2740,7 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     /* terfi edenlerin GPU kopyalari: (anlik ilk kose, sabit ilk kose, adet) */
     static uint32_t cp[512][3]; unsigned ncp = 0;
     uint64_t dsig = 1469598103934665603ull;         /* anlik ucgen duzeninin imzasi (bkz. refit) */
+    static float cpos[RT_MAXREC][3]; static uint8_t cpok[RT_MAXREC];   /* kayit sirasiyla oteleme */
     /* --- 2. gecis: kayitlar + malzemeler --- */
     for (unsigned i = 0; i < upto && i < MAXD; i++){
         if (!act[i]) continue;
@@ -2384,7 +2753,7 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         HDMatC m; rt_mat_of(dr, &m);
         RTEnt *e = ent[i];
         uint32_t midx = RT_SMAXE + ri;
-        if (e && e->state == 2 && e->first + n <= RT_SMAXV && e->seen == frame && e->born != 0xFFFFFFFFu && ncp < 512 &&
+        if (e && e->state == 2 && e->first + n <= 2u * RT_SMAXV && e->seen == frame && e->born != 0xFFFFFFFFu && ncp < 512 &&
             e->pad == 0){
             /* bu karede terfi etti: sabit malzeme + GPU kopyasi */
             e->pad = 1; midx = e->matidx;
@@ -2397,6 +2766,11 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         rec[ri].rawoff = dr->rawoff; rec[ri].koff = dr->koff; rec[ri].first = f; rec[ri].mat = midx;
         rec[ri].ib = dr->ix_ib; rec[ri].base = dr->ix_base; rec[ri].isz = dr->ix_isz; rec[ri].pad = 0;
         for (unsigned q = 0; q < n; q++) item[f + q] = ri;
+        cpok[ri] = g_rt_dpok[i]; if (cpok[ri]) memcpy(cpos[ri], g_rt_dp[i], 12);
+        if (ENVC("HD_RT_DLOG") && g_hd_dump_now)        /* tani: anlik yakalamanin dizilimi */
+            fprintf(stderr, "[DLOG] kare %ld kayit %u: vs %d ps %d n %u tex %u gh %016llx (%s) f %u ofs %u konum %s %.1f %.1f %.1f\n",
+                    (long)atomic_load(&g_frames_drawn), ri, dr->vsid, dr->ps, n, dr->tex, (unsigned long long)dr->gh,
+                    dr->gh ? "indisli" : "ham", f, dr->rawoff, cpok[ri] ? "var" : "yok", cpos[ri][0], cpos[ri][1], cpos[ri][2]);
         ri++;
     }
     #undef RT_OK
@@ -2464,7 +2838,7 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
           unsigned long long pr = atomic_load(&g_rt_promo), ev = atomic_load(&g_rt_evict);
           fprintf(stderr, "[RTLOG] kare %u: anlik %u ucgen/%u cizim, depo %u kose (%u olu), aday %u bekleyen %u sabit %u | "
                   "300 karede terfi %llu atma %llu (uzak %u, yakin %u, kardes %llu, aday %u) | sikistirma %llu sifirlama %llu ozet %llu\n",
-                  frame, total / 3, nrec, g_rt_scur, g_rt_sdead, n1, n2, n3, pr - lp, ev - le,
+                  frame, total / 3, nrec, rt_depot_used(), rt_depot_dead(), n1, n2, n3, pr - lp, ev - le,
                   g_rt_ev_far, g_rt_ev_frus, atomic_load(&g_rt_evsib) - lsib, g_rt_ev_cand, atomic_load(&g_rt_compact), atomic_load(&g_rt_reset), atomic_load(&g_rt_rehash));
           lp = pr; le = ev; lsib = atomic_load(&g_rt_evsib); g_rt_ev_far = g_rt_ev_frus = g_rt_ev_cand = 0;
           if (g_rt_fixcnt){ const uint32_t *fc = (const uint32_t *)[g_rt_fixcnt contents];
@@ -2520,98 +2894,173 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     if (stage < 0){ const char *e = ENVC("HD_RT_STAGE"); stage = e ? atoi(e) : 3; }
     int st = (g_ab_mode == 3) ? 2 : (g_ab_mode == 4) ? 1 : stage;      /* HD_RT_AB dilimi */
     if (st == 1) return 0;
-    /* --- GPU: sabit depoya kopya + atilanlari sifirla (dejenere ucgen) --- */
-    if (ncp || g_rt_nzr || g_rt_need_clear){
+    /* --- GPU: sabit depoya kopya (bu karenin terfileri) --- */
+    if (ncp || g_rt_need_clear){
         id<MTLBlitCommandEncoder> be = pp_blit(cb, "RT: sabit depoya kopya");
         if (g_rt_need_clear){ g_rt_need_clear = 0;
-            [be fillBuffer:g_rt_sposb[0] range:NSMakeRange(0, RT_SMAXV * 12) value:0];
-            [be fillBuffer:g_rt_sposb[1] range:NSMakeRange(0, RT_SMAXV * 12) value:0]; }
+            [be fillBuffer:g_rt_spos range:NSMakeRange(0, 2u * RT_SMAXV * 12) value:0]; }
         for (unsigned q = 0; q < ncp; q++){
             [be copyFromBuffer:g_rt_pos sourceOffset:(NSUInteger)cp[q][0] * 12 toBuffer:g_rt_spos
              destinationOffset:(NSUInteger)cp[q][1] * 12 size:(NSUInteger)cp[q][2] * 12];
             [be copyFromBuffer:g_rt_attr sourceOffset:(NSUInteger)cp[q][0] * 64 toBuffer:g_rt_sattr
              destinationOffset:(NSUInteger)cp[q][1] * 64 size:(NSUInteger)cp[q][2] * 64];
         }
-        for (unsigned q = 0; q < g_rt_nzr; q++)
-            [be fillBuffer:g_rt_spos range:NSMakeRange((NSUInteger)g_rt_zr[q][0] * 12, (NSUInteger)g_rt_zr[q][1] * 12) value:0];
         [be endEncoding];
     }
-    /* --- GPU: alt yapilar + ust yapi (profilde ayri kalemler) --- */
-    id<MTLAccelerationStructureCommandEncoder> ae = nil;
-    int have_dyn = total >= 3;
+    /* --- GPU: atilanlari ilk koselerine cokert (bkz. SABIT DEPO YUVALARI) --- */
+    if (g_rt_nzr){
+        id<MTLComputeCommandEncoder> ce = pp_compute(cb, "RT: atilanlari cokertme");
+        [ce setComputePipelineState:g_rt_colk];
+        [ce setBuffer:g_rt_spos offset:0 atIndex:0];
+        [ce setBytes:g_rt_zr length:(NSUInteger)g_rt_nzr * 8 atIndex:1];
+        uint32_t nr = g_rt_nzr; [ce setBytes:&nr length:4 atIndex:2];
+        NSUInteger tw = g_rt_colk.threadExecutionWidth;
+        [ce dispatchThreadgroups:MTLSizeMake((g_rt_nzr + tw - 1) / tw, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [ce endEncoding];
+    }
+    /* --- GPU: alt yapilar TEK kodlayicida: anlik + temel + yeni (her biri kendi
+     * karalamasiyla; kurulumlar ust uste calisir, k79 asbench) --- */
+    int have_dyn = total >= 3, dyn_refit = 0;
     if (have_dyn){
         dsig ^= (uint64_t)total; dsig *= 1099511628211ull;
-        int refit = hd_rt_refit_on() && dsig == g_rt_dsig && g_rt_dsince < RT_REFIT_MAX;
-        ae = pp_accel(cb, refit ? "RT: anlik yapi (refit)" : "RT: anlik yapi kurulumu");
-        MTLAccelerationStructureTriangleGeometryDescriptor *gd =
-            [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-        gd.vertexBuffer = g_rt_pos; gd.vertexStride = 12; gd.triangleCount = total / 3; gd.opaque = YES;
-        MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
-        ad.geometryDescriptors = @[gd]; ad.usage = hd_rt_dyn_usage();
-        if (refit){
-            [ae refitAccelerationStructure:g_rt_as descriptor:ad destination:g_rt_as
-                             scratchBuffer:g_rt_scratch scratchBufferOffset:0];
-            g_rt_dsince++; atomic_fetch_add(&g_rt_nrefit, 1ull);
-        } else {
-            [ae buildAccelerationStructure:g_rt_as descriptor:ad scratchBuffer:g_rt_scratch scratchBufferOffset:0];
-            g_rt_dsince = 0; atomic_fetch_add(&g_rt_nbuild, 1ull);
-        }
-        g_rt_dsig = dsig;
-        [ae endEncoding]; ae = nil;
-    } else g_rt_dsince = 0xFFFFFFFFu;
-    if (g_rt_sdirty && g_rt_scur >= 3 && (g_rt_sbuilt == 0 || frame - g_rt_last_sbuild >= RT_SREBUILD)){
-        ae = pp_accel(cb, "RT: sabit yapi kurulumu");
-        MTLAccelerationStructureTriangleGeometryDescriptor *gd =
-            [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-        gd.vertexBuffer = g_rt_spos; gd.vertexStride = 12; gd.triangleCount = g_rt_scur / 3; gd.opaque = YES;
-        MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
-        ad.geometryDescriptors = @[gd]; ad.usage = MTLAccelerationStructureUsageNone;
-        [ae buildAccelerationStructure:g_rt_sas descriptor:ad scratchBuffer:g_rt_sscratch scratchBufferOffset:0];
-        g_rt_sbuilt = g_rt_scur; g_rt_last_sbuild = frame; g_rt_sdirty = 0;
-        for (unsigned q = 0; q < RT_TABN; q++) if (g_rt_tab[q].state == 2 && g_rt_tab[q].pad) g_rt_tab[q].state = 3;
-        for (unsigned q = 0; q < g_rt_mpend_n && g_rt_mfree_n < RT_SMAXE; q++) g_rt_mfree[g_rt_mfree_n++] = g_rt_mpend[q];
-        g_rt_mpend_n = 0;
-        atomic_fetch_add(&g_rt_sbuilds, 1ull);
-        [ae endEncoding]; ae = nil;
+        dyn_refit = hd_rt_refit_on() && dsig == g_rt_dsig && g_rt_dsince < RT_REFIT_MAX;
+        if (dyn_refit && ri == g_rt_bn){                /* bkz. KONUM DENETIMI */
+            static float mv2 = -1.f;
+            if (mv2 < 0.f){ const char *ev = ENVC("HD_RT_REFIT_MOVE"); float m = ev ? (float)atof(ev) : RT_REFIT_MOVE; mv2 = m * m; }
+            for (unsigned q = 0; q < ri; q++){
+                if (!cpok[q] || !g_rt_bpok[q]) continue;
+                float dx = cpos[q][0] - g_rt_bpos[q][0], dy = cpos[q][1] - g_rt_bpos[q][1], dz = cpos[q][2] - g_rt_bpos[q][2];
+                if (dx*dx + dy*dy + dz*dz > mv2){ dyn_refit = 0; atomic_fetch_add(&g_rt_nmoved, 1ull); break; }
+            }
+        } else if (dyn_refit) dyn_refit = 0;
     }
-    int have_st = g_rt_sbuilt >= 3;
-    if (!have_dyn && !have_st) return 0;
-    ae = pp_accel(cb, "RT: ust yapi");
-    { MTLAccelerationStructureInstanceDescriptor *id2 = (MTLAccelerationStructureInstanceDescriptor *)[g_rt_inst contents];
-      /* ornek 0 her zaman var olan yapi; kimlik (accelerationStructureIndex) hangi depo oldugunu soyler */
-      id2[0].accelerationStructureIndex = have_dyn ? 0u : 1u;
-      id2[1].accelerationStructureIndex = 1u;
-      MTLInstanceAccelerationStructureDescriptor *td = [MTLInstanceAccelerationStructureDescriptor descriptor];
-      td.instancedAccelerationStructures = @[g_rt_as, g_rt_sas];
-      td.instanceCount = (have_dyn && have_st) ? 2 : 1; td.instanceDescriptorBuffer = g_rt_inst;
-      [ae buildAccelerationStructure:g_rt_tlas descriptor:td scratchBuffer:g_rt_tscratch scratchBufferOffset:0];
-      g_rt_only_static = !have_dyn; }
-    [ae endEncoding];
+    /* gruplar: birlesmede kare basina bir yeni grup kurulumu; atmada karede en
+     * fazla bir grup refit (grup basina RT_BREFIT karede bir).
+     * yeni: RT_SREBUILD karede bir kurulum, atmada ayni karede refit */
+    uint32_t rn = g_rt_scur - g_rt_recent.lo;
+    int mb = (g_rt_mstate && g_rt_mnext < g_rt_nng) ? (int)g_rt_mnext++ : -1;
+    int gr = -1;
+    if (!g_rt_mstate && g_rt_ng){ static unsigned rr;
+        for (unsigned t = 0; t < g_rt_ng; t++){ unsigned k = (rr + t) % g_rt_ng;
+            if (g_rt_grp[k].refit && g_rt_grp[k].built >= 3 && frame - g_rt_grp[k].refit_frame >= RT_BREFIT){ gr = (int)k; rr = k + 1u; break; } } }
+    int ract = (g_rt_recent.dirty && rn >= 3 && (!g_rt_recent.built || frame - g_rt_recent.built_frame >= RT_SREBUILD)) ? 1
+             : (g_rt_recent.refit && g_rt_recent.built >= 3) ? 2 : 0;
+    if (have_dyn || mb >= 0 || gr >= 0 || ract){
+        id<MTLAccelerationStructureCommandEncoder> ae = pp_accel(cb,
+            mb >= 0 ? "RT: alt yapilar (grup kurulumu ile)" : ract == 1 ? "RT: alt yapilar (yeni kurulumu ile)"
+            : (gr >= 0 || ract) ? "RT: alt yapilar (refit ile)" : dyn_refit ? "RT: anlik yapi (refit)" : "RT: anlik yapi kurulumu");
+        if (have_dyn){
+            MTLAccelerationStructureTriangleGeometryDescriptor *gd =
+                [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+            gd.vertexBuffer = g_rt_pos; gd.vertexStride = 12; gd.triangleCount = total / 3; gd.opaque = YES;
+            MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+            ad.geometryDescriptors = @[gd]; ad.usage = hd_rt_dyn_usage();
+            if (dyn_refit){
+                [ae refitAccelerationStructure:g_rt_as descriptor:ad destination:g_rt_as
+                                 scratchBuffer:g_rt_scratch scratchBufferOffset:0];
+                g_rt_dsince++; atomic_fetch_add(&g_rt_nrefit, 1ull);
+            } else {
+                [ae buildAccelerationStructure:g_rt_as descriptor:ad scratchBuffer:g_rt_scratch scratchBufferOffset:0];
+                g_rt_dsince = 0; atomic_fetch_add(&g_rt_nbuild, 1ull);
+                memcpy(g_rt_bpos, cpos, (size_t)ri * sizeof cpos[0]); memcpy(g_rt_bpok, cpok, ri); g_rt_bn = ri;
+            }
+            g_rt_dsig = dsig;
+        }
+        if (mb >= 0){                                   /* birlesme: siradaki yeni grup */
+            RTPart *pt = &g_rt_ngrp[mb];
+            [ae buildAccelerationStructure:pt->as descriptor:rt_part_desc(pt->lo, pt->built)
+                             scratchBuffer:g_rt_gscr_b scratchBufferOffset:0];
+            pt->built_frame = frame; atomic_fetch_add(&g_rt_sbuilds, 1ull);
+        }
+        if (gr >= 0){
+            RTPart *pt = &g_rt_grp[gr];
+            [ae refitAccelerationStructure:pt->as descriptor:rt_part_desc(pt->lo, pt->built) destination:pt->as
+                             scratchBuffer:g_rt_gscr_r scratchBufferOffset:0];
+            pt->refit = 0; pt->refit_frame = frame; atomic_fetch_add(&g_rt_srefits, 1ull);
+        }
+        if (ract){
+            RTPart *pt = &g_rt_recent;
+            uint32_t nv = ract == 1 ? rn : pt->built;
+            if (ract == 1){
+                [ae buildAccelerationStructure:pt->as descriptor:rt_part_desc(pt->lo, nv) scratchBuffer:pt->scratch scratchBufferOffset:0];
+                pt->built = nv; pt->built_frame = pt->refit_frame = frame; pt->dirty = 0; pt->refit = 0;
+                atomic_fetch_add(&g_rt_sbuilds, 1ull);
+            } else {
+                [ae refitAccelerationStructure:pt->as descriptor:rt_part_desc(pt->lo, nv) destination:pt->as
+                                 scratchBuffer:pt->scratch scratchBufferOffset:0];
+                pt->refit = 0; pt->refit_frame = frame; atomic_fetch_add(&g_rt_srefits, 1ull);
+            }
+        }
+        [ae endEncoding];
+    }
+    if (!have_dyn) g_rt_dsince = 0xFFFFFFFFu;
+    /* kurulan yeni bolgedeki bekleyen terfiler artik yapida: yakalamadan cikar */
+    if (ract == 1) for (unsigned q = 0; q < RT_TABN; q++){
+        RTEnt *e = &g_rt_tab[q];
+        if (e->state != 2 || !e->pad) continue;
+        if (e->first >= g_rt_recent.lo && e->first - g_rt_recent.lo < g_rt_recent.built) e->state = 3;
+    }
+    /* atilanlarin ucgenleri refit / kurulumla yapidan dustu: malzemeleri serbest
+     * (yeni bolge her karede: ya bu karede refit edildi ya hic yapida degildi) */
+    { uint8_t done[256]; memset(done, 0, sizeof done); done[RT_PREC] = 1; if (gr >= 0) done[gr] = 1;
+      rt_mpend_release(done); }
+    /* birlesmenin son grubu kodlandi: degisim (bu karenin ust yapisi yeni gruplarla) */
+    if (g_rt_mstate && g_rt_mnext >= g_rt_nng) rt_merge_switch(frame);
+    /* --- GPU: ust yapi = anlik + gruplar + yeni; IB: ornek -> depo tabani --- */
+    unsigned sbuilt = 0;
+    MTLAccelerationStructureInstanceDescriptor *id2 = (MTLAccelerationStructureInstanceDescriptor *)[g_rt_inst[ring] contents];
+    NSMutableArray *ias = [NSMutableArray arrayWithCapacity:RT_NINST];
+    g_rt_nib = 0; g_rt_tln = 0;
+    static int only = -1;                 /* tani: HD_RT_ONLY=1 yalniz anlik, 2 yalniz gruplar, 3 yalniz yeni */
+    if (only < 0){ const char *ev = ENVC("HD_RT_ONLY"); only = ev ? atoi(ev) : 0; }
+    if (have_dyn && (!only || only == 1)){ id2[g_rt_nib].accelerationStructureIndex = (uint32_t)ias.count; [ias addObject:g_rt_as];
+                   g_rt_tl[g_rt_tln++] = g_rt_as; g_rt_ib[g_rt_nib++] = 0xFFFFFFFFu; }
+    for (unsigned k = 0; k <= g_rt_ng; k++){
+        RTPart *pt = k < g_rt_ng ? &g_rt_grp[k] : &g_rt_recent;
+        if (pt->built < 3 || !pt->as) continue;
+        if (only && only != (k < g_rt_ng ? 2 : 3)) continue;
+        id2[g_rt_nib].accelerationStructureIndex = (uint32_t)ias.count; [ias addObject:pt->as];
+        g_rt_tl[g_rt_tln++] = pt->as; g_rt_ib[g_rt_nib++] = pt->lo; sbuilt += pt->built;
+    }
+    g_rt_only_static = !have_dyn;
+    if (!g_rt_nib) return 0;
+    {   id<MTLAccelerationStructureCommandEncoder> ae = pp_accel(cb, "RT: ust yapi");
+        MTLInstanceAccelerationStructureDescriptor *td = [MTLInstanceAccelerationStructureDescriptor descriptor];
+        td.instancedAccelerationStructures = ias;
+        td.instanceCount = g_rt_nib; td.instanceDescriptorBuffer = g_rt_inst[ring];
+        [ae buildAccelerationStructure:g_rt_tlas descriptor:td scratchBuffer:g_rt_tscratch scratchBufferOffset:0];
+        [ae endEncoding]; }
     if (st == 2) return 0;
     /* doku tablosu */
     [g_rt_argenc setArgumentBuffer:g_rt_arg[ring] offset:0];
     for (unsigned q = 0; q < nt; q++) [g_rt_argenc setTexture:g_rt_texs[q] atIndex:q];
     *ntex = nt;
     atomic_fetch_add(&g_rt_frames, 1ull);
-    atomic_fetch_add(&g_rt_tris, (unsigned long long)((total + g_rt_sbuilt) / 3));
+    atomic_fetch_add(&g_rt_tris, (unsigned long long)((total + sbuilt) / 3));
     atomic_fetch_add(&g_rt_draws, (unsigned long long)ri);
     atomic_fetch_add(&g_rt_dynv, (unsigned long long)total);
-    atomic_fetch_add(&g_rt_statv, (unsigned long long)g_rt_sbuilt);
-    return (total + g_rt_sbuilt) / 3;
+    atomic_fetch_add(&g_rt_statv, (unsigned long long)sbuilt);
+    return (total + sbuilt) / 3;
 }
 static int g_hd_dump_now;       /* bu kare DUMPFRAME ile secildi (tani) */
+static int g_rt_kforce;         /* HD_RTPROBE2: 1 eski cekirdek, 2 RT_V2 (ayni veriyle karsilastirma) */
 static void hd_rt_trace(id<MTLCommandBuffer> cb, const void *par, size_t parsz, id<MTLTexture> zt,
                         NSUInteger W, NSUInteger H, unsigned nt){
     id<MTLComputeCommandEncoder> ce = pp_compute(cb, "RT: isin cekirdegi (hesaplama)");
-    [ce setComputePipelineState:g_rt_kern];
+    [ce setComputePipelineState:g_rt_kforce == 1 ? g_rt_kern : (g_rt_kforce == 2 && g_rt_kern2) ? g_rt_kern2
+                                : (g_rt_kern2 && !abt_off("RTV2")) ? g_rt_kern2 : g_rt_kern];
     [ce setTexture:g_rt_out atIndex:0];
     [ce setTexture:zt atIndex:1];
     [ce setTexture:g_hd_g[0] atIndex:2];
+    [ce setTexture:g_hd_g[1] atIndex:3];
     [ce setTexture:g_hd_g[2] atIndex:4];
     [ce setBytes:par length:parsz atIndex:0];
     [ce setAccelerationStructure:g_rt_tlas atBufferIndex:1];
     [ce useResource:g_rt_as usage:MTLResourceUsageRead];
-    [ce useResource:g_rt_sas usage:MTLResourceUsageRead];
+    for (unsigned k = 0; k < g_rt_tln; k++) if (g_rt_tl[k] != g_rt_as) [ce useResource:g_rt_tl[k] usage:MTLResourceUsageRead];
+    { uint32_t ib1 = 0xFFFFFFFFu;        /* bkz. SABIT DEPO YUVALARI: ornek -> depo tabani */
+      if (g_rt_nib) [ce setBytes:g_rt_ib length:sizeof(uint32_t) * g_rt_nib atIndex:8];
+      else [ce setBytes:&ib1 length:sizeof ib1 atIndex:8]; }
     [ce setBuffer:g_rt_mat[g_rt_ring] offset:0 atIndex:3];
     [ce setBuffer:g_rt_attr offset:0 atIndex:4];
     [ce setBuffer:g_rt_arg[g_rt_ring] offset:0 atIndex:6];
@@ -2621,6 +3070,109 @@ static void hd_rt_trace(id<MTLCommandBuffer> cb, const void *par, size_t parsz, 
     [ce dispatchThreadgroups:MTLSizeMake((W + tw - 1) / tw, (H + th - 1) / th, 1)
        threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
     [ce endEncoding];
+}
+/* --- ISIN IZLEME KARE BASINDA ---------------------------------------------
+ * Yakalama + ivme yapilari sahnenin bittigi yerde (birlestirmeden hemen once)
+ * kodlaniyordu.  Isin cekirdegi yapilari beklediginden kurulumun GPU gecikmesi
+ * karenin kritik yolundaydi: Metal'in yazilim kurucusu kucuk yapida bile
+ * ~0.8 ms suruyor ve GPU'yu doldurmuyor (olculdu, k79 asbench: 8 kurulum tek
+ * kodlayicida tek kurulumun ~2.5 kati).  Yakalanan kose verisi ve kamera
+ * karenin basinda belli; ayni is ilk render gecisinden ONCE kodlaninca GPU onu
+ * yansima / kup / sahne gecisleriyle ust uste yurutur (k79 ovl: 8.7 bin
+ * ucgenlik hizli kurulum tek basina 0.94 ms, 9 ms'lik render isiyle birlikte
+ * +0.1 ms).  Sahne sonu (ekrandan ilk kopya) ve yansima cizimi kare basinda
+ * taranir; erken yol kosulamadiysa birlestirme eskisi gibi kendisi kurar.
+ * HD_RT_EARLY=0 eski; ABTEST=RTEARLY kapali dilimde eski yol. */
+static struct { int ok; unsigned tris, nt; float fogp[4]; } g_rt_early;
+static int hd_rt_early_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("HD_RT_EARLY"); v = (e && *e == '0') ? 0 : 1; }
+    return v && !abt_off("RTEARLY");
+}
+/* Karenin kamerasi: gorunum-projeksiyon (Hor+ ile), tersi, gorunumun tersi ve
+ * projeksiyonun 1/P00, 1/P11'i.  0 = kamera yok ya da tekil. */
+static int hd_cam_mats(int rb, float *vp, float *ivp, float *iv, float *ipx, float *ipy){
+    if (!g_hd_cam_ok[rb]) return 0;
+    memcpy(vp, &g_hd_cam[rb][32], 16 * sizeof(float));
+    for (int r4 = 0; r4 < 4; r4++) vp[r4*4] *= g_hd_cam_k[rb];   /* Hor+ */
+    if (!hd_inv4(vp, ivp) || !hd_inv4(&g_hd_cam[rb][0], iv)) return 0;
+    float p00 = g_hd_cam[rb][16] * g_hd_cam_k[rb], p11 = g_hd_cam[rb][16 + 5];
+    if (p00 == 0.f || p11 == 0.f) return 0;
+    *ipx = 1.f / p00; *ipy = 1.f / p11;
+    return 1;
+}
+/* ---- SAHNE ARASI KOPYA (hareket bulanikligi) -------------------------------
+ * Oyun hizli surerken karelerin cogunda (yaris 6000-8000: 2000 karenin 1237'si)
+ * once uzak sahneyi cizip ekrani #786'ya kopyaliyor, bulaniklastirip (ps19)
+ * ekrana harmanliyor (ps22), SONRA arabalari ve yakin sahneyi (Z yazarak)
+ * ciziyor.  HD ekrandan ilk kopyayi sahne sonu sayiyordu: birlestirme (RT/SSR)
+ * kopyada calisiyor, kopyadan sonra ekran tek ornekli -> o karelerde arabalar
+ * MSAA'siz, G-tamponsuz (RT yansimasi yok) ve yansima yakalamasinin disinda;
+ * kareden kareye degistigi icin titresim.  Simdi: ekrandan kopyadan sonra
+ * ayni karede (bir sonraki ekran kopyasina dek) ekrana Z yazan cizim varsa o
+ * kopya SAHNE ARASIDIR: cok ornekli renk / G / Z saklanir + cozulur (kopya
+ * cozulmus rengi okur), sahne ayni eklerle (Load) devam eder, birlestirme
+ * gercek sahne sonunda.  HD_MBFIX=0 eski davranis. */
+static uint8_t g_hd_brk[MAXD];                   /* bu karenin sahne arasi kopyalari */
+static _Atomic unsigned long long g_hd_brk_n;
+static void hd_break_plan(int rb){
+    static int on = -1; if (on < 0){ const char *e = ENVC("HD_MBFIX"); on = !(e && *e == '0'); }
+    if (rb < 0) return;
+    unsigned n = g_dn[rb] < MAXD ? g_dn[rb] : MAXD, b = ~0u;
+    memset(g_hd_brk, 0, n);
+    for (unsigned i = 0; i < n; i++){
+        const MDraw *dr = &g_dbuf[rb][i];
+        if (dr->is_blit && !dr->blit_src){ b = dr->target ? i : ~0u; continue; }
+        if (dr->is_blit) continue;
+        if (on && !abt_off("MBFIX") && b != ~0u && !dr->target && !dr->is_clear && (dr->depth & 2u) && dr->count && !g_hd_brk[b]){
+            g_hd_brk[b] = 1; atomic_fetch_add(&g_hd_brk_n, 1ull); }
+    }
+}
+/* Birlestirmeyi tetikleyecek kayit: ekrandan ilk kopya (kodlama dongusundeki
+ * kosulla ayni).  *refl: oncesinde G-tamponlu ekran gecisine yansima varyanti
+ * cizilecek mi (hd_refl_drawn'in on kestirimi). */
+static unsigned hd_scene_end_scan(int rb, int *refl){
+    *refl = 0;
+    for (unsigned i = 0; i < g_dn[rb] && i < MAXD; i++){
+        const MDraw *dr = &g_dbuf[rb][i];
+        if (dr->is_blit){
+            if (!dr->blit_src && dr->target && TGT_ID(dr->target) < MAXTEX && g_tex[TGT_ID(dr->target)] && !g_hd_brk[i]) return i;
+            continue; }
+        if (!dr->target && !dr->is_clear && dr->ps >= PSREFL) *refl = 1;
+    }
+    return ~0u;
+}
+/* tani (HD_MBLOG=1): ekrandan ilk kopyadan SONRA ekrana Z yazan 3B cizim var mi
+ * (hareket bulanikligi kopyasi sahnenin ortasinda) */
+static void hd_mb_log(int rb, long fno){
+    static int on = -1; if (on < 0) on = ENVC("HD_MBLOG") ? 1 : 0;
+    if (!on || rb < 0) return;
+    static unsigned long long nf, nm; static int shown;
+    unsigned n = g_dn[rb], B = ~0u, after = 0, a777 = 0, firstk = 0;
+    for (unsigned i = 0; i < n && i < MAXD; i++){
+        const MDraw *dr = &g_dbuf[rb][i];
+        if (B == ~0u){ if (dr->is_blit && !dr->blit_src) B = i; continue; }
+        if (!dr->target && !dr->is_clear && !dr->is_blit && (dr->depth & 2u) && dr->count){
+            if (!after) firstk = i; after++; if (dr->ps >= PSREFL) a777++; }
+    }
+    nf++; if (after) nm++;
+    static long lastf = -10;
+    if (after && fno > 5800 && fno - lastf > 30 && shown < 40){ shown++;
+        fprintf(stderr, "[MB] kare %ld: ekran kopyasi %u, sonra %u Z yazan ekran cizimi (ilk %u, yansimali %u), toplam %u\n",
+                fno, B, after, firstk, a777, n); }
+    if (after) lastf = fno;
+    if ((nf % 2000ull) == 0ull) fprintf(stderr, "[MB] %llu karede %llu sahne ortasi kopya\n", nf, nm);
+}
+static void hd_rt_early(id<MTLCommandBuffer> cb, int rb){
+    g_rt_early.ok = 0;
+    if (!hd_rt_early_on() || !hd_rt_on() || !g_hd_g[0] || g_ab_mode == 5 || g_ab_mode == 6) return;
+    int refl = 0; unsigned se = hd_scene_end_scan(rb, &refl);
+    float vp[16], ivp[16], iv[16], ipx, ipy;
+    if (se == ~0u || !refl || !hd_cam_mats(rb, vp, ivp, iv, &ipx, &ipy)) return;
+    hd_rt_init();
+    if (!g_rt_pso) return;
+    g_rt_early.tris = hd_rt_frame(cb, rb, se, iv, vp, ivp, ipx, ipy, &g_rt_early.nt, g_rt_early.fogp);
+    g_rt_early.ok = 1;
 }
 /* Sahne sonu birlestirmesi: isin izleme (varsa) ya da SSR.  i = sahnenin
  * bittigi cizim indeksi; scr = cozulmus ekran dokusu (drawable). */
@@ -2678,7 +3230,7 @@ static int hd_ms_memless_ok(int rb, unsigned i){
         if (x->is_clear && (x->clr_flags & 2u) && zid) break; }
     for (; j < n; j++){ const MDraw *x = &g_dbuf[rb][j];
         if (x->is_blit){
-            if (!x->blit_src) return 1;                                   /* ekran okunuyor: sonrasi tek ornekli */
+            if (!x->blit_src) return !g_hd_brk[j];                        /* ekran okunuyor: sonrasi tek ornekli (sahne arasi degilse) */
             if (!x->target) return 0;                                     /* ekrana kopya: MS renge saklanir */
             continue; }
         if (!x->target) return 0;                                         /* baska bir ekran gecisi: yukler */
@@ -2699,7 +3251,7 @@ static int hd_ms_end(id<MTLRenderCommandEncoder> enc, int rb, unsigned k, int c_
     unsigned n = g_dn[rb], k0 = k; int store = 0, res = 0, reader = 0, pend = 0;
     for (; k < n; k++){ const MDraw *x = &g_dbuf[rb][k];
         if (x->is_blit){
-            if (!x->blit_src){ res = 1; reader = 1; break; }
+            if (!x->blit_src){ res = 1; reader = 1; if (g_hd_brk[k]) store = 1; break; }
             if (!x->target){ res = 1; store = 1; break; }
             continue; }
         if (!x->target){ store = 1; break; }
@@ -2736,7 +3288,7 @@ static int hd_ms_end(id<MTLRenderCommandEncoder> enc, int rb, unsigned k, int c_
     if (g_hd_msp.on && g_hd_msp.dz){
         unsigned zid = g_hd_msp.zid; int sd = -1;
         for (unsigned q = k0; q < n && sd < 0; q++){ const MDraw *x = &g_dbuf[rb][q];
-            if (x->is_blit){ if (!x->blit_src) break; continue; }        /* ekran okundu: sonrasi tek ornekli */
+            if (x->is_blit){ if (!x->blit_src && !g_hd_brk[q]) break; continue; }   /* ekran okundu: sonrasi tek ornekli */
             if (DEPTH_ZID(x->depth) != zid) continue;
             if (x->is_clear && (x->clr_flags & 2u)) sd = 0;               /* yeniden kullanimdan once temizleniyor */
             else if (!x->target) sd = 1;                                  /* ayni Z ile yeni MS gecisi yukler */
@@ -2778,8 +3330,8 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
     for (int r4 = 0; r4 < 4; r4++) vp[r4*4] *= g_hd_cam_k[rb];   /* Hor+ */
     if (!hd_inv4(vp, ivp) || !hd_inv4(&g_hd_cam[rb][0], iv)) return;
 
-    struct { float vp[16], ivp[16], cam[4], prm[4], sz[4], cam2[4], cb[3][4], fogp[4]; } sp2;
-    memset(sp2.fogp, 0, sizeof sp2.fogp);
+    struct { float vp[16], ivp[16], cam[4], prm[4], sz[4], cam2[4], cb[3][4], fogp[4], rt2[4]; } sp2;
+    memset(sp2.fogp, 0, sizeof sp2.fogp); memset(sp2.rt2, 0, sizeof sp2.rt2);
     static float cl = -1.f, st = -1.f, md = -1.f, rmd = -1.f, rlk = -1.f;
     if (cl < 0.f){ const char *e = ENVC("HD_SSR_CARLOD"); cl = e ? (float)atof(e) : 1.0f;
                    e = ENVC("HD_SSR_STEPS"); st = e ? (float)atof(e) : 48.f;
@@ -2794,6 +3346,24 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
     sp2.prm[2] = 1.f; sp2.prm[3] = md;
     sp2.sz[0] = (float)scr.width; sp2.sz[1] = (float)scr.height; sp2.sz[2] = st; sp2.sz[3] = 0.6f;
     sp2.cam2[0] = cl; sp2.cam2[1] = rmd; sp2.cam2[2] = rlk;
+    /* --- ISIN MESAFE SINIRI ---------------------------------------------------
+     * Olculdu (2026-10-21, Quick Race kapasite kipi): isin cekirdeginin ~1.3 / 2.0
+     * ms'si uzak sahnenin piksellerinden (ufka yakin yol: yatik, uzun isinlar).
+     * O mesafede yansima birkac piksel ve sisli; HD_RT_FAR birimden uzak yuzeyde
+     * isin atilmaz, oyunun kendi yansimasi (R0) kalir; sinirin son %30'unda
+     * isin sonucu R0'a yumusakca karisir (gorunur kenar yok).  VARSAYILAN KAPALI:
+     * olculdu (kapasite kipi) 60 / 120 / 200 birimde yalniz -0.1 ms -- maliyet
+     * uzaktaki yolda degil, isinlar butun yola yayilmis.  HD_RT_FAR=<birim> acar.
+     * HD_RT_BMIN=<esik>: oyunun yansima agirligi B esigin altindaki pikselde isin
+     * yok (degisim <= B).  Olculdu: 0.02'de -%0.8, 0.06'da -%3.3 Mcevrim (0.06
+     * gorunur yansimayi keser) -- B cogu yol pikselinde buyuk; varsayilan kapali. */
+    { static float rfar = -1.f;
+      if (rfar < 0.f){ const char *e = ENVC("HD_RT_FAR"); rfar = e ? (float)atof(e) : 0.f; if (rfar < 0.f) rfar = 0.f;
+          fprintf(stderr, "[HD] isin mesafe siniri: %s (%.0f birim)\n", rfar > 0.f ? "ACIK" : "KAPALI", (double)rfar); }
+      sp2.rt2[0] = abt_off("RTFAR") ? 0.f : rfar; sp2.rt2[1] = 0.7f; }
+    { static float bmin = -1.f;
+      if (bmin < 0.f){ const char *e = ENVC("HD_RT_BMIN"); bmin = e ? (float)atof(e) : 0.f; if (bmin < 0.f) bmin = 0.f; }
+      sp2.rt2[2] = abt_off("RTBMIN") ? 0.f : bmin; }
     sp2.cam2[3] = ENVC("HD_RT_PLAIN") ? 2.f : ENVC("HD_RT_NOTEX") ? 1.f : 0.f;     /* tani */
     if (g_ab_mode == 2) sp2.cam2[3] = 2.f;
     for (int a3 = 0; a3 < 3; a3++){ memcpy(sp2.cb[a3], &g_hd_cube[rb][a3*3], 12); sp2.cb[a3][3] = 0.f; }
@@ -2811,7 +3381,10 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
     if (hd_rt_on() && g_ab_mode != 5 && g_ab_mode != 6){
         hd_rt_init();
         float p00 = g_hd_cam[rb][16] * g_hd_cam_k[rb], p11 = g_hd_cam[rb][16 + 5];
-        if (g_rt_pso && p00 != 0.f && p11 != 0.f)
+        if (g_rt_early.ok){              /* bkz. ISIN IZLEME KARE BASINDA */
+            g_rt_early.ok = 0; rt_tris = g_rt_early.tris; rt_nt = g_rt_early.nt;
+            memcpy(sp2.fogp, g_rt_early.fogp, sizeof sp2.fogp); sp2.cb[1][3] = (float)g_rt_only_static; }
+        else if (g_rt_pso && p00 != 0.f && p11 != 0.f)
             { rt_tris = hd_rt_frame(cb, rb, i, iv, vp, ivp, 1.f / p00, 1.f / p11, &rt_nt, sp2.fogp); sp2.cb[1][3] = (float)g_rt_only_static; }
         if (rt_tris){
             NSUInteger ow = (scr.width + rsc - 1) / rsc, oh = (scr.height + rsc - 1) / rsc;
@@ -2827,22 +3400,26 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
              * DISINDA tek basina zamanlanir.  Kare ici maliyetle karsilastirmak icin. */
             if (g_hd_dump_now && ENVC("HD_RTPROBE2")){
                 static int once = 0;
-                if (!once){ once = 1;
+                if (!once || ENVC("HD_RTPROBE2_HER")){ once = 1;
                     id<MTLCommandBuffer> pb = [g_queue commandBuffer]; unsigned nt2 = 0;
                     unsigned t2 = hd_rt_frame(pb, rb, i, iv, vp, ivp, 1.f / p00, 1.f / p11, &nt2, sp2.fogp);
                     [pb commit]; [pb waitUntilCompleted];
                     fprintf(stderr, "[RT2] yakalama+kurulum (ayri tampon): %.2f ms, %u ucgen\n",
                             (pb.GPUEndTime - pb.GPUStartTime) * 1e3, t2);
-                    double best = 1e30, sum = 0;
-                    for (int it = 0; it < 9; it++){
+                    double best[3] = { 1e30, 1e30, 1e30 }, sum[3] = { 0, 0, 0 };
+                    for (int it = 0; it < 19; it++){       /* cekirdek degiskenleri donusumlu, ayni veri */
+                        int kv = g_rt_kern2 ? 1 + (it & 1) : 1;
+                        g_rt_kforce = kv;
                         id<MTLCommandBuffer> tb = [g_queue commandBuffer];
                         hd_rt_trace(tb, &sp2, sizeof sp2, zt, ow, oh, nt2);
                         [tb commit]; [tb waitUntilCompleted];
                         double msx = (tb.GPUEndTime - tb.GPUStartTime) * 1e3;
-                        if (it == 0) continue;
-                        if (msx < best) best = msx; sum += msx;
+                        if (it < 2) continue;
+                        if (msx < best[kv]) best[kv] = msx; sum[kv] += msx;
                     }
-                    fprintf(stderr, "[RT2] isin cekirdegi (kare disi, tek basina): en iyi %.2f ms, ort %.2f ms\n", best, sum / 8);
+                    g_rt_kforce = 0;
+                    fprintf(stderr, "[RT2] kare %ld isin cekirdegi (kare disi, tek basina): eski en iyi %.3f ort %.3f ms | RT_V2 en iyi %.3f ort %.3f ms\n",
+                            (long)atomic_load(&g_frames_drawn), best[1], sum[1] / (g_rt_kern2 ? 9 : 17), best[2], g_rt_kern2 ? sum[2] / 8 : 0.0);
                     { rt_tris = hd_rt_frame(cb, rb, i, iv, vp, ivp, 1.f / p00, 1.f / p11, &rt_nt, sp2.fogp); sp2.cb[1][3] = (float)g_rt_only_static; }
                 }
             }
@@ -4837,6 +5414,121 @@ static int fs_pref_load(void){
     if (e && *e) return e[0] != '0';
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"NFSUFullScreen"] ? 1 : 0;
 }
+
+/* ---- SISTEM KISAYOLU ENGELI ---------------------------------------------
+ * Oyun ondeyken macOS'un Space / Mission Control kisayollari kapali.
+ * 2026-10-19 oturumu: Ctrl'li bir oyun tusuyla ok tusuna birlikte basilinca
+ * (Ctrl+Sol/Sag) masaustu degisti; oyun 1.6 sn tam ekran oyun kipinden cikti,
+ * kare 0.54 sn nextDrawable'da dondu.  Kisayol durumu pencere sunucusunda
+ * tutulur, tercih dosyasina yazilmaz ve surec olunce KENDILIGINDEN GERI
+ * GELMEZ (SIGKILL ile denendi).  Bu yuzden ilk kapatmada ayni ikiliden kucuk
+ * bir bekci surec dogar (NFSU_KISAYOL_BEKCI, tests/boot.c main'in ilk isi):
+ * kapatilan kimlikleri borudan ogrenir, boru kapaninca -- oyun nasil biterse
+ * bitsin -- onlari geri acar.  Oyun arkaya gecince kisayollar hemen geri
+ * acilir; Cmd+Tab, Spotlight ve ekran goruntusu kisayollarina dokunulmaz.
+ * NFSKISAYOL=0: hic dokunma; =2 (test): pencere arkadayken de kapat.
+ * NOFOCUS'lu test kosularinda =2 olmadikca devreye girmez. */
+#include <spawn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <mach-o/dyld.h>
+extern char **environ;
+typedef int  (*ks_set_fn)(unsigned, bool);
+typedef bool (*ks_is_fn)(unsigned);
+static ks_set_fn g_ks_set;
+static ks_is_fn  g_ks_is;
+/* Mission Control 32/34, uygulama pencereleri 33/35, masaustunu goster 36/37,
+ * onceki/sonraki girdi kaynagi 60/61 (Ctrl+Bosluk), Space sol/sag/yukari/asagi
+ * 79-86, Masaustu 1-16'ya gec 118-133 (Ctrl+1..).  Kimlikler
+ * com.apple.symbolichotkeys ile ayni. */
+static const unsigned short g_ks_ids[] = { 32, 33, 34, 35, 36, 37, 60, 61,
+    79, 80, 81, 82, 83, 84, 85, 86, 118, 119, 120, 121, 122, 123, 124, 125,
+    126, 127, 128, 129, 130, 131, 132, 133 };
+#define KS_N ((int)(sizeof g_ks_ids / sizeof g_ks_ids[0]))
+static unsigned char g_ks_off[KS_N];     /* bizim kapattiklarimiz */
+static int g_ks_on = 0, g_ks_fd = -1;
+
+static int ks_api(void){
+    static int done = 0;
+    if (!done){ done = 1;
+        void *h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY);
+        g_ks_set = h ? (ks_set_fn)dlsym(h, "SLSSetSymbolicHotKeyEnabled") : NULL;
+        g_ks_is  = h ? (ks_is_fn)dlsym(h, "SLSIsSymbolicHotKeyEnabled") : NULL;
+        if (!g_ks_set || !g_ks_is) fprintf(stderr, "app: sistem kisayolu API'si yok, engel kapali\n"); }
+    return g_ks_set && g_ks_is;
+}
+/* 0 = dokunma, 1 = oyun ondeyken kapat, 2 = (test) arka planda da kapat */
+static int ks_wanted(void){
+    static int w = -1;
+    if (w < 0){ const char *e = ENVC("NFSKISAYOL"), *nf = ENVC("NOFOCUS");
+        if (e && e[0] == '2') w = 2;
+        else w = !(e && e[0] == '0') && !(nf && nf[0] && nf[0] != '0'); }
+    return w;
+}
+/* Bekci: stdin'den "d <id>" (kapatildi) / "e <id>" (geri acildi) satirlari;
+ * EOF = oyun bitti -> hala kapali olanlari ac. */
+int metal_kisayol_bekci(void){
+    signal(SIGINT, SIG_IGN); signal(SIGHUP, SIG_IGN);
+    signal(SIGTERM, SIG_IGN); signal(SIGQUIT, SIG_IGN);
+    unsigned char off[256] = {0};
+    char line[32];
+    while (fgets(line, sizeof line, stdin)){
+        unsigned id = (unsigned)strtoul(line + 1, NULL, 10);
+        if (id < 256) off[id] = line[0] == 'd';
+    }
+    int n = 0;
+    if (ks_api()) for (unsigned id = 0; id < 256; id++) if (off[id]){ g_ks_set(id, true); n++; }
+    if (n) fprintf(stderr, "kisayol bekcisi: oyun beklenmedik bicimde bitti, %d sistem kisayolu geri acildi\n", n);
+    return 0;
+}
+static void ks_bekci_start(void){
+    char path[4096]; uint32_t n = sizeof path;
+    if (_NSGetExecutablePath(path, &n) != 0) return;
+    int p[2]; if (pipe(p) != 0) return;
+    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, p[0], 0);
+    posix_spawn_file_actions_addinherit_np(&fa, 2);   /* bekcinin notu oyunun loguna */
+    posix_spawnattr_t at; posix_spawnattr_init(&at);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    char *av[] = { path, NULL };
+    char *ev[] = { "NFSU_KISAYOL_BEKCI=1", NULL };
+    pid_t pid;
+    int r = posix_spawn(&pid, path, &fa, &at, av, ev);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&at);
+    close(p[0]);
+    if (r != 0){ close(p[1]);
+        fprintf(stderr, "app: kisayol bekcisi baslatilamadi (%d), engel kapali\n", r); return; }
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    fcntl(p[1], F_SETNOSIGPIPE, 1);     /* bekci olurse yazma oyunu oldurmesin */
+    g_ks_fd = p[1];
+}
+static void ks_note(char op, unsigned id){
+    char b[16]; int n = snprintf(b, sizeof b, "%c %u\n", op, id);
+    if (g_ks_fd >= 0) (void)!write(g_ks_fd, b, (size_t)n);
+}
+static void ks_engel(int on){
+    if (on == g_ks_on) return;
+    g_ks_on = on;
+    if (!ks_api()) return;
+    int n = 0;
+    if (on){
+        if (g_ks_fd < 0) ks_bekci_start();
+        if (g_ks_fd < 0) return;        /* bekcisiz kapatma yok: cokerse kapali kalirdi */
+        for (int i = 0; i < KS_N; i++){
+            unsigned id = g_ks_ids[i];
+            if (!g_ks_is(id)) continue;  /* kullanici zaten kapatmis */
+            ks_note('d', id);            /* once bekciye: arada cokersek o acar */
+            if (g_ks_set(id, false) == 0){ g_ks_off[i] = 1; n++; }
+            else ks_note('e', id);
+        }
+    } else {
+        for (int i = 0; i < KS_N; i++) if (g_ks_off[i]){
+            g_ks_set(g_ks_ids[i], true); g_ks_off[i] = 0; ks_note('e', g_ks_ids[i]); n++; }
+    }
+    fprintf(stderr, "app: sistem kisayollari %s (%d)\n", on ? "kapatildi (oyun onde)" : "geri acildi", n);
+}
+
 @interface NfsuDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate> @end
 @implementation NfsuDelegate
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)s { (void)s; return YES; }
@@ -4888,6 +5580,116 @@ static int fs_pref_load(void){
     atomic_store(&g_should_quit, 1); return NSTerminateCancel; }
 @end
 
+#if NFS_ENHANCED
+/* ---- AYRI G GECISI ----------------------------------------------------------
+ * Olculdu (2026-10-21, Quick Race kapasite kipi, en yuksek saatte 8.40 ms/kare):
+ * MSAA 2x'in G-tamponsuz bedeli 0.9 ms, G-tamponuyla ~3 ms.  G (3 hedef, ornek
+ * basina 12 bayt) cok ornekli sahne gecisinde renk + Z ile birlikte 2 ornek
+ * olarak karo belleginde tasiniyor, cozuluyor; hareket bulanikligi bolunmesinde
+ * (bkz. SAHNE ARASI KOPYA) ayrica saklanip geri yukleniyordu.  Ustelik yansima
+ * varyanti oyunun gölgelendiricisini UC KEZ degerlendiriyor (R0, B icin) ve bu
+ * da cok ornekli gecisteydi.  Simdi:
+ *  - Sahne gecisi G'siz; yansiyan cizimler orada oyunun KENDI gölgelendiricisiyle
+ *    (varyantin c0'i ile birebir ayni) cizilir.
+ *  - Sahne bitince (birlestirmeden hemen once) TEK ORNEKLI bir G gecisi yalniz
+ *    opak yansima varyanti cizimlerini yeniden cizer: hedef G dokulari (temiz),
+ *    Z = sahnenin cozulmus Z ikizi (Sample0), Z yazmadan <= testi.  Onlerindeki
+ *    her Z yazan yuzey onlari eler -> sinif 0 kalir (eskiden yansimasiz opak
+ *    cizimin G'yi sifirlamasiyla ayni sonuc).  Tek ornekli merkez ile Sample0
+ *    arasindaki ceyrek piksel kaymasi egime gore Z sapmasiyla kapanir.
+ *  - Karisimli cizimler eskisi gibi G yazmaz (yeniden cizilmez).
+ * HD_GSEP=0 eski; ABTEST=GSEP ayni kosuda karsilastirir. */
+static int hd_gsep(void){
+    static int v = -1; if (v < 0){ const char *e = ENVC("HD_GSEP"); v = (e && *e == '0') ? 0 : 1; }
+    return v && hd_msaa_n() > 1 && !abt_off("GSEP");
+}
+static id<MTLTexture> g_hd_gp_c0;                 /* G gecisinin renk 0'i: yazilmaz (belleksiz) */
+static _Atomic unsigned long long g_hd_gp_n, g_hd_gp_draws;
+static void hd_gpass(id<MTLCommandBuffer> cb, int rb, unsigned upto, unsigned zid){
+    id<MTLTexture> zt = (zid && zid < MAXZ) ? g_ztex[zid] : nil;
+    if (rb < 0 || !zt || !g_hd_g[0] || zt.width != g_hd_g[0].width || zt.height != g_hd_g[0].height) return;
+    NSUInteger W = zt.width, H = zt.height;
+    if (!g_hd_gp_c0 || g_hd_gp_c0.width != W || g_hd_gp_c0.height != H){
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                         width:W height:H mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = hd_ml_hw() ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+        g_hd_gp_c0 = [g_dev newTextureWithDescriptor:td];
+    }
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = g_hd_gp_c0;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    for (int gi = 0; gi < HD_NG; gi++){
+        MTLRenderPassColorAttachmentDescriptor *ga = rp.colorAttachments[1 + gi];
+        ga.texture = g_hd_g[gi];
+        ga.loadAction = MTLLoadActionClear;
+        ga.storeAction = MTLStoreActionStore;
+        ga.clearColor = (gi == 2 && hd_gpack())           /* paketli: sifir yon = 512 */
+            ? MTLClearColorMake(512.0 / 1023.0, 512.0 / 1023.0, 512.0 / 1023.0, 0)
+            : MTLClearColorMake(0, 0, 0, 0);
+    }
+    rp.depthAttachment.texture = zt;
+    rp.depthAttachment.loadAction = MTLLoadActionLoad;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    pp_rp(rp, "G gecisi (tek ornekli)");
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (halfpx_on()){ MTLViewport vp = { 0.5, 0.5, (double)W, (double)H, 0.0, 1.0 }; [e setViewport:vp]; }
+    [e setVertexBuffer:g_mtlvb offset:0 atIndex:0];
+    { float z4[4] = {0, 0, 0, 0}; [e setVertexBytes:z4 length:sizeof z4 atIndex:3]; }
+    { static int cw = -1;
+      if (cw < 0){ const char *ev = ENVC("CULLWIND"); cw = (ev && *ev && *ev != '0') ? 1 : 0; }
+      [e setFrontFacingWinding:cw ? MTLWindingCounterClockwise : MTLWindingClockwise]; }
+    if (g_atdbg) [e setFragmentBuffer:g_atdbg offset:0 atIndex:6];
+    /* Z: <= testi, yazma yok (bkz. dss_for: bit0 test, bit1 yazma, bit2-4 D3DCMP) */
+    [e setDepthStencilState:dss_for(1u | (4u << 2))];
+    [e setDepthBias:0.f slopeScale:-1.0f clamp:0.f];
+    unsigned nd = 0;
+    const MDraw *D = g_dbuf[rb];
+    for (unsigned j = 0; j < upto && j < g_dn[rb]; j++){
+        const MDraw *dr = &D[j];
+        if (dr->is_blit || dr->is_clear || !dr->count || dr->target || dr->ps < PSREFL || (dr->blend & 1u)) continue;
+        if (!(dr->depth & 1u) && !(dr->depth & 2u)) continue;   /* Z'siz cizim: sahnede yeri belirsiz */
+        uint64_t k2 = (uint64_t)(dr->blend & 0xFFFFFu & ~(15u << 14))   /* renk 0 yazilmaz */
+                    | ((uint64_t)(dr->ps & 0xFFF) << 20)
+                    | ((uint64_t)(dr->vsid & 0xFFF) << 32)
+                    | (1ull << 49);
+        if ((alfavar_mode() && !(dr->alpha_ref > 0.f) && !abt_off("ALFAVAR")) || alfavar_mode() == 3) k2 |= 1ull << 52;
+        [e setRenderPipelineState:pso_for(k2)];
+        [e setCullMode:(dr->cull == 1u) ? MTLCullModeNone : (dr->cull == 2u) ? MTLCullModeFront : MTLCullModeBack];
+        [e setBlendColorRed:(float)((dr->bcol>>16)&0xFFu)/255.f green:(float)((dr->bcol>>8)&0xFFu)/255.f
+                       blue:(float)(dr->bcol&0xFFu)/255.f alpha:(float)((dr->bcol>>24)&0xFFu)/255.f];
+        for (int si = 0; si < 4; si++) [e setFragmentSamplerState:samp_for(dr->smp[si]) atIndex:(NSUInteger)si];
+        { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } fp;
+          fp.aref = dr->alpha_ref; fp.usec = 0.f; fp.p0 = fp.p1 = 0.f;
+          memcpy(fp.proj, dr->proj, sizeof fp.proj);
+          memcpy(fp.fogv, dr->fogv, sizeof fp.fogv);
+          memcpy(fp.c, g_pscb[rb][dr->psci], sizeof fp.c);
+          [e setFragmentBytes:&fp length:sizeof fp atIndex:0]; }
+        { unsigned ts[4] = { dr->tex, dr->tex1, dr->tex2, dr->tex3 };
+          for (int q4 = 0; q4 < 4; q4++){ unsigned tt = ts[q4];
+              [e setFragmentTexture:(tt && tt < MAXTEX && g_tex[tt]) ? g_tex[tt] : g_white atIndex:(NSUInteger)q4]; } }
+        if (dr->vsid > 0 && dr->ix_isz){
+            id<MTLBuffer> pl = g_pool_fr[rb];
+            [e setVertexBuffer:pl offset:dr->rawoff atIndex:1];
+            [e setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
+            [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
+                           indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                         indexBuffer:pl indexBufferOffset:dr->ix_ib instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
+        } else if (dr->vsid > 0){
+            float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, 0, 0 };
+            [e setVertexBytes:u4 length:sizeof u4 atIndex:3];
+            [e setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
+            [e setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:dr->count];
+        } else
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:dr->first vertexCount:dr->count];
+        nd++;
+    }
+    [e endEncoding];
+    atomic_fetch_add(&g_hd_gp_n, 1ull); atomic_fetch_add(&g_hd_gp_draws, nd);
+}
+#endif
 /* Ana thread'de cagrilmali. Pencereyi acar ve NSApp dongusunu surer;
  * geri donmez (uygulama kapanana kadar).                                */
 void metal_run_main_loop(void){
@@ -5075,6 +5877,8 @@ void metal_run_main_loop(void){
               if (ti < tn && atomic_load(&g_frames_drawn) >= tg[ti]){
                   ti++; fprintf(stderr, "app: FSTOGGLE kare %ld\n", atomic_load(&g_frames_drawn));
                   [g_win toggleFullScreen:nil]; } }
+            /* Oyun ondeyken sistem kisayollari kapali (bkz. ks_engel) */
+            { int kw = ks_wanted(); if (kw) ks_engel(kw == 2 || [NSApp isActive]); }
             @autoreleasepool {
                 NSEvent *ev;
                 while ((ev = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -5242,12 +6046,25 @@ void metal_run_main_loop(void){
                 if (!have_new && atomic_load(&g_frame_pending)) g_skip_empty++;
                 if (have_new && atomic_exchange(&g_frame_pending, 0)){
                     struct timespec _d0,_d1; clock_gettime(CLOCK_MONOTONIC,&_d0);
-                    id<CAMetalDrawable> d = [g_layer nextDrawable];
+                    /* NODRAW=1 (yalniz OLCUM): ekran yerine 3 donusumlu ozel doku, sunum
+                     * yok -> bilesitirici temposu (120 Hz) yok, kare hizi = GPU/CPU
+                     * kapasitesi.  Gorunmez pencerede displaySyncEnabled=NO etkisiz. */
+                    id<CAMetalDrawable> d = nil; id<MTLTexture> dtex = nil;
+                    { static int nd = -1; if (nd < 0) nd = ENVC("NODRAW") ? 1 : 0;
+                      if (nd){ static id<MTLTexture> ot[3]; static unsigned oi;
+                          CGSize ds = g_layer.drawableSize; unsigned k3 = (oi++) % 3u;
+                          if (!ot[k3] || ot[k3].width != (NSUInteger)ds.width || ot[k3].height != (NSUInteger)ds.height){
+                              MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:g_layer.pixelFormat
+                                  width:(NSUInteger)ds.width height:(NSUInteger)ds.height mipmapped:NO];
+                              od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
+                              ot[k3] = [g_dev newTextureWithDescriptor:od]; }
+                          dtex = ot[k3]; }
+                      else { d = [g_layer nextDrawable]; dtex = d.texture; } }
                     clock_gettime(CLOCK_MONOTONIC,&_d1);
                     atomic_fetch_add(&g_wait_drawable_ns,
                       (unsigned long long)(_d1.tv_sec-_d0.tv_sec)*1000000000ull
                       + (unsigned long long)_d1.tv_nsec - (unsigned long long)_d0.tv_nsec);
-                    if (d){
+                    if (dtex){
                         struct timespec _e0; clock_gettime(CLOCK_MONOTONIC,&_e0);
                         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
                         pp_begin(atomic_load(&g_frames_drawn) + 1);
@@ -5286,7 +6103,7 @@ void metal_run_main_loop(void){
                         }
 
 #if NFS_ENHANCED
-                        hd_msaa_frame(d.texture.width, d.texture.height);   /* bkz. COZUNURLUGE GORE MSAA */
+                        hd_msaa_frame(dtex.width, dtex.height);   /* bkz. COZUNURLUGE GORE MSAA */
 #endif
                         /* Cizimler hedeflerine gore siraya dizili; hedef
                          * degistikce yeni bir render gecisi acilir. */
@@ -5307,13 +6124,14 @@ void metal_run_main_loop(void){
                         int c_zon = 0;                  /* gecisin gercek Z yuzeyi var */
                         int c_ms = 0;                   /* (HD) gecis cok ornekli */
                         int c_gb = 0;                   /* (HD) gecis G-tamponu tasiyor */
+                        int c_gbx = 0;                  /* (HD) sahne gecisi, G ayri gecise ertelendi (bkz. AYRI G GECISI) */
                         int hd_post = 0;                /* (HD) ekrandan ilk kopya gecti: son islem asamasi */
                         unsigned c_att = 0;             /* (HD) gecise cozme hedefi baglandi: bit0 renk, bit1 G */
                         (void)hd_post; (void)c_att;
                         if (rb >= 0) pass_reorder(rb);  /* sahneyi bolen ara gecisi ertele (bkz. GECIS BIRLESTIRME) */
                         /* bkz. EKRAN YONLENDIRME: scr_b'ye kadar ekran kayitlari scr_T'ye cizilir */
                         unsigned scr_T = 0; int scr_after = 0;
-                        long scr_b = rb >= 0 ? scr_redirect_plan(rb, d.texture, &scr_T) : -1;
+                        long scr_b = rb >= 0 ? scr_redirect_plan(rb, dtex, &scr_T) : -1;
                         /* bkz. SON ISLEM ZINCIRI: fbrole[i] 1 = zincir basi, 2 = devami */
                         static uint8_t fbrole[MAXD];
                         int nfb = rb >= 0 ? fb_plan(rb, fbrole, g_dn[rb]) : 0;
@@ -5326,6 +6144,10 @@ void metal_run_main_loop(void){
 #endif
 #if NFS_ENHANCED
                         memset(g_hd_zms_used, 0, sizeof g_hd_zms_used);
+                        g_rt_early.ok = 0;
+                        hd_break_plan(rb);
+                        hd_mb_log(rb, atomic_load(&g_frames_drawn) + 1);
+                        if (rb >= 0) hd_rt_early(cb, rb);   /* bkz. ISIN IZLEME KARE BASINDA */
 #endif
                         struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } c_fp;
                         int c_fp_valid = 0;
@@ -5502,7 +6324,7 @@ void metal_run_main_loop(void){
                         }
 #if NFS_ENHANCED
                         if (rb >= 0 && ENVC("HD_RTPROBE") && dump_wanted(fno_pre))
-                            hd_rt_probe(rb, d.texture, fno_pre);
+                            hd_rt_probe(rb, dtex, fno_pre);
                         g_hd_dump_now = dump_wanted(fno_pre);
                         /* CAMLOG=1 (DUMPFRAME ile): karenin kamerasi + dunya
                          * geometrisi cizen ilk birkac cizimin kose sabitleri. */
@@ -5612,7 +6434,7 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil;
-                                              if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                              if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                                     if (enc){ [enc endEncoding]; enc = nil; }
                                     cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
@@ -5644,7 +6466,7 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil;
-                                              if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                              if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                                     if (enc){ [enc endEncoding]; enc = nil; }
                                     cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
@@ -5665,7 +6487,7 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil;
-                                              if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                              if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                                     if (enc){ [enc endEncoding]; enc = nil; }
                                     cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
@@ -5727,16 +6549,16 @@ void metal_run_main_loop(void){
                                 if (dr->is_blit){
 #if NFS_ENHANCED
                                     /* gecerli olsun olmasin: hd_ms_end bu kopyayi gorup ornekleri saklamamis olabilir */
-                                    if (!dr->blit_src && hd_mslazy()) hd_post = 1;
+                                    if (!dr->blit_src && hd_mslazy() && !g_hd_brk[i]) hd_post = 1;
 #endif
                                     /* Kaynak/hedef dokuyu coz; ekran = drawable */
                                     id<MTLTexture> st2 = dr->blit_src
                                         ? ((dr->blit_src < MAXTEX) ? g_tex[dr->blit_src] : nil)
-                                        : d.texture;
+                                        : dtex;
                                     id<MTLTexture> dt2 = dr->target
                                         ? ((TGT_ID(dr->target) < MAXTEX)
                                              ? g_tex[TGT_ID(dr->target)] : nil)
-                                        : d.texture;
+                                        : dtex;
                                     if (st2 && dt2 && st2 != dt2){
                                         if (ENVC("BLITLOG")){
                                             static unsigned seen[32]; static int sn = 0;
@@ -5752,27 +6574,28 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                                         if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                                   [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
-                                                  if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                                  if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                                         if (enc){ [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu; }
 #if NFS_ENHANCED
                                         /* SSR birlestirme: ana sahne ekrandan ILK kez kopyalaniyor
                                          * (son islem basliyor).  Sahne + G-tamponu + Z hazir. */
-                                        if (st2 == d.texture && hd_scene_open){
+                                        if (st2 == dtex && hd_scene_open && !g_hd_brk[i]){
                                             hd_scene_open = 0;
-                                            hd_composite(cb, rb, i, d.texture, hd_scene_zid, hd_refl_drawn);
+                                            if (hd_gsep() && hd_refl_drawn && hd_ssr_on()) hd_gpass(cb, rb, i, hd_scene_zid);
+                                            hd_composite(cb, rb, i, dtex, hd_scene_zid, hd_refl_drawn);
                                         }
                                         /* MSAA: ekran icerigi cok ornekli dokuda yasiyor.
                                          * Drawable'a dogrudan yazilan kopya bir sonraki
                                          * ekran gecisinin cozumuyle EZILIRDI; kopyayi
                                          * cok ornekli dokuya dortgen olarak ciz, coz. */
-                                        if (dt2 == d.texture && hd_msaa_n() > 1 && hd_pso_ms() && !hd_post){
-                                            g_hd_mscol = hd_ms_tex(g_hd_mscol, d.texture.pixelFormat,
-                                                                   d.texture.width, d.texture.height);
+                                        if (dt2 == dtex && hd_msaa_n() > 1 && hd_pso_ms() && !hd_post){
+                                            g_hd_mscol = hd_ms_tex(g_hd_mscol, dtex.pixelFormat,
+                                                                   dtex.width, dtex.height);
                                             MTLRenderPassDescriptor *mp =
                                                 [MTLRenderPassDescriptor renderPassDescriptor];
                                             mp.colorAttachments[0].texture = g_hd_mscol;
-                                            mp.colorAttachments[0].resolveTexture = d.texture;
+                                            mp.colorAttachments[0].resolveTexture = dtex;
                                             mp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
                                             mp.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
                                             pp_rp(mp, "blit -> ekran (MSAA dortgen)");
@@ -5820,7 +6643,7 @@ void metal_run_main_loop(void){
                                          * icerik veriyor (32/64 px mozaik).
                                          * Once gercek kopya ile ara dokuya al,
                                          * sonra ondan olcekleyerek ornekle. */
-                                        if (st2 == d.texture){
+                                        if (st2 == dtex){
                                             static id<MTLTexture> scratch;
                                             if (!scratch || scratch.width != st2.width ||
                                                 scratch.height != st2.height ||
@@ -5886,7 +6709,7 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                                         if (enc && cur_z == zc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                                   [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu;
-                                                  if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                                  if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                                         if (enc && cur_z == zc){ [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu; }
                                     }
@@ -5900,7 +6723,7 @@ void metal_run_main_loop(void){
                                 if (hd_blur && g_hd_dirty[dr->tex]){
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu;
-                                              if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                              if (pe) hd_ms_fallback(cb, dtex, pe); }
                                     id<MTLBlitCommandEncoder> mb = pp_blit(cb, "yol yansimasi mip uretimi");
                                     [mb generateMipmapsForTexture:g_tex[dr->tex]];
                                     [mb endEncoding];
@@ -5918,13 +6741,13 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil;
-                                              if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                              if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                                     if (enc){ [enc endEncoding]; enc = nil; }
 #if NFS_ENHANCED
                                     if (hd_is_road(TGT_ID(dr->target))) g_hd_dirty[TGT_ID(dr->target)] = 1;
 #endif
-                                    id<MTLTexture> tgt = d.texture;
+                                    id<MTLTexture> tgt = dtex;
                                     if (dr->target) freed_use(TGT_ID(dr->target), 1);
                                     if (dr->target && TGT_ID(dr->target) < MAXTEX &&
                                         g_tex[TGT_ID(dr->target)])
@@ -5973,7 +6796,7 @@ void metal_run_main_loop(void){
                                         /* hicbir ek yuklenmeyecek (renk ilk kullanim, G ilk kez,
                                          * derinlik temizlenecek) ve hicbir ornek saklanmayacak */
                                         c_ml = hd_ms_memless() && first_use &&
-                                               (hd_gb_first || !(hd_scene_open && hd_ssr_on())) &&
+                                               (hd_gb_first || hd_gsep() || !(hd_scene_open && hd_ssr_on())) &&
                                                !(zq && zq < 64u && g_hd_msz_seen[zq] && g_hd_msz_kept[zq] &&
                                                  !g_hd_zpend_ms[zq]) &&
                                                hd_ms_memless_ok(rb, i);
@@ -5998,7 +6821,8 @@ void metal_run_main_loop(void){
                                         }
                                     }
                                     c_gb = 0;
-                                    if (!dr->target && hd_scene_open && hd_ssr_on()){
+                                    c_gbx = !dr->target && hd_scene_open && hd_ssr_on() && c_ms && hd_gsep();
+                                    if (!dr->target && hd_scene_open && hd_ssr_on() && !c_gbx){
                                         NSUInteger ns = c_ms ? (NSUInteger)hd_msaa_n() : 1u;
                                         for (int gi = 0; gi < HD_NG; gi++){
                                             g_hd_g[gi] = hd_tex(g_hd_g[gi], hd_gfmt(gi), tgt.width, tgt.height, 1);
@@ -6022,6 +6846,12 @@ void metal_run_main_loop(void){
                                         hd_gb_first = 0;
                                         hd_scene_zid = DEPTH_ZID(dr->depth);
                                         c_gb = 1;
+                                    }
+                                    if (c_gbx){                     /* bkz. AYRI G GECISI: G dokulari tek ornekli */
+                                        for (int gi = 0; gi < HD_NG; gi++)
+                                            g_hd_g[gi] = hd_tex(g_hd_g[gi], hd_gfmt(gi), tgt.width, tgt.height, 1);
+                                        hd_gb_first = 0;
+                                        hd_scene_zid = DEPTH_ZID(dr->depth);
                                     }
 #endif
                                     /* Z: bagli Z yuzeyinin kendi dokusu (bkz. g_ztex).
@@ -6156,7 +6986,7 @@ void metal_run_main_loop(void){
                                     if (!c_ms) g_hd_msp.dz = 0;
 #endif
                                     if (g_pp_sb){ char pn[48];
-                                        if (!dr->target) snprintf(pn, sizeof pn, "EKRAN%s%s%s", tgt != d.texture ? " (yonlendirilmis)" : "", c_ms ? " +MSAA" : "",
+                                        if (!dr->target) snprintf(pn, sizeof pn, "EKRAN%s%s%s", tgt != dtex ? " (yonlendirilmis)" : "", c_ms ? " +MSAA" : "",
 #if NFS_ENHANCED
                                                                   c_gb ? " +G-tampon" : "");
 #else
@@ -6227,7 +7057,7 @@ void metal_run_main_loop(void){
                                             (double)dr->c0[0],(double)dr->c0[1],
                                             (double)dr->c0[2],(double)dr->c0[3]); } }
 #if NFS_ENHANCED
-                                if (dr->ps >= PSREFL && c_gb){ hd_refl_drawn = 1; atomic_fetch_add(&g_hd_refl_draws, 1ull); }
+                                if (dr->ps >= PSREFL && (c_gb || c_gbx)){ hd_refl_drawn = 1; atomic_fetch_add(&g_hd_refl_draws, 1ull); }
                                 /* Ayni Z yuzeyi bu karede ekranda (cok ornekli ikiziyle)
                                  * kullanildi ve simdi tek ornekli bir hedefte Z TESTI
                                  * yapiliyor: ikizler icerik paylasmadigi icin bu cizim
@@ -6252,8 +7082,13 @@ void metal_run_main_loop(void){
                                     }
                                 }
 #endif
-                                { uint64_t k2 = (uint64_t)(dr->blend & 0xFFFFFu)
-                                               | ((uint64_t)(dr->ps & 0xFFF) << 20)
+                                { int psk = dr->ps;
+#if NFS_ENHANCED
+                                  /* bkz. AYRI G GECISI: G'siz sahnede oyunun kendi gölgelendiricisi */
+                                  if (c_gbx && psk >= PSREFL) psk %= PSREFL;
+#endif
+                                  uint64_t k2 = (uint64_t)(dr->blend & 0xFFFFFu)
+                                               | ((uint64_t)(psk & 0xFFF) << 20)
                                                | ((uint64_t)(dr->vsid & 0xFFF) << 32)
                                                | ((uint64_t)(c_ms & 1) << 48)
                                                | ((uint64_t)(c_gb & 1) << 49);
@@ -6362,14 +7197,14 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                         if (enc){ int pe = rb >= 0 ? hd_ms_end(enc, rb, g_dn[rb], c_ms, c_gb, c_att) : 0;
                                   [enc endEncoding]; enc = nil;
-                                  if (pe) hd_ms_fallback(cb, d.texture, pe); }
+                                  if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                         if (enc) [enc endEncoding];
                         /* ekrana hic cizilmediyse en azindan temizle */
                         if (!screen_touched){
                             MTLRenderPassDescriptor *rp =
                                 [MTLRenderPassDescriptor renderPassDescriptor];
-                            rp.colorAttachments[0].texture = d.texture;
+                            rp.colorAttachments[0].texture = dtex;
                             rp.colorAttachments[0].loadAction = MTLLoadActionClear;
                             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
                             rp.colorAttachments[0].clearColor = MTLClearColorMake(
@@ -6405,7 +7240,7 @@ void metal_run_main_loop(void){
                         if (ENVC("TESTFILL")){
                             MTLRenderPassDescriptor *rp =
                                 [MTLRenderPassDescriptor renderPassDescriptor];
-                            rp.colorAttachments[0].texture = d.texture;
+                            rp.colorAttachments[0].texture = dtex;
                             rp.colorAttachments[0].loadAction = MTLLoadActionClear;
                             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
                             rp.colorAttachments[0].clearColor =
@@ -6414,18 +7249,18 @@ void metal_run_main_loop(void){
                                 [cb renderCommandEncoderWithDescriptor:rp];
                             [e3 endEncoding];
                         }
-                        if (g_perflog && atomic_exchange(&g_pl_thumb_req, 0)) pl_thumb(cb, d.texture, fno_pre);
+                        if (g_perflog && atomic_exchange(&g_pl_thumb_req, 0)) pl_thumb(cb, dtex, fno_pre);
                         /* Sunumdan ONCE okunabilir bir kopya al: sunulmus bir
                          * drawable'in dokusundan geri okuma guvenilir degil. */
                         if (dumpnow){
                             /* boyut degistiyse (tam ekran gecisi) yeniden yarat */
-                            if (g_capture && (g_capture.width != d.texture.width ||
-                                              g_capture.height != d.texture.height)) g_capture = nil;
+                            if (g_capture && (g_capture.width != dtex.width ||
+                                              g_capture.height != dtex.height)) g_capture = nil;
                             if (!g_capture){
                                 MTLTextureDescriptor *td =
                                     [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
                                         MTLPixelFormatBGRA8Unorm
-                                        width:d.texture.width height:d.texture.height
+                                        width:dtex.width height:dtex.height
                                         mipmapped:NO];
                                 td.usage = MTLTextureUsageShaderRead;
                                 td.storageMode = MTLStorageModeShared;
@@ -6433,10 +7268,10 @@ void metal_run_main_loop(void){
                             }
                             if (g_capture){
                                 id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-                                [bl copyFromTexture:d.texture sourceSlice:0 sourceLevel:0
+                                [bl copyFromTexture:dtex sourceSlice:0 sourceLevel:0
                                        sourceOrigin:MTLOriginMake(0,0,0)
-                                         sourceSize:MTLSizeMake(d.texture.width,
-                                                                d.texture.height,1)
+                                         sourceSize:MTLSizeMake(dtex.width,
+                                                                dtex.height,1)
                                           toTexture:g_capture destinationSlice:0
                                    destinationLevel:0
                                   destinationOrigin:MTLOriginMake(0,0,0)];
@@ -6474,7 +7309,7 @@ void metal_run_main_loop(void){
                                 while (ns > mx &&
                                        !atomic_compare_exchange_weak(&g_gpu_max_ns, &mx, ns)) {}
                             } }];
-                        [cb presentDrawable:d];
+                        if (d) [cb presentDrawable:d];
                         [cb commit];
                         long fno = atomic_fetch_add(&g_frames_drawn, 1) + 1;
                         if (g_perflog){ struct timespec _p1; clock_gettime(CLOCK_MONOTONIC, &_p1);
@@ -6528,6 +7363,9 @@ void metal_run_main_loop(void){
                     + (unsigned long long)_f1.tv_nsec - (unsigned long long)_f0.tv_nsec); }
             }
         }
+        /* Kisayollari geri ac; boru kapaninca bekci de cikar. */
+        ks_engel(0);
+        if (g_ks_fd >= 0){ close(g_ks_fd); g_ks_fd = -1; }
         fprintf(stderr, "metal: bos kare atlandi = %ld\n", g_skip_empty);
         fprintf(stderr, "metal: tampon halkasi: %lu karede onceki kare hala GPU'daydi "
                 "(tek tamponla ezilirdi), %lu kez bos takim beklendi (toplam %.1f ms)\n",
@@ -6568,10 +7406,14 @@ void metal_budget_report(void){
       fprintf(stderr, "[HD] RT onbellek: kare basina ort anlik %.0f ucgen + sabit %.0f ucgen; terfi %llu, atma %llu, sifirlama %llu, sabit kurulum %llu\n",
               f ? (double)atomic_load(&g_rt_dynv) / 3 / f : 0.0, f ? (double)atomic_load(&g_rt_statv) / 3 / f : 0.0,
               atomic_load(&g_rt_promo), atomic_load(&g_rt_evict), atomic_load(&g_rt_reset), atomic_load(&g_rt_sbuilds));
-      fprintf(stderr, "[HD] RT anlik yapi: %llu tam kurulum, %llu yerinde guncelleme (refit %s)\n",
-              atomic_load(&g_rt_nbuild), atomic_load(&g_rt_nrefit), hd_rt_refit_on() ? "ACIK" : "KAPALI");
-      fprintf(stderr, "[HD] RT onbellek: sikistirma %llu, yeniden ozetleme %llu, depo %u kose (%u olu)\n",
-              atomic_load(&g_rt_compact), atomic_load(&g_rt_rehash), g_rt_scur, g_rt_sdead);
+      fprintf(stderr, "[HD] RT anlik yapi: %llu tam kurulum (%llu'i konum kaydigi icin), %llu yerinde guncelleme (refit %s)\n",
+              atomic_load(&g_rt_nbuild), atomic_load(&g_rt_nmoved), atomic_load(&g_rt_nrefit), hd_rt_refit_on() ? "ACIK" : "KAPALI");
+      { uint32_t gv = 0; for (unsigned k = 0; k < g_rt_ng; k++) gv += g_rt_grp[k].built;
+        fprintf(stderr, "[HD] RT onbellek: birlesme %llu (en eskiyi birakma %llu), parca kurulumu %llu, refit %llu, "
+                "yeniden ozetleme %llu, depo %u kose (%u olu; %u grup %u kose, yeni %u)\n",
+                atomic_load(&g_rt_merges), atomic_load(&g_rt_sdrop), atomic_load(&g_rt_sbuilds),
+                atomic_load(&g_rt_srefits), atomic_load(&g_rt_rehash), rt_depot_used(), rt_depot_dead(),
+                g_rt_ng, gv, g_rt_scur - g_rt_recent.lo); }
       if (g_rt_fixcnt){ const uint32_t *fc = (const uint32_t *)[g_rt_fixcnt contents];
           fprintf(stderr, "[HD] RT kose denetimi: %s; etkisizlestirilen ucgen: NaN/sonsuz %u, cok uzak %u (kare basina ort %.1f)\n",
                   g_rt_fixk ? "ACIK" : "KAPALI", fc[0], fc[1], f ? (double)(fc[0] + fc[1]) / (double)f : 0.0); } }
@@ -6587,6 +7429,11 @@ void metal_budget_report(void){
             "%llu saklanmadi, %llu kez temizlemeden yukleme istendi ama ornekler kayipti (0 olmali)\n",
             atomic_load(&g_hd_ml_pass), atomic_load(&g_hd_ml_miss), g_hd_ml_off ? " (belleksiz kip KAPANDI)" : "",
             atomic_load(&g_hd_mszst), atomic_load(&g_hd_mszskip), atomic_load(&g_hd_mszlost));
+    fprintf(stderr, "[HD] sahne arasi kopya (hareket bulanikligi): %llu kare -- sahne cok ornekli devam etti\n",
+            atomic_load(&g_hd_brk_n));
+    { unsigned long long gn = atomic_load(&g_hd_gp_n);
+      fprintf(stderr, "[HD] ayri G gecisi: %s, %llu gecis, gecis basina %.1f yansiyan cizim\n",
+              hd_gsep() ? "ACIK" : "KAPALI", gn, gn ? (double)atomic_load(&g_hd_gp_draws) / gn : 0.0); }
 #endif
     unsigned long long n  = atomic_load(&g_gpu_n);
     unsigned long long gs = atomic_load(&g_gpu_ns);
@@ -6614,7 +7461,12 @@ void metal_budget_report(void){
                   g_gpuw_a, g_gpuw_b, (g_gS1.j - g_gS0.j) * 1e3 / nf, (g_gS1.j - g_gS0.j) / (g_gT1 - g_gT0));
           fprintf(stderr, "  PENCERE %ld-%ld   : GPU BELLEK okuma %.1f yazma %.1f MB/kare, DRAM okuma %.1f yazma %.1f MB/kare (AMC)\n",
                   g_gpuw_a, g_gpuw_b, (g_gS1.rd - g_gS0.rd) / 1e6 / nf, (g_gS1.wr - g_gS0.wr) / 1e6 / nf,
-                  (g_gS1.drd - g_gS0.drd) / 1e6 / nf, (g_gS1.dwr - g_gS0.dwr) / 1e6 / nf); } }
+                  (g_gS1.drd - g_gS0.drd) / 1e6 / nf, (g_gS1.dwr - g_gS0.dwr) / 1e6 / nf);
+          double ga = g_gS1.gact - g_gS0.gact, gt = g_gS1.gtot - g_gS0.gtot, gc = g_gS1.gcy - g_gS0.gcy;
+          if (gt > 0 && gc > 0 && g_ior_fmax > 0)
+              fprintf(stderr, "  PENCERE %ld-%ld   : GPU DOLULUK %%%.1f, ort saat %.0f MHz, mesgul %.2f Mcevrim/kare = %.2f ms/kare @%.0f MHz (en yuksek saat; 120 fps siniri 8.33)\n",
+                      g_gpuw_a, g_gpuw_b, 100.0 * ga / gt, ga > 0 ? gc / (ga / gt * (g_gT1 - g_gT0) * 1e6) : 0.0,
+                      gc / 1e6 / nf, gc / g_ior_fmax / 1e3 / nf, g_ior_fmax); } }
     abt_report();
     fprintf(stderr, "  konuk BEKLEME     : %.2f ms/kare (onceki kare ekrana konsun diye)\n"
                     "  ana thread bekleme: %.2f ms/kare kare-hazir, %.2f ms/kare nextDrawable (vsync)\n",

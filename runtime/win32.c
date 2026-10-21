@@ -95,12 +95,17 @@ void vclock_tick(void){
      *   VCLOCK=real  : GERCEK gecen sure (varsayilan).  Oyun da muzik de
      *                  gercek zamanda akar.  Telafi dongusune girmemesi
      *                  icin kare basina artis 50 ms ile sinirli. */
-    { static _Atomic int mode = -1;
+    /*   VCLOCK=<us>  : her kare tam <us> (OLCUM: VCLOCK=8333 + NOVSYNC=1 ile
+     *                  oyun 120 fps zamaninda ama sinirlayici hic beklemez;
+     *                  fps = GPU/CPU kapasitesi, rota kare kare ayni). */
+    { static _Atomic int mode = -1; static uint64_t fstep = 16667ull;
       int m = atomic_load(&mode);
       if (m < 0){ const char *e = ENVC("VCLOCK");
-                  m = (e && *e == 'f') ? 0 : 1; atomic_store(&mode, m); }
+                  m = (e && *e == 'f') ? 0 : 1;
+                  if (e && *e >= '1' && *e <= '9'){ fstep = strtoull(e, 0, 10); if (fstep < 1000ull) fstep = 1000ull; m = 0; }
+                  atomic_store(&mode, m); }
       uint64_t rb = atomic_load(&g_real_base);
-      uint64_t step = 16667ull;
+      uint64_t step = fstep;
       if (m && rb && now > rb){
           step = now - rb;
           if (step < 4000ull)  step = 4000ull;    /* 250 fps ustu: kirp */

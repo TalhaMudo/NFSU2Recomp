@@ -125,6 +125,9 @@ static void *guest_main_thread(void *unused){
 }
 
 int main(int argc,char**argv){
+    /* Sistem kisayolu bekcisi (metal.m ks_engel): ayni ikili, oyunu hic
+     * baslatmadan oyun surecinin bitmesini bekler. */
+    if (getenv("NFSU_KISAYOL_BEKCI")){ extern int metal_kisayol_bekci(void); return metal_kisayol_bekci(); }
     /* Paketten calisirken: run.sh'in ayarlari, bir log dosyasi ve oyun
      * verisinin yeri.  Terminalden calistirmada hicbiri devreye girmez. */
     const char *exe = (argc > 1 && strncmp(argv[1], "-psn_", 5)) ? argv[1] : NULL;

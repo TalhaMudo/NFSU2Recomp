@@ -185,6 +185,10 @@ def main():
     guc = guc_oku(os.path.join(d, 'guc.txt'))
     for g in guc:
         g['tms'] = (g['t'] - g['dt'] / 2 - epoch0) * 1e3   # ornek ortasi, oturum zamaninda
+    # oturum.sh + tools/smcoku: SMC sicaklik / fan (1 sn), yoksa bos
+    sicak = oku_csv(os.path.join(d, 'sicaklik.csv')) if os.path.exists(os.path.join(d, 'sicaklik.csv')) else []
+    for c in sicak:
+        c['tms'] = (c['epoch_s'] - epoch0) * 1e3
     ekranlar = sorted(glob.glob(os.path.join(d, 'ekran', '*.jpg')))
     ekran_t = [(float(os.path.basename(e).split('_')[0]), e) for e in ekranlar]
 
@@ -230,6 +234,13 @@ def main():
             yaz('| powermetrics toplam / CPU / GPU | %.2f / %.2f / %.2f W |'
                 % (ort(g['top'] for g in guc), ort(g['cpu'] for g in guc), ort(g['gpu'] for g in guc)))
             yaz('| GPU frekansi / P0 frekansi | %.0f / %.0f MHz |' % (ort(g.get('gf') for g in guc), ort(g.get('pf') for g in guc)))
+        if sicak:
+            ok = lambda k: [c[k] for c in sicak if c[k] > 0]
+            yaz('| sicaklik CPU / GPU (ort / en yuksek) | %.1f / %.1f C, %.1f / %.1f C |'
+                % (ort(ok('cpu_ort')), max(ok('cpu_max') or [0]), ort(ok('gpu_ort')), max(ok('gpu_max') or [0])))
+            fv = [c[k] for c in sicak for k in ('fan0', 'fan1') if c[k] >= 0]   # 0 = fan durdu (gecerli)
+            yaz('| fan (ort / en yuksek) | %.0f / %.0f dev/dk%s |' % (ort(fv), max(fv or [0]), ' (fanlar hic donmedi)' if fv and max(fv) == 0 else ''))
+            yaz('| sistem gucu (SMC PSTR, ekran dahil) ort / en yuksek | %.1f / %.1f W |' % (ort(ok('sistem_w')), max(ok('sistem_w') or [0])))
         # oturum.sh: gercek ekran tazeleme hizi (DLINK=2) ve pil/guc modu.  Dusus
         # oyundan mi sistemden mi, ilk bakista buradan ayrilir.
         tl = os.path.join(d, 'oyun_tam.log')
@@ -271,6 +282,7 @@ def main():
         kk = [k for k in konuk if a <= k['t_ms'] < b]
         ss = [s for s in sec if a - 1000 <= s['t_ms'] < b + 1000]
         gg = [g for g in guc if a <= g['tms'] < b]
+        cc = [c for c in sicak if a <= c['tms'] < b]
         w = {'a': a, 'b': b, 'n': len(rr)}
         if rr:
             w['fps'] = len(rr) / (pen_s)
@@ -292,6 +304,9 @@ def main():
             w['pm_cpu'] = ort(g['cpu'] for g in gg)
             w['pm_gpu'] = ort(g['gpu'] for g in gg)
             w['pm_gf'] = ort(g.get('gf') for g in gg)
+        if cc:
+            w['gpu_c'] = max(c['gpu_max'] for c in cc)
+            w['fan'] = ort([c[k] for c in cc for k in ('fan0', 'fan1') if c[k] >= 0])
         e = [x for x in ekran_t if a <= x[0] < b]
         w['ekran'] = os.path.relpath(e[len(e) // 2][1], d) if e else ''
         pencereler.append(w)
@@ -304,13 +319,13 @@ def main():
     yaz('## Zaman cizelgesi (%.0f sn pencereler)\n' % pen_s)
     yaz('Konuk CPU = oyun thread\'inin kare basina gercek CPU suresi; uyku = kare sinirlayicinin '
         'bos payi (yuksek = rahat).  CPU W = surecin kendi enerji sayaci (sudo gerekmez); pm = powermetrics.\n')
-    yaz('| t (sn) | fps | konuk CPU ms | uyku ms | kodlama ms | GPU ms | cizim | en uzun ms | CPU W | pm CPU W | pm GPU W | GPU MHz | termal | derleme | doku MB | ekran |')
-    yaz('|' + '---|' * 16)
+    yaz('| t (sn) | fps | konuk CPU ms | uyku ms | kodlama ms | GPU ms | cizim | en uzun ms | CPU W | pm CPU W | pm GPU W | GPU MHz | termal | GPU C | fan | derleme | doku MB | ekran |')
+    yaz('|' + '---|' * 18)
     for w in pencereler:
-        yaz('| %.0f | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+        yaz('| %.0f | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
             (w['a'] - t_bas) / 1e3, f(w, 'fps', '%.1f'), f(w, 'kcpu'), f(w, 'uyku'), f(w, 'kodlama'), f(w, 'gpu'),
             f(w, 'cizim', '%.0f'), f(w, 'maks', '%.1f'), f(w, 'cpuw'), f(w, 'pm_cpu'), f(w, 'pm_gpu'),
-            f(w, 'pm_gf', '%.0f'), f(w, 'termal', '%.0f'), f(w, 'derleme', '%.0f'), f(w, 'doku_mb', '%.1f'),
+            f(w, 'pm_gf', '%.0f'), f(w, 'termal', '%.0f'), f(w, 'gpu_c', '%.0f'), f(w, 'fan', '%.0f'), f(w, 'derleme', '%.0f'), f(w, 'doku_mb', '%.1f'),
             ('![](%s)' % w['ekran']) if w['ekran'] else ''))
     yaz('')
 
