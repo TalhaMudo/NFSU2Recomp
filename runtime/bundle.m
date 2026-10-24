@@ -114,15 +114,16 @@ static int find_under(const char *dir, char *out, size_t osz, int depth){
 static NSString *const kPrefKey = @"OyunDizini";
 static int g_embedded = 0;        /* veri paketin icinden bulundu */
 
-/* Oyun verisi paketin icindeyse kayitlarin yazilacagi dizin; degilse NULL
- * (o zaman oyun eskisi gibi kendi klasorune yazar).  Paketin icine yazmak
- * imzayi bozar ve uygulama yenilenince kayitlari siler.
- * NFSU2_SAVEDIR ile her kosulda zorlanabilir. */
+/* Kayitlarin (kariyer profilleri) yazilacagi dizin.  HER ZAMAN oyun ve
+ * uygulama klasorlerinin disinda: yeni bir surum dagitilip .app ya da oyun
+ * klasoru degistirilince oyuncunun ilerlemesi kaybolmasin.  Paketin icine
+ * yazmak ayrica imzayi bozardi.  Eski surumlerin oyun klasorune yazdigi
+ * kayitlar acilista buraya tasinir (fileio_migrate_saves).
+ * NFSU2_SAVEDIR ile degistirilebilir (testler gercek kayitlara dokunmasin). */
 const char *app_save_dir(void){
     static char dir[1200];
     const char *env = getenv("NFSU2_SAVEDIR");
     if (env && *env){ snprintf(dir, sizeof dir, "%s", env); return dir; }
-    if (!g_embedded) return NULL;
     const char *home = getenv("HOME"); if (!home) return NULL;
     snprintf(dir, sizeof dir, "%s/Library/Application Support/NFSU2 Kayitlar", home);
     return dir;

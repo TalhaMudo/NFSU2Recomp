@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <fnmatch.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
@@ -86,14 +87,15 @@ static int resolve_in(const char *root, const char *win, char *out, size_t outsz
 }
 
 /* --- yazma koku (kayit katmani) ----------------------------------------
- * Oyun kayitlarini ve profillerini KENDI klasorune yazar.  Veri .app'in
- * icine gomuluyken oraya yazmak paketin imzasini bozar; ayrica uygulama
- * guncellenince kayitlar silinir.  Yazma koku ayarliysa:
+ * Oyun kayitlarini ve profillerini KENDI klasorune yazar ("C:\NFSU2\NFS
+ * Underground 2\<ad>\<ad>").  Oraya yazmak, yeni surum dagitilip .app ya
+ * da oyun klasoru degistirilince kayitlari siler; veri .app'in icine
+ * gomuluyken paketin imzasini da bozar.  Bu yuzden yazma koku artik HER
+ * ZAMAN ayarli (bundle.m app_save_dir, ~/Library/Application Support):
  *   - yazma / olusturma / silme her zaman yazma kokune gider,
  *   - okuma once yazma kokune, yoksa oyun kokune bakar,
  *   - dizin listesi ikisinin birlesimidir.
- * Ayarli degilse (terminalden ya da verisi disarida olan paket) her sey
- * eskisi gibi tek kokte kalir. */
+ * Ayarli degilse (yalnizca HOME yoksa) her sey tek kokte kalir. */
 static char g_wroot[1024] = "";
 void fileio_set_write_root(const char *dir){
     if (!dir || !*dir){ g_wroot[0] = 0; return; }
@@ -153,27 +155,77 @@ static uint32_t A(CPU *c,int i){ return MR32(c->esp + 4u*(uint32_t)i); }
 #define GS(a) ((const char*)(g_mem + (uint32_t)(a)))
 #define INVALID_HANDLE 0xFFFFFFFFu
 
-/* Dizin taramasinda siradaki adi ver: once yazma koku, sonra oyun koku. */
-static int find_next(FH *f, char *nm, size_t nsz){
+/* Windows joker eslemesi: buyuk/kucuk harf duyarsiz, "*.*" her seyi tutar. */
+static int win_match(const char *pat, const char *name){
+    if (!pat[0] || !strcmp(pat, "*") || !strcmp(pat, "*.*")) return 1;
+    return fnmatch(pat, name, FNM_CASEFOLD) == 0;
+}
+/* Dizin taramasinda siradaki adi ver: once yazma koku, sonra oyun koku.
+ * full: bulunan girdinin gercek yolu (oznitelik/boyut icin). */
+static int find_next(FH *f, char *nm, size_t nsz, char *full, size_t fsz){
     struct dirent *e;
     if (f->dir){
         while ((e = readdir(f->dir))){
             if (e->d_name[0] == '.') continue;
+            if (!win_match(f->pat, e->d_name)) continue;
+            snprintf(full, fsz, "%s/%s", f->path1, e->d_name);
             snprintf(nm, nsz, "%s", e->d_name); return 1; }
     }
     if (f->dir2){
         while ((e = readdir(f->dir2))){
             if (e->d_name[0] == '.') continue;
+            if (!win_match(f->pat, e->d_name)) continue;
             if (f->path1[0]){               /* yazma kokunde zaten verildi */
                 char p[1024]; struct stat st;
                 snprintf(p, sizeof p, "%s/%s", f->path1, e->d_name);
                 if (stat(p, &st) == 0) continue; }
+            snprintf(full, fsz, "%s/%s", f->path, e->d_name);
             snprintf(nm, nsz, "%s", e->d_name); return 1; }
     }
     return 0;
 }
+/* WIN32_FIND_DATAA (320 bayt): +0 oznitelik, +4/+12/+20 olusturma/erisim/
+ * yazma FILETIME, +28 boyut (ust), +32 boyut (alt), +44 ad.
+ * Oznitelik eskiden hep 0x80 (normal dosya) veriliyordu: oyun kariyer
+ * profillerini "NFS Underground 2" altindaki KLASORLER olarak ariyor,
+ * klasoru dosya sanip kaydi hic bulamiyordu. */
+static void fill_find_data(uint32_t fd_, const char *full, const char *nm){
+    if (!fd_) return;
+    mem_commit(fd_, 320); memset(g_mem+fd_, 0, 320);
+    struct stat st; uint32_t attr = 0x80u;          /* FILE_ATTRIBUTE_NORMAL */
+    if (stat(full, &st) == 0){
+        if (S_ISDIR(st.st_mode)) attr = 0x10u;      /* FILE_ATTRIBUTE_DIRECTORY */
+        else {
+            MR32(fd_+28) = (uint32_t)((uint64_t)st.st_size >> 32);
+            MR32(fd_+32) = (uint32_t)st.st_size;
+        }
+        /* Unix saniyesi -> FILETIME (1601'den beri 100 ns) */
+        uint64_t ft = ((uint64_t)st.st_mtime + 11644473600ull) * 10000000ull;
+        for (int k = 0; k < 3; k++){
+            MR32(fd_+4+8u*k) = (uint32_t)ft; MR32(fd_+8+8u*k) = (uint32_t)(ft >> 32); }
+    }
+    MR32(fd_) = attr;
+    snprintf((char*)(g_mem+fd_+44), 260, "%s", nm);
+}
 
+static int fileio_call_impl(CPU *c, const char *n, uint32_t *out);
+/* FILEOPLOG=1: dosya islemlerini (okuma/konumlama haric) sonuclariyla yaz.
+ * Kayit (profil) hatalarini izlemek icin. */
 int fileio_call(CPU *c, const char *n, uint32_t *out){
+    static int lg = -1; if (lg < 0) lg = getenv("FILEOPLOG") != 0;
+    int h = fileio_call_impl(c, n, out);
+    if (lg && h && strcmp(n,"ReadFile") && strcmp(n,"SetFilePointer")
+        && strcmp(n,"GetOverlappedResult") && strcmp(n,"HasOverlappedIoCompleted")){
+        uint32_t a0 = A(c,0);
+        const char *s0 = (a0 >= 0x10000u && mem_is_committed(a0)) ? GS(a0) : "";
+        if (strcmp(n,"CreateFileA") && strcmp(n,"GetFileAttributesA") && strcmp(n,"FindFirstFileA")
+            && strcmp(n,"DeleteFileA") && strcmp(n,"CreateDirectoryA") && strcmp(n,"MoveFileA")
+            && strcmp(n,"CopyFileA")) s0 = "";
+        fprintf(stderr, "  [dosya] %-18s %.200s -> 0x%x  (arg1=0x%x)\n", n, s0, *out, A(c,1));
+    }
+    return h;
+}
+static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
     uint32_t r = 0;
     if (!strcmp(n,"CreateFileA")){
         uint32_t pn=A(c,0), access=A(c,1), disp=A(c,4);
@@ -367,6 +419,11 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
         mkparents(real);
         r = (mkdir(real,0755)==0 || errno==EEXIST);
     }
+    else if (!strcmp(n,"RemoveDirectoryA")){
+        /* Profil silinirken dosyadan sonra klasoru de kaldiriyor. */
+        char real[1024]; resolve_w(GS(A(c,0)), real, sizeof real);
+        r = (rmdir(real)==0);
+    }
     else if (!strcmp(n,"MoveFileA")){
         char a[1024],b[1024]; resolve(GS(A(c,0)),a,sizeof a); resolve_w(GS(A(c,1)),b,sizeof b);
         mkparents(b);
@@ -401,21 +458,16 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
                else { f->dir=d1; f->dir2=d2; snprintf(f->pat,sizeof f->pat,"%s",pat);
                       snprintf(f->path1,sizeof f->path1,"%s",wreal);
                       snprintf(f->path,sizeof f->path,"%s",real);
-                      char nm[260];
-                      if (!find_next(f, nm, sizeof nm)){
+                      char nm[260], full[1400];
+                      if (!find_next(f, nm, sizeof nm, full, sizeof full)){
                           if(f->dir) closedir(f->dir); if(f->dir2) closedir(f->dir2);
                           f->used=0; r=INVALID_HANDLE; }
-                      else { uint32_t fd_=A(c,1);
-                          if(fd_){ mem_commit(fd_,320); memset(g_mem+fd_,0,320);
-                              MR32(fd_)=0x80; snprintf((char*)(g_mem+fd_+44),260,"%s",nm); }
-                          r=h; } } }
+                      else { fill_find_data(A(c,1), full, nm); r=h; } } }
     }
     else if (!strcmp(n,"FindNextFileA")){
-        FH*f=fh_get(A(c,0)); r=0; char nm[260];
-        if(f && (f->dir || f->dir2) && find_next(f, nm, sizeof nm)){
-            uint32_t fd_=A(c,1);
-            if(fd_){ mem_commit(fd_,320); memset(g_mem+fd_,0,320);
-                MR32(fd_)=0x80; snprintf((char*)(g_mem+fd_+44),260,"%s",nm); }
+        FH*f=fh_get(A(c,0)); r=0; char nm[260], full[1400];
+        if(f && (f->dir || f->dir2) && find_next(f, nm, sizeof nm, full, sizeof full)){
+            fill_find_data(A(c,1), full, nm);
             r=1; }
     }
     else if (!strcmp(n,"FindClose")){

@@ -219,6 +219,7 @@ static pthread_mutex_t *cs_for(uint32_t key){
 }
 
 uint32_t call_guest(CPU *c, uint32_t fn, int nargs, const uint32_t *args);
+int metal_take_char(int remove);            /* metal.m: WM_CHAR kuyrugu */
 static uint32_t g_wndproc = 0;
 static uint32_t g_hwnd    = 0x00B00001u;
 #define WMQ 8
@@ -634,6 +635,14 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                 MR32(pm+16)=0; MR32(pm+20)=0; MR32(pm+24)=0; }
             g_wm_sent++;
             r=1;
+        } else if ((wp = (uint32_t)metal_take_char(remove)) != 0xFFFFFFFFu){
+            /* Yazilan karakter (bkz. metal.m char_push).  Windows'ta
+             * TranslateMessage'in uretecegi WM_CHAR; lParam: tekrar=1. */
+            if (pm){ mem_commit(pm,28);
+                MR32(pm)=g_hwnd; MR32(pm+4)=0x0102u; MR32(pm+8)=wp; MR32(pm+12)=1u;
+                MR32(pm+16)=0; MR32(pm+20)=0; MR32(pm+24)=0; }
+            g_wm_sent++;
+            r=1;
         } else {
             if (pm){ mem_commit(pm,28); memset(g_mem+pm,0,28); MR32(pm)=g_hwnd; }
             r = !strcmp(n,"GetMessageA") ? 1u : 0u;   /* GetMessage 0 = WM_QUIT */
@@ -854,6 +863,87 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         uint32_t l = src? (uint32_t)strlen((char*)(g_mem+src)) : 0;
         if(dst && sz>l){ memcpy(g_mem+dst, g_mem+src, l+1); }
         r=l; }
+    /* Kayit dosyalarinin tarihleri (WIN32_FIND_DATA FILETIME'lari).  Oyun
+     * profil bulununca bunlari CRT'nin localtime'ina sokuyor; eskiden
+     * uygulanmamislardi -> cop -> localtime NULL -> guest adres 0x14'te
+     * cokme (tm_year).  Bir profil kaydedilene kadar hic cagrilmiyorlardi. */
+    else if (!strcmp(n,"FileTimeToLocalFileTime")||!strcmp(n,"LocalFileTimeToFileTime")){
+        uint32_t s=A(c,0), d=A(c,1); r=0;
+        if (s && d && mem_is_committed(s+7)){
+            uint64_t ft = (uint64_t)MR32(s) | ((uint64_t)MR32(s+4) << 32);
+            time_t t = time(0); struct tm lt; localtime_r(&t, &lt);
+            int64_t off = (int64_t)lt.tm_gmtoff * 10000000ll;
+            ft = !strcmp(n,"FileTimeToLocalFileTime") ? ft + (uint64_t)off : ft - (uint64_t)off;
+            mem_commit(d,8); MR32(d)=(uint32_t)ft; MR32(d+4)=(uint32_t)(ft>>32); r=1; } }
+    else if (!strcmp(n,"FileTimeToSystemTime")){
+        /* SYSTEMTIME: wYear wMonth wDayOfWeek wDay wHour wMinute wSecond wMs */
+        uint32_t s=A(c,0), d=A(c,1); r=0;
+        if (s && d && mem_is_committed(s+7)){
+            uint64_t ft = (uint64_t)MR32(s) | ((uint64_t)MR32(s+4) << 32);
+            uint64_t sec = ft / 10000000ull;
+            if (sec >= 11644473600ull){
+                time_t t = (time_t)(sec - 11644473600ull); struct tm g;
+                if (gmtime_r(&t, &g)){
+                    mem_commit(d,16);
+                    MR16(d)    = (uint16_t)(g.tm_year + 1900);
+                    MR16(d+2)  = (uint16_t)(g.tm_mon + 1);
+                    MR16(d+4)  = (uint16_t)g.tm_wday;
+                    MR16(d+6)  = (uint16_t)g.tm_mday;
+                    MR16(d+8)  = (uint16_t)g.tm_hour;
+                    MR16(d+10) = (uint16_t)g.tm_min;
+                    MR16(d+12) = (uint16_t)g.tm_sec;
+                    MR16(d+14) = (uint16_t)((ft / 10000ull) % 1000ull);
+                    r=1; } } } }
+    else if (!strcmp(n,"GetTimeZoneInformation")){
+        /* TIME_ZONE_INFORMATION (172 bayt): +0 Bias (dakika, UTC = yerel + Bias).
+         * Eskiden tampon doldurulmuyordu (cop). */
+        uint32_t p=A(c,0);
+        if (p){ mem_commit(p,172); memset(g_mem+p,0,172);
+            time_t t = time(0); struct tm lt; localtime_r(&t, &lt);
+            MR32(p) = (uint32_t)(int32_t)(-(lt.tm_gmtoff / 60)); }
+        r=0; }                                        /* TIME_ZONE_ID_UNKNOWN */
+    else if (!strcmp(n,"GetFullPathNameA")){
+        /* (lpFileName, nBufferLength, lpBuffer, lpFilePart)
+         * Kariyer kaydi profil yolunu bununla kuruyor
+         * ("C:\NFSU2\NFS Underground 2").  Eskiden uygulanmamisti: 0 donup
+         * tamponu bos birakiyordu, oyun cop bir yola yazmaya calisip
+         * "Unable to save <ad>" diyordu.  Gecerli dizin hep C:\NFSU2. */
+        uint32_t src=A(c,0), sz=A(c,1), dst=A(c,2), fpart=A(c,3);
+        const char *in = (src && mem_is_committed(src)) ? (const char*)(g_mem+src) : "";
+        char full[1024]; size_t k = 0;
+        if (in[0] && in[1] == ':')                    /* "X:..." */
+            { full[k++] = in[0]; full[k++] = ':'; in += 2; }
+        else { memcpy(full, "C:", 2); k = 2; }
+        if (*in != '\\' && *in != '/'){               /* gorece: gecerli dizin */
+            memcpy(full + k, "\\NFSU2", 6); k += 6; }
+        /* bilesen bilesen: "." atla, ".." bir ust */
+        while (*in && k < sizeof full - 2){
+            while (*in == '\\' || *in == '/') in++;
+            if (!*in) break;
+            const char *e2 = in; while (*e2 && *e2 != '\\' && *e2 != '/') e2++;
+            size_t L = (size_t)(e2 - in);
+            if (L == 1 && in[0] == '.') { in = e2; continue; }
+            if (L == 2 && in[0] == '.' && in[1] == '.'){
+                while (k > 2 && full[k-1] != '\\') k--;
+                if (k > 2) k--;
+                in = e2; continue; }
+            if (k + 1 + L >= sizeof full - 1) break;
+            full[k++] = '\\'; memcpy(full + k, in, L); k += L; in = e2;
+        }
+        if (k == 2) full[k++] = '\\';                 /* yalnizca "C:\" */
+        /* sondaki ayirac korunur ("dir\" -> "C:\...\dir\") */
+        { size_t il = src && mem_is_committed(src) ? strlen((const char*)(g_mem+src)) : 0;
+          const char *s0 = (const char*)(g_mem+src);
+          if (il && (s0[il-1]=='\\' || s0[il-1]=='/') && full[k-1] != '\\') full[k++] = '\\'; }
+        full[k] = 0;
+        if (dst && sz > k){
+            mem_commit(dst, (uint32_t)k + 1); memcpy(g_mem+dst, full, k + 1);
+            if (fpart){ mem_commit(fpart, 4);
+                char *ls = strrchr(full, '\\');
+                MR32(fpart) = (ls && ls[1]) ? dst + (uint32_t)(ls + 1 - full) : 0; }
+            r = (uint32_t)k;
+        } else r = (uint32_t)k + 1;                   /* gereken boyut (NUL dahil) */
+    }
     else if (!strcmp(n,"GetSystemDirectoryA")||!strcmp(n,"GetWindowsDirectoryA")){
         uint32_t p=A(c,0); const char*s="C:\\Windows"; uint32_t l=(uint32_t)strlen(s);
         if(p){ mem_commit(p,l+1); memcpy(g_mem+p,s,l); MR8(p+l)=0; } r=l; }

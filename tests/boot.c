@@ -145,7 +145,7 @@ int main(int argc,char**argv){
     mem_commit(TEB_BASE,0x20000);
     mem_commit(STACK_LO, STACK_HI-STACK_LO);
     fileio_set_root(exe);
-    /* Veri paketin icine gomuluyse kayitlar disariya yazilir. */
+    /* Kayitlar oyun/uygulama klasorunun disina yazilir (guncellemede kaybolmasin). */
     { const char *sd = app_save_dir(); if (sd) fileio_set_write_root(sd); }
     dispatch_init(); win32_init();
     { extern void overrides_install(void); overrides_install(); }

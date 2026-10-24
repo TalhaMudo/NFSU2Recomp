@@ -536,6 +536,8 @@ int win32_call(CPU *c, uint32_t idx){
     else if (fileio_call(c, n, &r)) { /* dosya G/C */ }
     else if (win32_ext_call(c, n, &r)) { /* 2. tur katman */ }
     else { handled = 0; g_win32_unimpl++; stat_[idx].unimpl++;
+           if (getenv("FILEOPLOG"))
+               fprintf(stderr, "  [stub] %s (donus 0x%08x)\n", n, MR32(c->esp));
            if (unimpl_first==0xffffffffu){ unimpl_first=idx; unimpl_name=n; } }
 
     if (g_bt_on && (!strcmp(n,"GetModuleFileNameA")||!strcmp(n,"ExitProcess")||!strcmp(n,"RaiseException")))

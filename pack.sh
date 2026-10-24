@@ -5,9 +5,8 @@
 #   ./pack.sh --with-data     oyun verisini de yanina kopyala (~1.5 GB)
 #   ./pack.sh --zip           dagitim icin NFSU2.zip da uret
 #   ./pack.sh --embed         KISISEL tek parca uygulama: oyun verisi paketin
-#                             ICINE gomulur (out/kisisel/, ~1.4 GB).  Kayitlar
-#                             ~/Library/Application Support/NFSU2 Kayitlar'a
-#                             yazilir.  Oyunun kendisini icerdigi icin
+#                             ICINE gomulur (out/kisisel/, ~1.4 GB).  Oyunun
+#                             kendisini icerdigi icin
 #                             DAGITILAMAZ; dagitim klasoru / zip uretilmez.
 #   ./pack.sh --hd            HD build'den "NFSU2 HD.app" (grafik iyilestirmeleri;
 #                             ayri paket kimligi, ayri log, orijinalle yan yana durur)
@@ -15,6 +14,11 @@
 # Oyun verisi VARSAYILAN OLARAK pakete girmez: uygulama ilk acilista
 # klasoru sorar ve secimi hatirlar.  Boylece paket kucuk kalir ve herkes
 # kendi kurulumuyla calisir.
+#
+# Kayitlar (kariyer profilleri) HER pakette uygulama ve oyun klasorunun
+# DISINDA, ~/Library/Application Support/NFSU2 Kayitlar'da; ayarlar
+# ~/.nfsu2_registry'de.  Yeni surum dagitilip .app ya da oyun klasoru
+# degistirilince oyuncunun ilerlemesi kaybolmaz (runtime/bundle.m).
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"; cd "$ROOT"
 
@@ -183,16 +187,22 @@ BIR SEY TERS GIDERSE
   Oyun klasorunu yeniden sectirmek icin:
      defaults delete $BID
 
-  Kayitli oyunlar oyun klasorundeki memcard/ icinde,
-  ayarlar ~/.nfsu2_registry dosyasinda tutulur.
+KAYITLAR
+  Kariyer kayitlari:  ~/Library/Application Support/NFSU2 Kayitlar
+  Ayarlar:            ~/.nfsu2_registry
+  Ikisi de uygulamanin ve oyun klasorunun DISINDA durur: yeni bir surum
+  geldiginde $NAME.app'i (ya da oyun klasorunu) degistirmek ilerlemeni
+  silmez.  Yedeklemek icin bu klasoru ve dosyayi kopyalaman yeterli.
+
+  Profil adi: "Create Profile" ekraninda yazilir.  Kutuda hazir gelen
+  "NAME"i Delete (geri) tusuyla sil, en fazla 7 harf/rakam yaz, Enter.
 TXT
 echo "not: $ROOT/out/OKUBENI.txt"
 
 # --- dagitim klasoru ---
 # Uygulama, .app'in bulundugu dizini (ve bir ustunu) tarayarak oyunu
 # kendiliginden buluyor.  Bu yuzden veri paketin ICINE degil YANINA
-# konur: imza bozulmaz ve memcard/ yazilabilir kalir -- imzali bir
-# bundle'in icine kayit yazmak calismaz.
+# konur: imza bozulmaz.  Kayitlar zaten Application Support'a gider.
 DIST="$ROOT/out/NFSU2${TAG}-dagitim"
 rm -rf "$DIST"; mkdir -p "$DIST"
 ditto "$APP" "$DIST/$NAME.app"

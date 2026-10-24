@@ -261,6 +261,29 @@ static void mix_into(int16_t *out, unsigned frames){
          * tutacak sekilde surekli duzelt.  Hedef, oyunun kendi dogal
          * denge noktasi olsun -- sabit bir sayi secmek yanlis olur
          * (once 0.25 secilmisti, oyun 0.30-0.64 arasinda calisiyor). */
+        /* SERVO VARSAYILAN KAPALI (2026-10-22).  Oyun akisi yazdigi yeri bizim
+         * bildirdigimiz GERCEK oynatma imlecine gore seciyor (com.c
+         * GetCurrentPosition -> audio_cursors): calmayi yavaslatinca oyun da
+         * muzigi ayni oranda yavas uretir, avail (yazma payi) hizdan bagimsiz
+         * kalir ve servo hatasini hic kapatamaz.  Olculdu (SNDMUTE + SNDCSV,
+         * Quick Race 3 dk): her yukleme / takilmadan sonra pay yeni bir duzeye
+         * (0.19 / 0.52 / 0.40) oturuyor, servo kelepceye (%3) dayanip 40-50 sn
+         * orada kaliyordu -- 50 sn boyunca muzik %3 yavas (yarim sesten pes,
+         * kullanici: "o andan itibaren muzik agir akiyor"), cagrilarin %33'unde
+         * hiz sapmasi > %1.  Servonun hedefledigi 30 sn bosluklari oyunun
+         * kendisi yaziyor (bkz. SNDZERO); servo onlari zaten gidermemisti.
+         * SNDPLL=1 eski servo. */
+        static int pll = -1;
+        if (pll < 0){ const char *e = getenv("SNDPLL"); pll = e && *e == '1'; }
+        if (!pll){
+            if (b->wseen){
+                uint32_t bpf2 = b->chans * (b->bits/8u);
+                uint32_t pbyte = ((uint32_t)(b->cursor * (double)bpf2)) % b->bytes;
+                uint32_t avail = (b->wpos + b->bytes - pbyte) % b->bytes;
+                if ((double)avail / (double)b->bytes > 0.85) b->over++;   /* yalniz sayac */
+            }
+            b->trim = 1.0;
+        } else
         if (b->wseen){
             uint32_t bpf2 = b->chans * (b->bits/8u);
             uint32_t pbyte = ((uint32_t)(b->cursor * (double)bpf2)) % b->bytes;
@@ -436,6 +459,9 @@ static OSStatus au_cb(void *ud, AudioUnitRenderActionFlags *flags,
     if (nframes > (UInt32)FRAMES) nframes = (UInt32)FRAMES;   /* acc dizisi siniri */
     if (nframes > g_au_slice) g_au_slice = nframes;
     mix_into(out, (unsigned)nframes);
+    /* SNDMUTE=1 (tani): karistirma, servo ve zamanlama aynen calisir, aygita sessizlik gider */
+    { static int mute = -1; if (mute < 0){ const char *e = getenv("SNDMUTE"); mute = e && *e && *e != '0'; }
+      if (mute) memset(out, 0, (size_t)nframes * OUT_CH * sizeof(int16_t)); }
     abl->mBuffers[0].mDataByteSize = nframes * OUT_CH * sizeof(int16_t);
     return noErr;
 }

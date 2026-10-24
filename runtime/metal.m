@@ -246,6 +246,73 @@ static unsigned char mac_to_dik(unsigned short kc){
     default:   return 0;
     }
 }
+/* --- yazilan karakterler -> pencere yordamina WM_CHAR ------------------
+ * Oyun metin girisini (kariyer profil adi vb.) DirectInput'tan DEGIL,
+ * pencere yordaminin WM_CHAR dalindan aliyor (0x005ccd70 -> 0x0055dbe0 ->
+ * metin kutusu 0x00551280: 0x0D kabul, 0x1B iptal, 0x08 sil, gerisi
+ * eklenir).  Windows'ta bunu TranslateMessage uretir; biz dogrudan
+ * macOS'un cozdugu karakterden uretiyoruz (klavye duzeni, Shift dahil).
+ * Tek ureten (ana is parcacigi) / tek tuketen (PeekMessage) halka. */
+#define CHQ 128u
+static unsigned char g_chq[CHQ];
+static _Atomic unsigned g_chq_w, g_chq_r;
+static void char_push(unsigned char ch){
+    unsigned w = atomic_load(&g_chq_w), r = atomic_load(&g_chq_r);
+    if (w - r >= CHQ) return;                 /* dolu: dusur */
+    g_chq[w % CHQ] = ch;
+    atomic_store(&g_chq_w, w + 1);
+}
+/* remove=0: yalnizca bak (PM_NOREMOVE).  Bos ise -1. */
+int metal_take_char(int remove){
+    unsigned r = atomic_load(&g_chq_r);
+    if (r == atomic_load(&g_chq_w)) return -1;
+    int ch = g_chq[r % CHQ];
+    if (remove) atomic_store(&g_chq_r, r + 1);
+    return ch;
+}
+/* Bir tus basisinin uretecegi karakter(ler).  Oyun tek baytlik Windows-1252
+ * kullaniyor: U+00A0..U+00FF ayni degerler; Turkce'ye ozgu harfler 1252'de
+ * yok, en yakin ASCII karsiligina dusuruluyor. */
+static void char_from_event(NSEvent *ev){
+    switch ([ev keyCode]){
+    case 0x24: case 0x4C: char_push(0x0D); return;   /* Return / Enter */
+    case 0x33: char_push(0x08); return;              /* Delete -> Backspace */
+    case 0x35: char_push(0x1B); return;              /* Escape */
+    case 0x30: char_push(0x09); return;              /* Tab */
+    default: break;
+    }
+    if ([ev modifierFlags] & NSEventModifierFlagControl) return;
+    NSString *s = [ev characters];
+    for (NSUInteger i = 0; i < [s length]; i++){
+        unichar u = [s characterAtIndex:i];
+        switch (u){
+        case 0x0131: u = 'i'; break;  case 0x0130: u = 'I'; break;   /* ı İ */
+        case 0x015F: u = 's'; break;  case 0x015E: u = 'S'; break;   /* ş Ş */
+        case 0x011F: u = 'g'; break;  case 0x011E: u = 'G'; break;   /* ğ Ğ */
+        default: break;
+        }
+        if ((u >= 0x20 && u < 0x7F) || (u >= 0xA0 && u <= 0xFF))
+            char_push((unsigned char)u);
+    }
+}
+/* AUTOTEXT="<kare>:<metin>": metni o kareden itibaren 6 karede bir harf
+ * olarak "yazar" (tani/test).  \n -> Enter (0x0D), \b -> Backspace. */
+static void autotext_tick(long f){
+    static int init = 0; static long start = -1; static char txt[128]; static int n = 0, pos = 0;
+    if (!init){ init = 1;
+        const char *e = getenv("AUTOTEXT");
+        const char *c = e ? strchr(e, ':') : 0;
+        if (c){ start = strtol(e, 0, 0);
+            for (const char *q = c + 1; *q && n < (int)sizeof txt - 1; q++){
+                if (q[0] == '\\' && q[1] == 'n'){ txt[n++] = 0x0D; q++; }
+                else if (q[0] == '\\' && q[1] == 'b'){ txt[n++] = 0x08; q++; }
+                else txt[n++] = *q;
+            } }
+    }
+    if (start < 0 || pos >= n || f < start) return;
+    if ((f - start) / 6 >= pos){ char_push((unsigned char)txt[pos]); pos++; }
+}
+
 /* Guest tarafi: DirectInput klavye durumunu doldur */
 void metal_fill_keyboard(unsigned char *dst, unsigned n){
     if (n > 256) n = 256;
@@ -5901,6 +5968,8 @@ void metal_run_main_loop(void){
                             [NSApp sendEvent:ev]; continue; }
                         unsigned char dik = mac_to_dik([ev keyCode]);
                         if (dik) atomic_store(&g_keys[dik], et == NSEventTypeKeyDown ? 1 : 0);
+                        /* Basili tutulunca tekrarlar da yazilir (Windows gibi). */
+                        if (et == NSEventTypeKeyDown) char_from_event(ev);
                         continue;                    /* oyuna gitsin, sisteme degil */
                     }
                     /* Fare olayi oyun alaninin DISINDAysa (baslik cubugu:
@@ -5978,6 +6047,7 @@ void metal_run_main_loop(void){
                  * <sure> kare boyunca tusa bas (varsayilan 8).  Sure
                  * gerekiyordu: arabayi surmeden farlarin yuzeye vurusunu
                  * goremiyoruz. */
+                autotext_tick(atomic_load(&g_frames_drawn));
                 { enum { SQMAX = 64 };
                   static int sqinit = 0; static long sqf[SQMAX], sqd[SQMAX];
                   static unsigned char sqk[SQMAX]; static int sqn = 0;
