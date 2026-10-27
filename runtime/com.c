@@ -70,22 +70,74 @@ static uint32_t com_alloc(uint32_t n){
     if (com_ptr+n > COM_MAX) return 0;
     uint32_t p=com_ptr; com_ptr+=n; mem_commit(p,n); memset(g_mem+p,0,n); return p;
 }
-/* general allocator on the guest side (for Lock etc.).  Never frees (COM objects
- * have no reference count yet): a 23-minute u2net session ended at 587 MB, so the
- * area goes up to just below the guest thread stacks (0x7E000000), 1.1 GB instead
- * of 640 MB.  Address space only: macOS backs the pages the game writes. */
+/* general allocator on the guest side (for Lock etc.).  Bump allocator over
+ * 0x38000000..0x7DE00000 (1.1 GB of address space; macOS backs only the pages the
+ * game writes) plus exact-size free lists: the game Releases textures, vertex and
+ * index buffers (it never AddRefs them), and com_free_buffers() hands their data
+ * back after a short quarantine (GBUF_QUAR presents), because the GPU path copies
+ * guest data a frame or so after the draw.  Before this, repeated race loads filled
+ * the heap in ~3 minutes (black intros, then a crash). */
+static uint64_t g_present;
 #define GBUF_BASE 0x38000000u
 #define GBUF_MAX  0x7DE00000u     /* 2 MB gap: gbuf_alloc commits a 1 MB margin */
+#define GBUF_QUAR 6
+#define GBUF_NB   4096
+#define GBUF_POOL (1<<17)
 static uint32_t gbuf_ptr = GBUF_BASE;
+static uint32_t *g_gsz;                         /* (addr-BASE)>>6 -> size of the live block */
+static struct GFree { uint32_t addr, size, stamp; int next; } *g_gfree;
+static int g_gfree_head[GBUF_NB], g_gfree_unused = -1;   /* size buckets / spare nodes */
+static int g_gq_head = -1, g_gq_tail = -1;               /* quarantine FIFO (stamp order) */
+static uint64_t g_gb_freed = 0, g_gb_reused = 0, g_gb_bytes_freed = 0, g_gb_bad = 0;
+static uint32_t g_gb_live = 0, g_gb_live_peak = 0;
 uint32_t com_gbuf_used(void){ return gbuf_ptr - GBUF_BASE; }
+static void gbuf_init(void){
+    if (g_gsz) return;
+    g_gsz = calloc((GBUF_MAX - GBUF_BASE) >> 6, 4);
+    g_gfree = calloc(GBUF_POOL, sizeof *g_gfree);
+    for (int i = 0; i < GBUF_NB; i++) g_gfree_head[i] = -1;
+    for (int i = 0; i < GBUF_POOL; i++){ g_gfree[i].next = g_gfree_unused; g_gfree_unused = i; }
+}
+static void gbuf_age(void){                     /* quarantine -> size buckets */
+    while (g_gq_head >= 0 && (uint32_t)g_present - g_gfree[g_gq_head].stamp >= GBUF_QUAR){
+        int n = g_gq_head; g_gq_head = g_gfree[n].next; if (g_gq_head < 0) g_gq_tail = -1;
+        uint32_t bk = (g_gfree[n].size >> 6) % GBUF_NB;
+        g_gfree[n].next = g_gfree_head[bk]; g_gfree_head[bk] = n;
+    }
+}
+static void gbuf_free(uint32_t p){
+    if (!p || p < GBUF_BASE || p >= gbuf_ptr || (p & 63u)){ if (p) g_gb_bad++; return; }
+    gbuf_init();
+    uint32_t n = g_gsz[(p - GBUF_BASE) >> 6];
+    if (!n || g_gfree_unused < 0){ if (!n) g_gb_bad++; return; }   /* double free / pool full */
+    g_gsz[(p - GBUF_BASE) >> 6] = 0;
+    int k = g_gfree_unused; g_gfree_unused = g_gfree[k].next;
+    g_gfree[k].addr = p; g_gfree[k].size = n; g_gfree[k].stamp = (uint32_t)g_present; g_gfree[k].next = -1;
+    if (g_gq_tail >= 0) g_gfree[g_gq_tail].next = k; else g_gq_head = k;
+    g_gq_tail = k;
+    g_gb_freed++; g_gb_bytes_freed += n; g_gb_live -= n;
+}
 static uint32_t gbuf_alloc(uint32_t n){
     n=(n+63)&~63u;
+    gbuf_init();
+    gbuf_age();
+    { uint32_t bk = (n >> 6) % GBUF_NB; int *pp = &g_gfree_head[bk];
+      for (int guard = 0; *pp >= 0 && guard < 64; guard++, pp = &g_gfree[*pp].next)
+          if (g_gfree[*pp].size == n){
+              int k = *pp; uint32_t p = g_gfree[k].addr;
+              *pp = g_gfree[k].next; g_gfree[k].next = g_gfree_unused; g_gfree_unused = k;
+              memset(g_mem + p, 0, n);                  /* fresh buffers were zero */
+              g_gsz[(p - GBUF_BASE) >> 6] = n;
+              g_gb_reused++; g_gb_live += n; if (g_gb_live > g_gb_live_peak) g_gb_live_peak = g_gb_live;
+              return p; } }
     if (gbuf_ptr+n > GBUF_MAX || gbuf_ptr+n < gbuf_ptr){
         static int shown = 0;
-        if (shown++ < 5) fprintf(stderr, "  [gbuf] OUT OF MEMORY: %u bytes, buffer heap %u KB\n",
-                                 n, (gbuf_ptr - GBUF_BASE) / 1024u);
+        if (shown++ < 5) fprintf(stderr, "  [gbuf] OUT OF MEMORY: %u bytes, buffer heap %u KB (live %u KB)\n",
+                                 n, (gbuf_ptr - GBUF_BASE) / 1024u, g_gb_live / 1024u);
         return 0; }
     uint32_t p=gbuf_ptr; gbuf_ptr+=n;
+    g_gsz[(p - GBUF_BASE) >> 6] = n;
+    g_gb_live += n; if (g_gb_live > g_gb_live_peak) g_gb_live_peak = g_gb_live;
     /* The FULL size + a safety margin is committed per buffer.  Some of the game's
      * paths (high texture/LOD settings) write a little more than we computed;
      * since what follows wasn't committed, it crashed (measured: 0x38098000).
@@ -1980,6 +2032,18 @@ int com_call(CPU *c, uint32_t magic){
                                        if (g_sb_rec == bi) g_sb_rec = 0;
                                        MR32(self1+8) = 0; }
         }
+        if ((iface==IF_VB || iface==IF_IB) && !getenv("NFSU2_GBUF_FREE0")){
+            uint32_t o=A(c,0);
+            if (o && mem_is_committed(o+11)){ gbuf_free(MR32(o+8)); MR32(o+8)=0; }
+        }
+        else if (iface==IF_TEX && !getenv("NFSU2_GBUF_FREE0")){
+            uint32_t o=A(c,0);
+            if (o && mem_is_committed(o+67)){
+                for (uint32_t q=32; q<64; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
+                if (mem_is_committed(o+143) && MR32(o+140)==0xC0BEC0BEu)
+                    for (uint32_t q=104; q<136; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
+            }
+        }
         if (iface==IF_DSBUF){
             uint32_t self0=A(c,0);
             if (self0 && mem_is_committed(self0+31) && MR32(self0+28)){
@@ -3206,6 +3270,7 @@ int com_call(CPU *c, uint32_t magic){
              * -> garbage values were read in the reflection path. */
             uint32_t edge=A(c,1), lev=A(c,2), usage=A(c,3), fmt=A(c,4), pp=A(c,6);
             uint32_t t2=com_new(IF_TEX,160);        /* wide enough for face buffers */
+            MR32(t2+140)=0xC0BEC0BEu;                /* cube marker (Release frees faces) */
             if (!edge || edge > 4096u) edge = 256u;
             MR32(t2+4)=edge; MR32(t2+8)=edge; MR32(t2+20)=fmt?fmt:22u;
             MR32(t2+24)=lev?lev:1u;
@@ -4350,6 +4415,10 @@ void com_report(void){
         for (int i=0;i<64;i++) if (g_stride[i])
             fprintf(stderr,"    %3d bytes  %llu\n", i*4, (unsigned long long)g_stride[i]);
     }
+    fprintf(stderr,"  buffer heap       : top %u KB, live %u KB (peak %u KB); %llu freed (%llu KB), %llu reused, %llu bad frees\n",
+            (gbuf_ptr-GBUF_BASE)/1024u, g_gb_live/1024u, g_gb_live_peak/1024u,
+            (unsigned long long)g_gb_freed, (unsigned long long)(g_gb_bytes_freed/1024u),
+            (unsigned long long)g_gb_reused, (unsigned long long)g_gb_bad);
     fprintf(stderr,"  --- DirectInput / DirectSound calls ---\n");
     { int any=0;
       for (unsigned i=1;i<NEL(g_if) && i<MSTAT_IF;i++){
