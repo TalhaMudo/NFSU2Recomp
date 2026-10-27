@@ -265,18 +265,19 @@ uint32_t gheap_top_used(void){ return g_top - GH_BASE; }
 uint64_t gheap_failed(void){ return st_fail; }
 
 static void line(const char *tag){
-    extern uint32_t com_gbuf_used(void);
+    extern void com_gbuf_fmt(char *s, size_t n);
+    char gb[192]; com_gbuf_fmt(gb, sizeof gb);
     fprintf(stderr, "  [heap]%s live %llu KB (peak %llu), arena top %u KB (peak %llu), "
             "free %llu KB (%u extents), quarantine %llu KB; %llu allocs, %llu frees, %llu reused, "
             "%llu realloc in place; %llu double / %llu bad / %llu corrupt frees, %llu failed%s; "
-            "buffer heap %u KB\n", tag,
+            "buffer heap %s\n", tag,
             (unsigned long long)(st_live >> 10), (unsigned long long)(st_peak_live >> 10),
             (g_top - GH_BASE) >> 10, (unsigned long long)((st_peak_top ? st_peak_top - GH_BASE : 0) >> 10),
             (unsigned long long)(st_free_bytes >> 10), g_ext_n, (unsigned long long)(g_q_bytes >> 10),
             (unsigned long long)st_alloc, (unsigned long long)st_free, (unsigned long long)st_reuse,
             (unsigned long long)st_inplace, (unsigned long long)st_double, (unsigned long long)st_bad,
             (unsigned long long)st_corrupt, (unsigned long long)st_fail,
-            g_free_on == 0 ? " (FREE OFF)" : "", com_gbuf_used() >> 10);
+            g_free_on == 0 ? " (FREE OFF)" : "", gb);
     if (g_poison) fprintf(stderr, "  [heap] poison: %llu blocks written after free\n",
                           (unsigned long long)st_poison_hit);
 }
