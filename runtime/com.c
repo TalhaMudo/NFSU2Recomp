@@ -74,6 +74,7 @@ static uint32_t com_alloc(uint32_t n){
 #define GBUF_BASE 0x38000000u
 #define GBUF_MAX  0x60000000u
 static uint32_t gbuf_ptr = GBUF_BASE;
+uint32_t com_gbuf_used(void){ return gbuf_ptr - GBUF_BASE; }
 static uint32_t gbuf_alloc(uint32_t n){
     n=(n+63)&~63u;
     if (gbuf_ptr+n > GBUF_MAX) return 0;
