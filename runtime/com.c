@@ -998,22 +998,35 @@ static void put_guid(uint32_t p, uint32_t d1, uint16_t d2, uint16_t d3,
     for (int i=0;i<8;i++) MR8(p+8+i)=d4[i];
 }
 
-/* Fill a DIDEVICEINSTANCEA (580 bytes) and return its address. */
-static uint32_t make_devinst(int keyboard){
-    static uint32_t kb = 0, ms = 0;
-    uint32_t *slot = keyboard ? &kb : &ms;
-    if (*slot) return *slot;
-    uint32_t p = gbuf_alloc(600); g_gb_kept[3] += 640;
+/* Fill a DIDEVICEINSTANCEA (580 bytes) and return its address.  kind 1 keyboard,
+ * 2 mouse, 3 game pad (host controller, runtime/gamepad.m). */
+int gamepad_present(void);
+void gamepad_fill(unsigned char *dst);
+const char *gamepad_name(void);
+static uint32_t make_devinst(int kind){
+    static uint32_t slots[4] = {0,0,0,0};
+    uint32_t *slot = &slots[kind & 3];
+    if (!*slot){ *slot = gbuf_alloc(600); g_gb_kept[3] += 640; }
+    uint32_t p = *slot;
     memset(g_mem+p, 0, 600);
     MR32(p) = 580u;                                   /* dwSize */
     static const uint8_t tail[8] = {0xBF,0xC7,0x44,0x45,0x53,0x54,0x00,0x00};
+    if (kind == 3){
+        static const uint8_t ptail[8] = {0,0,'P','I','D','V','I','D'};
+        put_guid(p+4,  0x6F1D2B70u, 0xD5A0, 0x11CF, tail);     /* guidInstance */
+        put_guid(p+20, 0x028E045Eu, 0x0000, 0x0000, ptail);    /* guidProduct: VID 045E PID 028E */
+        MR32(p+36) = 0x0215u;                         /* DI8DEVTYPE_GAMEPAD, STANDARD */
+        snprintf((char*)(g_mem+p+40),  260, "%s", gamepad_name());
+        snprintf((char*)(g_mem+p+300), 260, "%s", gamepad_name());
+        return p;
+    }
+    int keyboard = (kind == 1);
     put_guid(p+4,  keyboard?0x6F1D2B61u:0x6F1D2B60u, 0xD5A0, 0x11CF, tail);
     put_guid(p+20, keyboard?0x6F1D2B61u:0x6F1D2B60u, 0xD5A0, 0x11CF, tail);
     /* dwDevType: subtype << 8 | type.  0x13=KEYBOARD, 0x12=MOUSE */
     MR32(p+36) = keyboard ? 0x0313u : 0x0212u;
     snprintf((char*)(g_mem+p+40),  260, "%s", keyboard ? "Keyboard" : "Mouse");
     snprintf((char*)(g_mem+p+300), 260, "%s", keyboard ? "Keyboard" : "Mouse");
-    *slot = p;
     return p;
 }
 
@@ -4121,9 +4134,10 @@ int com_call(CPU *c, uint32_t magic){
                 uint32_t d1 = MR32(g);
                 if (d1 == 0x6F1D2B61u) kind = 1;        /* GUID_SysKeyboard */
                 else if (d1 == 0x6F1D2B60u) kind = 2;   /* GUID_SysMouse    */
+                else if (d1 == 0x6F1D2B70u) kind = 3;   /* host game pad    */
                 fprintf(stderr,"  [DI] CreateDevice GUID %08x-%04x-%04x -> %s\n",
                         d1, MR16(g+4), MR16(g+6),
-                        kind==1?"KEYBOARD":(kind==2?"MOUSE":"unknown"));
+                        kind==1?"KEYBOARD":(kind==2?"MOUSE":(kind==3?"GAMEPAD":"unknown")));
             }
             MR32(d+8) = kind;
             if(pp) MR32(pp)=d; r=0; }
@@ -4131,13 +4145,21 @@ int com_call(CPU *c, uint32_t magic){
             /* (dwDevType, lpCallback, pvRef, dwFlags)
              * REALLY call the callback: report a keyboard and a mouse. */
             uint32_t devtype=A(c,1), cb=A(c,2), ref=A(c,3);
-            if (cb && ENVC("DI_ENUM")){
+            if (cb && devtype == 4u){                 /* DI8DEVCLASS_GAMECTRL: the host pad */
+                if (gamepad_present()){
+                    uint32_t args[2] = { make_devinst(3), ref };
+                    call_guest(c, cb, 2, args);
+                    fprintf(stderr,"  [DI] game pad offered to the game: %s\n", gamepad_name());
+                }
+                g_di_enum++;
+            }
+            else if (cb && ENVC("DI_ENUM")){
                 for (int k=0;k<2;k++){
                     int is_kb = (k==0);
                     uint32_t t = is_kb ? 0x13u : 0x12u;
                     /* 0 = DI8DEVCLASS_ALL -> all */
                     if (devtype && (devtype & 0xFFu) != t && devtype > 4u) continue;
-                    uint32_t args[2] = { make_devinst(is_kb), ref };
+                    uint32_t args[2] = { make_devinst(is_kb ? 1 : 2), ref };
                     if (call_guest(c, cb, 2, args) == 0) break;   /* DIENUM_STOP */
                 }
                 g_di_enum++;
@@ -4152,7 +4174,7 @@ int com_call(CPU *c, uint32_t magic){
                     int is_kb = (k==0);
                     uint32_t dev = com_new(IF_DIDEV,128);
                     MR32(dev+8) = is_kb ? 1u : 2u;     /* device type marker */
-                    uint32_t args[5] = { make_devinst(is_kb), dev,
+                    uint32_t args[5] = { make_devinst(is_kb ? 1 : 2), dev,
                                          0x00000001u,          /* DIEDBS_MAPPEDPRI1 */
                                          (uint32_t)(1-k), ref };
                     if (call_guest(c, cb, 5, args) == 0) break;
@@ -4179,7 +4201,28 @@ int com_call(CPU *c, uint32_t magic){
              * BOOL(LPCDIDEVICEOBJECTINSTANCE, LPVOID)
              * If it isn't called the game sees the device as "objectless" and abandons it. */
             uint32_t cb=A(c,1), ref=A(c,2), flags=A(c,3);
-            if (cb && dkind == 1u){                 /* keyboard */
+            if (cb && dkind == 3u){                 /* game pad: 8 axes, 10 buttons, 1 POV */
+                static const uint32_t axg[8] = {0xA36D02E0,0xA36D02E1,0xA36D02E2,0xA36D02F4,
+                                                0xA36D02F5,0xA36D02E3,0xA36D02E4,0xA36D02E4};
+                uint32_t oi = gbuf_alloc(340); g_gb_kept[3] += 384;
+                for (int k = 0; k < 19; k++){
+                    uint32_t type, ofs, g1;
+                    if (k < 8){        type = 0x02u | ((uint32_t)k << 8);        ofs = 4u*k;  g1 = axg[k]; }
+                    else if (k == 8){  type = 0x10u;                             ofs = 0x20;  g1 = 0xA36D02F2; }
+                    else {             type = 0x04u | ((uint32_t)(k-9) << 8);    ofs = 0x30u + (uint32_t)(k-9); g1 = 0xA36D02F0; }
+                    if (!(flags == 0u || (flags & type & 0xFFu))) continue;   /* DIDFT_ALL / filter */
+                    memset(g_mem+oi, 0, 340);
+                    MR32(oi) = 316u;
+                    put_guid(oi+4, g1, 0xC9F3, 0x11CF, (const uint8_t[8]){0xBF,0xC7,0x44,0x45,0x53,0x54,0,0});
+                    MR32(oi+20) = ofs;  MR32(oi+24) = type;  MR32(oi+28) = 0;
+                    snprintf((char*)(g_mem+oi+32), 260, k < 8 ? "Axis %d" : (k == 8 ? "POV" : "Button %d"),
+                             k < 8 ? k : k - 9);
+                    uint32_t args[2] = { oi, ref };
+                    if (call_guest(c, cb, 2, args) == 0) break;
+                }
+                g_di_objs++;
+            }
+            else if (cb && dkind == 1u){                 /* keyboard */
                 uint32_t oi = gbuf_alloc(340); g_gb_kept[3] += 384;
                 for (uint32_t dik = 1; dik < 0xEEu; dik++){
                     if (!(flags & 0x0Cu) && flags != 0u) break;   /* DIDFT_BUTTON/ALL */
@@ -4215,7 +4258,7 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t p=A(c,1);
             if (p && mem_is_committed(p+3)){
                 uint32_t sz=MR32(p); if(!sz||sz>700u) sz=580u;
-                uint32_t src = make_devinst(dkind != 2u);
+                uint32_t src = make_devinst(dkind ? (int)dkind : 1);
                 mem_commit(p, sz);
                 memcpy(g_mem+p, g_mem+src, sz < 580u ? sz : 580u);
                 MR32(p)=sz;
@@ -4236,7 +4279,11 @@ int com_call(CPU *c, uint32_t magic){
             if(p && cb && cb<4096u){
                 mem_commit(p,cb); memset(g_mem+p,0,cb);
                 /* a 256-byte request = the DirectInput keyboard table */
-                if (cb == 20u && metal_available()){        /* DIMOUSESTATE2 */
+                if (cb == 272u && dkind == 3u){             /* DIJOYSTATE2: host game pad */
+                    gamepad_fill(g_mem+p);
+                    g_dikey_calls++;
+                }
+                else if (cb == 20u && metal_available()){        /* DIMOUSESTATE2 */
                     metal_fill_mouse(g_mem+p, cb);
                     g_dikey_calls++;
                     for (uint32_t q=12;q<20;q++)
@@ -4346,9 +4393,13 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t p=A(c,1);
             if(p){ uint32_t sz=MR32(p); if(!sz||sz>256u) sz=44u; mem_commit(p,sz);
                    memset(g_mem+p,0,sz); MR32(p)=sz;
-                   MR32(p+4)=0x00000010u;   /* DIDC_ATTACHED */
-                   MR32(p+8)=0x00000013u;   /* DI8DEVTYPE_KEYBOARD */
-                   MR32(p+12)=256; }        /* dwAxes/dwButtons approximate */
+                   if (dkind == 3u){
+                       MR32(p+4)=0x00000001u;  MR32(p+8)=0x00000215u;   /* attached, GAMEPAD */
+                       MR32(p+12)=8; MR32(p+16)=10; MR32(p+20)=1;       /* axes, buttons, POVs */
+                   } else {
+                       MR32(p+4)=0x00000010u;   /* DIDC_ATTACHED */
+                       MR32(p+8)=0x00000013u;   /* DI8DEVTYPE_KEYBOARD */
+                       MR32(p+12)=256; } }      /* dwAxes/dwButtons approximate */
             r=0; }
         else if (MID(GetProperty)){
             uint32_t p=A(c,2);
@@ -4492,6 +4543,7 @@ void draw_stats_save(uint64_t *a, uint64_t *b){ g_ptype=a; g_stride=b; }
 void com_report(void){
     fprintf(stderr,"\n=== COM / D3D9 KATMANI ===\n");
     { void ws_report(void); ws_report(); }   /* LOCAL PATCH */
+    { void gamepad_report(void); gamepad_report(); }   /* LOCAL PATCH: gamepad.m */
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
                   g_aspfix, g_asp_persp, g_asp_ortho);
