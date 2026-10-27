@@ -4546,6 +4546,7 @@ void com_report(void){
     { void gamepad_report(void); gamepad_report(); }   /* LOCAL PATCH: gamepad.m */
     { void xpatch_report(void); xpatch_report(); }
     { void highfps_report(void); highfps_report(); }   /* LOCAL PATCH: highfps.c */
+    { void fasttravel_report(void); fasttravel_report(); }   /* LOCAL PATCH: fasttravel.c */
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
                   g_aspfix, g_asp_persp, g_asp_ortho);
