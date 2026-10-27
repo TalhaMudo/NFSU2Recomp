@@ -43,6 +43,14 @@ static pthread_mutex_t g_guest = PTHREAD_MUTEX_INITIALIZER;
 extern CPU *g_cur_cpu;
 static _Thread_local CPU *tl_cpu = 0;
 static _Thread_local void *tl_obj = 0;   /* this thread's object */
+/* Wait semantics.  Waits used to give up early: events after 2 s even for INFINITE, multi-object
+ * waits after 200 ms.  A game thread that waits for an event during a long load (the NIS
+ * audio stream thread, for instance) then saw a bogus WAIT_TIMEOUT.  NFSU2_WAIT_LEGACY=1 restores
+ * the old behaviour. */
+static int wait_legacy(void){ static int v=-1; if (v<0){ const char *e=getenv("NFSU2_WAIT_LEGACY"); v = (e && *e && *e!='0'); } return v; }
+static uint64_t wait_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000u + (uint64_t)t.tv_nsec/1000000u; }
+static int wait_thread_killed(void);
+
 /* CPU state of all guest threads: to be able to dump the stack traces of ALL
  * of them at stall time (a single thread's can be misleading). */
 #define MAXCPUS 32
@@ -328,6 +336,7 @@ static void tstack_put(uint32_t lo){
     if (g_tfree_n < 64) g_tfree[g_tfree_n++] = lo;
     pthread_mutex_unlock(&g_lock);
 }
+static int wait_thread_killed(void){ return tl_obj && ((Obj*)tl_obj)->terminate; }
 static void guest_thread_die(void){            /* called WITH the guest lock held */
     Obj *o = (Obj*)tl_obj;
     if (o){ pthread_mutex_lock(&o->mtx); o->signaled=1;
@@ -826,11 +835,23 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
             guest_yield_begin();
             pthread_mutex_lock(&o->mtx);
             if(!o->signaled && ms){
-                struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-                uint32_t wait = (ms==0xFFFFFFFFu)? 2000u : (ms>2000u?2000u:ms);
-                ts.tv_sec += wait/1000; ts.tv_nsec += (long)(wait%1000)*1000000L;
-                if(ts.tv_nsec>=1000000000L){ts.tv_sec++;ts.tv_nsec-=1000000000L;}
-                pthread_cond_timedwait(&o->cv,&o->mtx,&ts);
+                uint64_t t0 = wait_now_ms();
+                for (;;){
+                    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
+                    uint32_t wait = 2000u;
+                    if (!wait_legacy()){
+                        wait = 50u;                               /* short slices: see terminate */
+                        if (ms != 0xFFFFFFFFu){
+                            uint64_t el = wait_now_ms() - t0;
+                            if (el >= ms) break;
+                            if (ms - el < wait) wait = (uint32_t)(ms - el);
+                        }
+                    } else if (ms != 0xFFFFFFFFu && ms < wait) wait = ms;
+                    ts.tv_sec += wait/1000; ts.tv_nsec += (long)(wait%1000)*1000000L;
+                    if(ts.tv_nsec>=1000000000L){ts.tv_sec++;ts.tv_nsec-=1000000000L;}
+                    pthread_cond_timedwait(&o->cv,&o->mtx,&ts);
+                    if (o->signaled || wait_legacy() || wait_thread_killed()) break;
+                }
             }
             r = o->signaled ? 0u : 0x102u;              /* WAIT_OBJECT_0 / WAIT_TIMEOUT */
             if(o->signaled && !o->manual) o->signaled=0;
@@ -915,10 +936,21 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         r=0; }
     else if (!strcmp(n,"WaitForMultipleObjects")){
         uint32_t cnt=A(c,0), parr=A(c,1), waitall=A(c,2), ms=A(c,3);
-        (void)waitall;
         guest_yield_begin();
         uint32_t got=0x102u;
-        for (int spin=0; spin<200; spin++){
+        uint64_t t0 = wait_now_ms();
+        for (int spin=0; ; spin++){
+            if (waitall && !wait_legacy()){
+                uint32_t nsig=0, nobj=0;
+                for (uint32_t i=0;i<cnt && i<64;i++){
+                    Obj*o=obj_get(MR32(parr+4u*i)); if(!o) continue; nobj++;
+                    pthread_mutex_lock(&o->mtx); if (o->signaled) nsig++; pthread_mutex_unlock(&o->mtx); }
+                if (nobj && nsig==nobj){
+                    for (uint32_t i=0;i<cnt && i<64;i++){
+                        Obj*o=obj_get(MR32(parr+4u*i)); if(!o) continue;
+                        pthread_mutex_lock(&o->mtx); if(!o->manual) o->signaled=0; pthread_mutex_unlock(&o->mtx); }
+                    got=0; }
+            } else
             for (uint32_t i=0;i<cnt && i<64;i++){
                 Obj*o=obj_get(MR32(parr+4u*i));
                 if(o){ pthread_mutex_lock(&o->mtx);
@@ -928,6 +960,8 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                        if(sig){ got=i; break; } }
             }
             if (got!=0x102u || ms==0) break;
+            if (wait_legacy()){ if (spin>=199) break; }
+            else { if (ms!=0xFFFFFFFFu && wait_now_ms()-t0 >= ms) break; if (wait_thread_killed()) break; }
             struct timespec ts={0,1000000L}; nanosleep(&ts,0);
         }
         guest_yield_end();
