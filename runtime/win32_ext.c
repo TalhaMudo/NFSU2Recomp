@@ -289,7 +289,10 @@ static Obj *obj_get(uint32_t h){
 
 /* ---- guest thread ---- */
 #define GTHREAD_STACK 0x00100000u          /* 1 MB */
-static uint32_t g_tstack_next = 0x60000000u;
+/* 16 stacks at 0x7E000000..0x7F000000, below the main stack (boot.c STACK_LO);
+ * the game starts 8 threads.  (They were at 0x60000000, now the buffer heap's.) */
+#define GTHREAD_TOP   0x7F000000u
+static uint32_t g_tstack_next = 0x7E000000u;
 uint64_t g_threads_started = 0, g_threads_exited = 0;
 
 typedef struct { uint32_t entry, arg, teb; Obj *ob; } TArg;
@@ -317,6 +320,8 @@ static void *guest_thread_main(void *p){
     CPU cpu; memset(&cpu,0,sizeof cpu);
     uint32_t stack_lo, stack_hi;
     pthread_mutex_lock(&g_lock);
+    if (g_tstack_next + GTHREAD_STACK > GTHREAD_TOP){
+        fprintf(stderr, "  [thread] no room for another guest thread stack\n"); exit(7); }
     stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
     pthread_mutex_unlock(&g_lock);
     mem_commit(stack_lo, GTHREAD_STACK);
@@ -383,6 +388,8 @@ static void *timer_thread_main(void *p){
     CPU cpu; memset(&cpu,0,sizeof cpu);
     uint32_t stack_lo, stack_hi, teb;
     pthread_mutex_lock(&g_lock);
+    if (g_tstack_next + GTHREAD_STACK > GTHREAD_TOP){
+        fprintf(stderr, "  [thread] no room for another guest thread stack\n"); exit(7); }
     stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
     teb = 0x00C60000u;
     pthread_mutex_unlock(&g_lock);

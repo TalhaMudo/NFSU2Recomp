@@ -70,14 +70,21 @@ static uint32_t com_alloc(uint32_t n){
     if (com_ptr+n > COM_MAX) return 0;
     uint32_t p=com_ptr; com_ptr+=n; mem_commit(p,n); memset(g_mem+p,0,n); return p;
 }
-/* general allocator on the guest side (for Lock etc.) */
+/* general allocator on the guest side (for Lock etc.).  Never frees (COM objects
+ * have no reference count yet): a 23-minute u2net session ended at 587 MB, so the
+ * area goes up to just below the guest thread stacks (0x7E000000), 1.1 GB instead
+ * of 640 MB.  Address space only: macOS backs the pages the game writes. */
 #define GBUF_BASE 0x38000000u
-#define GBUF_MAX  0x60000000u
+#define GBUF_MAX  0x7DE00000u     /* 2 MB gap: gbuf_alloc commits a 1 MB margin */
 static uint32_t gbuf_ptr = GBUF_BASE;
 uint32_t com_gbuf_used(void){ return gbuf_ptr - GBUF_BASE; }
 static uint32_t gbuf_alloc(uint32_t n){
     n=(n+63)&~63u;
-    if (gbuf_ptr+n > GBUF_MAX) return 0;
+    if (gbuf_ptr+n > GBUF_MAX || gbuf_ptr+n < gbuf_ptr){
+        static int shown = 0;
+        if (shown++ < 5) fprintf(stderr, "  [gbuf] OUT OF MEMORY: %u bytes, buffer heap %u KB\n",
+                                 n, (gbuf_ptr - GBUF_BASE) / 1024u);
+        return 0; }
     uint32_t p=gbuf_ptr; gbuf_ptr+=n;
     /* The FULL size + a safety margin is committed per buffer.  Some of the game's
      * paths (high texture/LOD settings) write a little more than we computed;
@@ -4286,6 +4293,8 @@ uint32_t com_direct3dcreate9(void){
     return g_d3d9;
 }
 void com_init(void){ mem_commit(COM_BASE,0x10000);
+    /* GBUF_SKIP_MB=<n>: start the buffer heap n MB higher (test of the top of the area) */
+    { const char *e = getenv("GBUF_SKIP_MB"); if (e && *e) gbuf_ptr += (uint32_t)atoi(e) << 20; }
     { extern char **environ; (void)environ; }
 }
 static uint64_t *g_ptype = 0, *g_stride = 0;
