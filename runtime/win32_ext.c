@@ -25,6 +25,7 @@ typedef struct {
     uint32_t guest_arg, guest_entry, tid;
     uint32_t owner_tid; int rec;      /* MUTEX: ownership + recursion */
     pthread_t th; int started; void *pending;
+    volatile int terminate;           /* THREAD: TerminateThread was called on it */
     char name[64];
 } Obj;
 #define OBJ_MAX 512
@@ -93,7 +94,9 @@ static void gil_gave(void){
 void guest_lock(CPU *c){ pthread_mutex_lock(&g_guest); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took(); }
 void guest_unlock(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
-static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took(); }
+static void guest_thread_die(void);
+static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took();
+    if (tl_obj && ((Obj*)tl_obj)->terminate) guest_thread_die(); }
 /* Sleep while releasing the big lock (win32.c: the game's frame wait loop). */
 uint64_t g_sleep_late_ns, g_sleep_gil_ns, g_sleep_n;    /* diagnostics: sleep latency / lock wait */
 /* On macOS nanosleep wakes up with a timer coalescing margin: in the game a
@@ -304,6 +307,39 @@ void mem_altstack_install(void);
  * default of 512 KB via `pthread_create(...,0,...)` -> a HOST STACK OVERFLOW in
  * deep recursion (SIGSEGV, an address outside guest space).  The reservation
  * is virtual address space; it is only committed as it gets used. */
+/* Guest thread stacks: 1 MB slots in a small area (16 of them).  The game starts worker
+ * threads at every race load, and TerminateThread used to do nothing, so they piled up and
+ * the 16 slots ran out after ~9 races ("no room for another guest thread stack", exit 7).
+ * Now slots are recycled when a thread ends, and TerminateThread really ends the thread
+ * (at its next return from a wait/sleep, where it gets the guest lock back). */
+static uint32_t g_tfree[64]; static int g_tfree_n = 0;
+static _Thread_local uint32_t tl_stack_lo = 0;
+static uint32_t tstack_get(void){
+    uint32_t lo = 0;
+    pthread_mutex_lock(&g_lock);
+    if (g_tfree_n > 0) lo = g_tfree[--g_tfree_n];
+    else if (g_tstack_next + GTHREAD_STACK <= GTHREAD_TOP){ lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; }
+    pthread_mutex_unlock(&g_lock);
+    return lo;
+}
+static void tstack_put(uint32_t lo){
+    if (!lo) return;
+    pthread_mutex_lock(&g_lock);
+    if (g_tfree_n < 64) g_tfree[g_tfree_n++] = lo;
+    pthread_mutex_unlock(&g_lock);
+}
+static void guest_thread_die(void){            /* called WITH the guest lock held */
+    Obj *o = (Obj*)tl_obj;
+    if (o){ pthread_mutex_lock(&o->mtx); o->signaled=1;
+            pthread_cond_broadcast(&o->cv); pthread_mutex_unlock(&o->mtx); }
+    { static int sh = 0; if (sh++ < 200)
+        fprintf(stderr, "  [thread] tid=%u ends, stack slot %08x recycled\n", o ? o->tid : 0u, tl_stack_lo); }
+    tstack_put(tl_stack_lo); tl_stack_lo = 0;
+    __sync_fetch_and_add(&g_threads_exited, 1);
+    guest_unlock();
+    pthread_exit(0);
+}
+
 static int guest_pthread_create(pthread_t *th, void *(*fn)(void*), void *arg){
     pthread_attr_t at;
     if (pthread_attr_init(&at) != 0) return pthread_create(th, 0, fn, arg);
@@ -319,12 +355,12 @@ static void *guest_thread_main(void *p){
     TArg *t = (TArg*)p;
     CPU cpu; memset(&cpu,0,sizeof cpu);
     uint32_t stack_lo, stack_hi;
-    pthread_mutex_lock(&g_lock);
-    if (g_tstack_next + GTHREAD_STACK > GTHREAD_TOP){
+    stack_lo = tstack_get();
+    if (!stack_lo){
         fprintf(stderr, "  [thread] no room for another guest thread stack\n"); exit(7); }
-    stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
-    pthread_mutex_unlock(&g_lock);
+    stack_hi = stack_lo + GTHREAD_STACK; tl_stack_lo = stack_lo;
     mem_commit(stack_lo, GTHREAD_STACK);
+    memset(g_mem + stack_lo, 0, GTHREAD_STACK);     /* a recycled slot starts clean */
     cpu.esp = stack_hi - 0x1000u;
     cpu.top = 0; cpu.fcw = 0x037f;
     cpu.fs_base = t->teb; cpu.gs_base = t->teb;
@@ -344,10 +380,8 @@ static void *guest_thread_main(void *p){
       pthread_setname_np(nm); }
     guest_lock(&cpu);
     dispatch_indirect(&cpu, t->entry);
-    guest_unlock();
-    if (t->ob){ pthread_mutex_lock(&t->ob->mtx); t->ob->signaled=1;
-                pthread_cond_broadcast(&t->ob->cv); pthread_mutex_unlock(&t->ob->mtx); }
     free(t);
+    guest_thread_die();                              /* returned normally */
     return 0;
 }
 
@@ -387,12 +421,11 @@ static void *timer_thread_main(void *p){
     mem_altstack_install();
     CPU cpu; memset(&cpu,0,sizeof cpu);
     uint32_t stack_lo, stack_hi, teb;
-    pthread_mutex_lock(&g_lock);
-    if (g_tstack_next + GTHREAD_STACK > GTHREAD_TOP){
+    stack_lo = tstack_get();
+    if (!stack_lo){
         fprintf(stderr, "  [thread] no room for another guest thread stack\n"); exit(7); }
-    stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
+    stack_hi = stack_lo + GTHREAD_STACK;
     teb = 0x00C60000u;
-    pthread_mutex_unlock(&g_lock);
     mem_commit(stack_lo, GTHREAD_STACK);
     mem_commit(teb, 0x2000);
     cpu.top = 0; cpu.fcw = 0x037f;
@@ -807,6 +840,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     /* --- thread --- */
     else if (!strcmp(n,"CreateThread")){
         uint32_t entry=A(c,2), arg=A(c,3), ptid=A(c,5);
+        { static int sc=0; if (sc++ < 200) fprintf(stderr, "  [thread] CreateThread entry=0x%08x arg=0x%08x flags=0x%x\n", entry, arg, A(c,4)); }
         { static int sh=0; if (getenv("VERBOSE") && sh<40){ sh++;
             fprintf(stderr,"      [thread] CreateThread(attr=0x%08x stack=0x%x entry=0x%08x arg=0x%08x flags=0x%x ptid=0x%08x)\n",
                     A(c,0),A(c,1),entry,arg,A(c,4),ptid); } }
@@ -845,14 +879,17 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"ExitThread")){
         /* REALLY terminate the guest thread. Otherwise execution falls from
          * _endthreadex into the _threadstartex prologue and the thread restarts itself. */
-        Obj *o = (Obj*)tl_obj;
-        if (o){ pthread_mutex_lock(&o->mtx); o->signaled=1;
-                pthread_cond_broadcast(&o->cv); pthread_mutex_unlock(&o->mtx); }
-        __sync_fetch_and_add(&g_threads_exited, 1);
-        guest_unlock();
-        pthread_exit(0);
+        guest_thread_die();
         r=1; }
-    else if (!strcmp(n,"TerminateThread")) r=1;
+    else if (!strcmp(n,"TerminateThread")){
+        Obj *to = obj_get(A(c,0));
+        { static int sh = 0; if (sh++ < 200)
+            fprintf(stderr, "  [thread] TerminateThread tid=%u%s\n", to ? to->tid : 0u, to == tl_obj ? " (self)" : ""); }
+        if (to && to->kind == OB_THREAD){
+            if (to == (Obj*)tl_obj) guest_thread_die();
+            to->terminate = 1;
+        }
+        r=1; }
     else if (!strcmp(n,"GetExitCodeThread")){ uint32_t p=A(c,1); if(p) MR32(p)=0; r=1; }
     else if (!strcmp(n,"SetThreadAffinityMask")||!strcmp(n,"SetProcessAffinityMask")) r=1;
     else if (!strcmp(n,"GetProcessAffinityMask")){
