@@ -80,7 +80,9 @@ static uint32_t com_alloc(uint32_t n){
 static uint64_t g_present;
 #define GBUF_BASE 0x38000000u
 #define GBUF_MAX  0x7DE00000u     /* 2 MB gap: gbuf_alloc commits a 1 MB margin */
-#define GBUF_QUAR 6
+/* A released resource stays alive in Direct3D while it is still bound to the device, so the
+ * data must outlive the Release by a good margin (NFSU2_GBUF_QUAR presents, default 1500 = ~15 s). */
+static uint32_t gbuf_quar(void){ static int q=-1; if (q<0){ const char *e=getenv("NFSU2_GBUF_QUAR"); q = e ? atoi(e) : 1500; if (q<1) q=1; } return (uint32_t)q; }
 #define GBUF_NB   4096
 #define GBUF_POOL (1<<17)
 static uint32_t gbuf_ptr = GBUF_BASE;
@@ -99,7 +101,7 @@ static void gbuf_init(void){
     for (int i = 0; i < GBUF_POOL; i++){ g_gfree[i].next = g_gfree_unused; g_gfree_unused = i; }
 }
 static void gbuf_age(void){                     /* quarantine -> size buckets */
-    while (g_gq_head >= 0 && (uint32_t)g_present - g_gfree[g_gq_head].stamp >= GBUF_QUAR){
+    while (g_gq_head >= 0 && (uint32_t)g_present - g_gfree[g_gq_head].stamp >= gbuf_quar()){
         int n = g_gq_head; g_gq_head = g_gfree[n].next; if (g_gq_head < 0) g_gq_tail = -1;
         uint32_t bk = (g_gfree[n].size >> 6) % GBUF_NB;
         g_gfree[n].next = g_gfree_head[bk]; g_gfree_head[bk] = n;
