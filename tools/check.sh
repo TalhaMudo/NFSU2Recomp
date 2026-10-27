@@ -53,6 +53,7 @@ for b in $BUILDS; do
     ${NFSU2_HEAP_FREE:+NFSU2_HEAP_FREE="$NFSU2_HEAP_FREE"} ${NFSU2_HEAP_QUAR_MB:+NFSU2_HEAP_QUAR_MB="$NFSU2_HEAP_QUAR_MB"} ${HEAPPOISON:+HEAPPOISON="$HEAPPOISON"} ${NFSU2_HEAPLOG:+NFSU2_HEAPLOG="$NFSU2_HEAPLOG"} \
     ${NFSU2_HEAP_FREE:+NFSU2_HEAP_FREE="$NFSU2_HEAP_FREE"} ${NFSU2_HEAP_QUAR_MB:+NFSU2_HEAP_QUAR_MB="$NFSU2_HEAP_QUAR_MB"} ${HEAPPOISON:+HEAPPOISON="$HEAPPOISON"} ${GBUF_SKIP_MB:+GBUF_SKIP_MB="$GBUF_SKIP_MB"} ${NFSU2_HEAPLOG:+NFSU2_HEAPLOG="$NFSU2_HEAPLOG"} \
     ${NFSU2_HEAP_FREE:+NFSU2_HEAP_FREE="$NFSU2_HEAP_FREE"} ${NFSU2_HEAP_QUAR_MB:+NFSU2_HEAP_QUAR_MB="$NFSU2_HEAP_QUAR_MB"} ${HEAPPOISON:+HEAPPOISON="$HEAPPOISON"} ${GBUF_SKIP_MB:+GBUF_SKIP_MB="$GBUF_SKIP_MB"} ${NFSU2_GBUF_MERGE:+NFSU2_GBUF_MERGE="$NFSU2_GBUF_MERGE"} ${NFSU2_GBUF_QUAR:+NFSU2_GBUF_QUAR="$NFSU2_GBUF_QUAR"} ${NFSU2_GBUF_FREE0:+NFSU2_GBUF_FREE0="$NFSU2_GBUF_FREE0"} ${NFSU2_HEAPLOG:+NFSU2_HEAPLOG="$NFSU2_HEAPLOG"} \
+    ${NFSU2_HIGHFPS:+NFSU2_HIGHFPS="$NFSU2_HIGHFPS"} ${NFSU2_HIGHFPS_OFF:+NFSU2_HIGHFPS_OFF="$NFSU2_HIGHFPS_OFF"} ${NFSU2_HIGHFPS_SET:+NFSU2_HIGHFPS_SET="$NFSU2_HIGHFPS_SET"} ${TIMELOG:+TIMELOG="$TIMELOG"} ${FILEOPLOG:+FILEOPLOG="$FILEOPLOG"} \
     "$BIN" "$EXE" > "$LOG" 2>&1
   rc=$?
   restore
@@ -69,6 +70,11 @@ for b in $BUILDS; do
   check "buffer heap: 0 bad frees, no OOM" "$([ "${v:-x}" = 0 ] && [ "$o" = 0 ] && echo 1 || echo 0)" "${v:-?} bad, $o OOM"
   v=$(num "[0-9]+ MISSING" ', ([0-9]+) MISSING'); check "missing mip levels = 0" "$([ "${v:-x}" = 0 ] && echo 1 || echo 0)" "${v:-?}"
   v=$(grep -a -E "^ +vs[0-9]+: version" "$LOG" | grep -a -v -c ", 0 unknown"); check "unknown in vertex shaders = 0" "$([ "$v" = 0 ] && echo 1 || echo 0)" "$v shaders"
+  # high-FPS fixes (highfps.c): installed, particle steps seen in the race
+  if [ "${NFSU2_HIGHFPS:-1}" != 0 ]; then
+    v=$(grep -a "^  \\[highfps\\] on: " "$LOG" | sed -E 's/.*particle steps ([0-9]+).*/\1/' | tail -1)
+    check "highfps: particle steps > 0" "$([ "${v:-0}" -gt 0 ] 2>/dev/null && echo 1 || echo 0)" "${v:-0}"
+  fi
   v=$(num "sound cursor overrun" ': ([0-9]+) callbacks'); check "audio: cursor overrun = 0" "$([ "${v:-0}" = 0 ] && echo 1 || echo 0)" "${v:-(sound off)}"
   # did we really get into a race: draws per frame in the measurement window (menu ~475, race ~900+)
   v=$(num "draw calls: [0-9]+/frame" 'draw calls: ([0-9]+)/frame'); check "got into a race (draws/frame > 700)" "$([ "${v:-0}" -gt 700 ] && echo 1 || echo 0)" "${v:-?}"
