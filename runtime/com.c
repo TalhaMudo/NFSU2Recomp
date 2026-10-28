@@ -4544,6 +4544,7 @@ void com_report(void){
     fprintf(stderr,"\n=== COM / D3D9 KATMANI ===\n");
     { void ws_report(void); ws_report(); }   /* LOCAL PATCH */
     { void gamepad_report(void); gamepad_report(); }   /* LOCAL PATCH: gamepad.m */
+    { void xpatch_report(void); xpatch_report(); }
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
                   g_aspfix, g_asp_persp, g_asp_ortho);

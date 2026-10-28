@@ -1,0 +1,2 @@
+# xpatch sites for the European v1.2 SPEED2.EXE (sha256 8f6a9ae2...).
+# Format: see the header of tools/xpatch.py.  Features add their own sites here.
