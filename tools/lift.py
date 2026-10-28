@@ -284,6 +284,10 @@ class Unsupported(Exception): pass
 # call, ret, an instruction touching c->st/c->top, end of block) only the modified
 # slots still on the stack are written back and c->top is updated once.
 import re as _re
+import re
+PLACEHOLDERS_XP = (0x5d, 0x6b, 0x71, 0x4f, 0x63, 0x3b)
+class XPatchError(Exception):
+    """a bad xpatch site: generation must stop (genall re-raises it)"""
 _ST_RE = _re.compile(r'ST\((\d+)\)')
 _STA_RE = _re.compile(r'ST\((\d+)\)\s*=(?!=)')
 _BOUNDARY_RE = _re.compile(r'\b\w+\(c[,)]|\breturn\b|c->st|c->top|\bST\(|FPUSH|FPOP|fsw_get')
@@ -347,7 +351,7 @@ class RawLifter:
     def __init__(self, data, base=0x00401000, comments=True):
         self.comments=comments; self.trap=False; self.traps=0
         self.trap_kinds=collections.Counter(); self.hooks=set(); self.watch=False
-        self.cov=False
+        self.cov=False; self.xp=None
         self.secs=[('.text', base, len(data), bytes(data))]
         self.TVA=base; self.TSZ=len(data); self.TDATA=bytes(data)
         self.md=Cs(CS_ARCH_X86,CS_MODE_32); self.md.detail=True
@@ -357,7 +361,7 @@ class Lifter:
     def __init__(self, pe_path, comments=True, trap=False, hooks=None, watch=False):
         self.comments=comments; self.trap=trap; self.traps=0; self.trap_kinds=collections.Counter()
         self.hooks=set(hooks or ()); self.watch=watch
-        self.cov=False
+        self.cov=False; self.xp=None; self.xp_hits=set()
         pe = pefile.PE(pe_path); self.IB = pe.OPTIONAL_HEADER.ImageBase
         self.secs=[]
         for s in pe.sections:
@@ -1581,6 +1585,65 @@ class Lifter:
 
         raise Unsupported(m)
 
+    # ---------- LOCAL PATCH: run-time switchable patches (tools/xpatch.py) ----------
+    def _xp_lines(self, s, data, lbl, targets):
+        """patched bytes -> C lines; returns (lines, ends_with_transfer)"""
+        L = []; pos = s.a; ends = False
+        saved = getattr(self, 'cur_fmask', F_ALL)
+        for i in self.md.disasm(data, s.a):
+            m = i.mnemonic; pos = i.address + i.size
+            if m == 'jmp' and i.operands[0].type == X86_OP_IMM:
+                t = i.operands[0].imm
+                if t not in lbl: raise XPatchError(f"xpatch {s.name}: jmp to {t:#x} is not a label")
+                L.append(f"goto L_{t:08x};"); ends = True; break
+            if m.startswith('j') and m[1:] in CC and i.operands[0].type == X86_OP_IMM:
+                t = i.operands[0].imm
+                if t not in lbl: raise XPatchError(f"xpatch {s.name}: {m} to {t:#x} is not a label")
+                L.append(f"if({CC[m[1:]]}) goto L_{t:08x};")
+            else:
+                self.cur_fmask = F_ALL
+                if m[:1] == 'f' or X86_GRP_FPU in i.groups:
+                    raise XPatchError(f"xpatch {s.name}: x87 in patched code")
+                try: L += self.insn(i, targets)
+                except Unsupported as e: raise XPatchError(f"xpatch {s.name}: {m} not supported ({e})")
+                if m in ('ret', 'retf'): ends = True; break
+            if s.kind == 'w' and pos >= s.e: break
+        self.cur_fmask = saved
+        if s.kind == 'w' and not ends and pos != s.e:
+            raise XPatchError(f"xpatch {s.name}: patched code at {s.a:#x} ends at {pos:#x}, region ends at {s.e:#x}")
+        if s.kind == 'cave' and not ends and pos != s.a + len(data):
+            raise XPatchError(f"xpatch {s.name}: cave did not decode to its end")
+        return L, ends
+
+    def _xp_emit(self, s, lbl, targets, resume):
+        if s.kind == 'c':
+            L = [s.data]; ends = s.data.rstrip().endswith('return;')
+        elif s.kind == 'cave':
+            L, ends = self._xp_lines(s, s.data, lbl, targets)
+        else:
+            L = None
+            for ph in PLACEHOLDERS_XP:
+                buf = bytearray(s.data)
+                for off, var in s.var: buf[off] = ph
+                L0, ends = self._xp_lines(s, bytes(buf), lbl, targets)
+                if not s.var: L = L0; break
+                tok = re.compile(r'\b0x%xu\b' % ph)
+                text = "\n".join(L0)
+                if len(s.var) == 1 and len(tok.findall(text)) == 1:
+                    var = s.var[0][1]
+                    L = [tok.sub(f"((uint32_t)g_xpval[{self.xp.vars.index(var)}] /* {var} */)", text)]
+                    break
+            if L is None:
+                raise XPatchError(f"xpatch {s.name}: no unique placeholder at {s.a:#x}")
+        self.xp_hits.add((s.name, s.a))
+        out = [f"if (g_xpatch[{s.idx}]) {{   /* xpatch {s.name} {s.a:#x}..{s.e:#x} */"]
+        out += ["    " + l for l in L]
+        if not ends:
+            out.append(f"    goto L_{s.e:08x};" if s.e in lbl else f"    goto XR_{s.e:08x};")
+            if s.e not in lbl: resume.add(s.e)
+        out.append("}")
+        return out
+
     # ---------- function -> C ----------
     def lift(self, entry):
         blocks, calls = self.discover(entry)
@@ -1604,12 +1667,26 @@ class Lifter:
         body=[]
         x87opt = _os.environ.get('X87OPT','') == '1'
         xb = X87Region()
+        # LOCAL PATCH: xpatch sites in this function; the resume labels needed
+        # are known after the sites are emitted, so they are collected first.
+        xsites = self.xp.sites_for(self, blocks) if self.xp else {}
+        xresume = set(); xr_done = set(); xs_done = set()
+        if xsites:
+            for s in xsites.values():
+                if s.e not in lbl: xresume.add(s.e)
         for ba in addrs:
             body.append(f"L_{ba:08x}:; /* --- block --- */")
             ins=blocks[ba]
             xb.reset()
             for k,i in enumerate(ins):
                 m=i.mnemonic
+                if i.address in xresume and i.address not in xr_done:
+                    if x87opt and xb.active: body += ["    "+l for l in xb.close()]
+                    body.append(f"XR_{i.address:08x}:;")
+                    xr_done.add(i.address)
+                if i.address in xsites:
+                    if x87opt and xb.active: body += ["    "+l for l in xb.close()]
+                    body += ["    "+l for l in self._xp_emit(xsites[i.address], lbl, targets, set())]
                 if x87opt and xb.active and (m=='jmp' or (m.startswith('j') and m[1:] in CC)
                         or m in ('jecxz','jcxz','loop','loope','loopz','loopne','loopnz')):
                     body += ["    "+l for l in xb.close()]
@@ -1618,6 +1695,11 @@ class Lifter:
                 if self.comments:
                     body.append(f"    /* {i.address:08x}  {i.mnemonic} {i.op_str} */")
                 if i.address in self.hooks:
+                    # LOCAL PATCH: a hook reads and may change ST(0) (wsfov.c):
+                    # write the open X87OPT region back first; the next x87
+                    # instruction reloads from c->st.
+                    if x87opt and xb.active:
+                        body += ["    "+l for l in xb.close()]
                     body.append(f"    guest_hook(c, 0x{i.address:x}u);")
                 if m=='jmp':
                     o0=i.operands[0]

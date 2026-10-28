@@ -52,7 +52,7 @@ int g_bt_on = 0;
 
 #define IMP_MAGIC 0xF0000000u
 
-/* --- guest heap: a bump allocator with headers (keeps the size for HeapSize/ReAlloc) --- */
+/* --- guest heap: see gheap.c (headers keep the size for HeapSize/ReAlloc) --- */
 #define HEAP_BASE 0x10000000u
 #define HEAP_MAX  0x2F000000u
 #define HDR 16u
@@ -178,26 +178,18 @@ uint64_t host_us(void){
 uint32_t host_ms(void){ return (uint32_t)(host_us() / 1000ull) + 1000u; }
 uint64_t host_qpc(void){ return host_us(); }
 
-static uint32_t heap_ptr = HEAP_BASE;
-static uint64_t g_alloc_fail = 0;
-static uint32_t galloc(uint32_t n, int zero){
-    uint32_t need = (n + HDR + 15u) & ~15u;
-    if (heap_ptr + need > HEAP_MAX || need < n){ g_alloc_fail++; return 0; }
-    uint32_t p = heap_ptr; heap_ptr += need;
-    mem_commit(p, need);
-    MR32(p) = n;                       /* user size */
-    MR32(p+4) = 0xA110C8EDu;           /* signature        */
-    uint32_t u = p + HDR;
-    if (zero) memset(g_mem + u, 0, n);
-    return u;
-}
-static uint32_t gsize(uint32_t u){
-    if (!u || u < HEAP_BASE + HDR || u >= HEAP_MAX) return 0;
-    if (MR32(u - HDR + 4) != 0xA110C8EDu) return 0;
-    return MR32(u - HDR);
-}
+/* the guest heap itself lives in gheap.c (free lists + quarantine) */
+uint32_t gheap_alloc(uint32_t n, int zero);
+int      gheap_free(uint32_t u, const char *who);
+uint32_t gheap_realloc(uint32_t o, uint32_t n, int zero, int in_place_only);
+uint32_t gheap_size(uint32_t u);
+uint32_t gheap_top_used(void);
+uint64_t gheap_failed(void);
+void     gheap_report(void);
+#define galloc gheap_alloc
+#define gsize  gheap_size
 uint32_t win32_block_size(uint32_t u){ return gsize(u); }
-uint32_t win32_heap_used(void){ return heap_ptr - HEAP_BASE; }
+uint32_t win32_heap_used(void){ return gheap_top_used(); }
 
 /* --- tracing --- */
 typedef struct { uint32_t calls; uint32_t unimpl; } ImpStat;
@@ -372,11 +364,9 @@ int win32_call(CPU *c, uint32_t idx){
             fprintf(stderr,"\n        esi=%08x edi=%08x ebx=%08x\n", c->esi,c->edi,c->ebx); }
     }
     else if (!strcmp(n,"HeapReAlloc")){
-        uint32_t o=ARG(c,2), ns=ARG(c,3), os=gsize(o);
-        uint32_t p=galloc(ns, ARG(c,1)&8u);
-        if(p&&o){ uint32_t cp = os && os<ns ? os : ns; memcpy(g_mem+p, g_mem+o, cp); }
-        r=p; }
-    else if (!strcmp(n,"HeapFree"))              r = 1;
+        /* (heap, flags, mem, bytes); flags 8 = ZERO_MEMORY, 0x10 = REALLOC_IN_PLACE_ONLY */
+        r = gheap_realloc(ARG(c,2), ARG(c,3), ARG(c,1)&8u, ARG(c,1)&0x10u); }
+    else if (!strcmp(n,"HeapFree")){ gheap_free(ARG(c,2), "HeapFree"); r = 1; }
     else if (!strcmp(n,"HeapSize")){
         uint32_t lp=ARG(c,2); r = gsize(lp);
         static int shown=0;
@@ -389,10 +379,12 @@ int win32_call(CPU *c, uint32_t idx){
     else if (!strcmp(n,"VirtualAlloc"))          r = galloc(ARG(c,1), 1);
     else if (!strcmp(n,"GlobalAlloc"))            r = galloc(ARG(c,1), ARG(c,0)&0x40u);
     else if (!strcmp(n,"LocalAlloc"))             r = galloc(ARG(c,1), ARG(c,0)&0x40u);
-    else if (!strcmp(n,"GlobalFree")||!strcmp(n,"LocalFree")) r = 0;
+    else if (!strcmp(n,"GlobalFree")||!strcmp(n,"LocalFree")){ gheap_free(ARG(c,0), n); r = 0; }
     else if (!strcmp(n,"GlobalLock")||!strcmp(n,"LocalLock")) r = ARG(c,0);
     else if (!strcmp(n,"GlobalUnlock"))           r = 1;
-    else if (!strcmp(n,"VirtualFree"))           r = 1;
+    else if (!strcmp(n,"VirtualFree")){          /* (addr, size, type): only MEM_RELEASE frees */
+        if (ARG(c,2) & 0x8000u) gheap_free(ARG(c,0), n);
+        r = 1; }
     else if (!strcmp(n,"GetCommandLineA"))       r = g_cmdline;
     else if (!strcmp(n,"GetEnvironmentStrings")||!strcmp(n,"GetEnvironmentStringsW")){
         uint32_t p=galloc(8,1); r=p; }
@@ -589,7 +581,8 @@ void win32_report(void){
     fprintf(stderr,"  total import calls    : %llu\n",(unsigned long long)g_win32_calls);
     fprintf(stderr,"  not implemented       : %llu\n",(unsigned long long)g_win32_unimpl);
     fprintf(stderr,"  heap usage            : %u KB   failed allocations: %llu\n",
-            win32_heap_used()/1024u, (unsigned long long)g_alloc_fail);
+            win32_heap_used()/1024u, (unsigned long long)gheap_failed());
+    gheap_report();
     /* the most called unimplemented ones */
     fprintf(stderr,"  guest threads : %llu started, %llu terminated\n",
             (unsigned long long)win32_ext_threads(),(unsigned long long)win32_ext_threads_exited());
