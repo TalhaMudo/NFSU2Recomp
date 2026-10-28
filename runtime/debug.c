@@ -93,6 +93,7 @@ static RecEnt g_rec[RECR];
 static uint32_t g_rec_n = 0, g_rec_esp0 = 0;
 void guest_hook(CPU *c, uint32_t ip){
     g_hook_hits++;
+    { int ws_hook(CPU *, uint32_t); if (ws_hook(c, ip)) return; }   /* LOCAL PATCH */
     if (ip == GA(0x0065ae35u)){
         uint32_t a1=MR32(c->esp+4u), a2=MR32(c->esp+8u), a3=MR32(c->esp+12u);
         if (!g_rec_esp0) g_rec_esp0 = c->esp;

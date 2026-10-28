@@ -25,7 +25,8 @@ OVR_NA=60faa0,61e380,61f120,5c7ec0,50d510,65ae25,6623da,66aa2f,66acd2,6691a1,669
 SHA="$(shasum -a 256 "$EXE" | cut -c1-64)"
 case "$SHA" in
   8f6a9ae2c4cfa01181d2fd755d99c6f4b7103f60273908ea1de1e719dfe2a297)
-    BUILD=eu; DEF=gen/all; WORK=out ;;
+    BUILD=eu; DEF=gen/all; WORK=out
+    export HOOKS="${HOOKS:-0x5c7ffe,0x4ec35c}" ;;   # LOCAL PATCH: runtime/wsfov.c
   f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7)
     BUILD=na; DEF=gen/na; WORK=out/na; OVR=$OVR_NA; export LIFT_MISSING=1 ;;
   *) echo "unsupported SPEED2.EXE (sha256 $SHA); see README, \"Game versions\""; exit 1 ;;
