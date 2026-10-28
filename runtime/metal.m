@@ -1165,7 +1165,8 @@ static id<MTLBuffer>              g_blitvb;   /* fullscreen quad for StretchRect
 static id<MTLSamplerState>        g_samp;
 
 /* --- texture table --- */
-#define MAXTEX 16384   /* long session + many Resets: every Reset recreates the RTs */
+#define MAXTEX 65536   /* ids are 16 bits (TGT_ID).  Ids are never reused and a race creates ~3000
+                        * textures: 16384 ran out after ~30 min and every later texture was white. */
 static uint8_t g_tex_cube[MAXTEX];          /* 1 = MTLTextureTypeCube */
 static unsigned g_tex_lvlmask[MAXTEX];
 static id<MTLTexture> g_tex[MAXTEX];
@@ -1209,6 +1210,20 @@ static MTLPixelFormat d3dfmt_to_mtl(unsigned f, unsigned *blk, unsigned *bpb){
     }
 }
 
+/* Ids are never reused (the COM objects have no refcount): when the table is full every
+ * later texture is "no texture" = white.  Say so once instead of failing silently. */
+static unsigned long g_tex_full_hits;
+static unsigned g_texmax = MAXTEX;       /* NFSU2_TEXMAX=<n>: test the table-full path with a small table */
+static unsigned tex_limit(void){
+    static int init;
+    if (!init){ init = 1; const char *e = getenv("NFSU2_TEXMAX");
+                if (e && atoi(e) > 1 && (unsigned)atoi(e) < MAXTEX) g_texmax = (unsigned)atoi(e); }
+    return g_texmax;
+}
+static void tex_table_full(void){
+    if (!g_tex_full_hits++)
+        fprintf(stderr, "metal: WARNING texture table full (%u ids): new textures will be white\n", g_texmax);
+}
 unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
                                  unsigned d3dfmt, unsigned is_rt);
 /* New texture content is UNDEFINED: ALL mip levels and (for cubes) ALL faces are
@@ -1239,7 +1254,8 @@ unsigned metal_create_texture(unsigned w, unsigned h, unsigned levels, unsigned 
 }
 unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
                                  unsigned d3dfmt, unsigned is_rt){
-    if (!g_dev || g_texn >= MAXTEX) return 0;
+    if (!g_dev) return 0;
+    if (g_texn >= tex_limit()){ tex_table_full(); return 0; }
     unsigned blk, bpb;
     MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
     if (pf == MTLPixelFormatInvalid) return 0;
@@ -3732,7 +3748,8 @@ static int pass_clear_only(int rb, unsigned i){
  * other into the same surface. */
 unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
                                    unsigned d3dfmt, unsigned is_rt){
-    if (!g_dev || g_texn >= MAXTEX) return 0;
+    if (!g_dev) return 0;
+    if (g_texn >= tex_limit()){ tex_table_full(); return 0; }
     unsigned blk, bpb;
     MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
     if (pf == MTLPixelFormatInvalid) return 0;
@@ -7643,6 +7660,10 @@ void metal_run_main_loop(void){
                 g_rt_freed, g_freed_use_smp, g_freed_use_tgt);
         fprintf(stderr, "metal: Z surface: %llu passes without Z, %llu passes size mismatch (scratch)\n",
                 (unsigned long long)g_z_null, (unsigned long long)g_z_mismatch);
+        { unsigned long long tb = 0; unsigned live = 0;
+          for (unsigned i = 1; i < g_texn && i < MAXTEX; i++) if (g_tex[i]){ live++; tb += g_tex[i].allocatedSize; }
+          fprintf(stderr, "metal: texture ids used %u of %u (%u still alive, %.0f MB), table full %lu times\n",
+                  g_texn, (unsigned)MAXTEX, live, tb / 1048576.0, g_tex_full_hits); }
         fprintf(stderr, "metal: window closed (%ld frames drawn)\n",
                 atomic_load(&g_frames_drawn));
     }
