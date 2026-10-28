@@ -837,6 +837,21 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
     EMIT("    device atomic_uint *atdbg [[buffer(6), function_constant(kATD)]]) {\n");
     EMIT("  float4 r[16]; for (int q=0;q<16;q++) r[q]=float4(0.0);\n");
     EMIT("  float4 t[4]; for (int q=0;q<4;q++) t[q]=float4(0.0);\n");
+    /* LOCAL PATCH: ps_2_0 texture coordinate inputs.  "dcl t0.xy" declares an
+     * interpolated input and "texld r1, t0, s0" reads it, but t[] was only filled by
+     * the ps_1_x forms (tex / texcoord), so in ps_2_0 every t# stayed 0 and the shader
+     * sampled one texel for the whole screen.  The race intro depth-of-field blend
+     * (ps 30: lerp(scene, blurred scene) by the depth in the scene's alpha) turned the
+     * intro into one flat colour that shifted with the camera.  ps_2_0 texld does no
+     * projective divide (texldp would), so t# = the interpolant as is. */
+    unsigned tdcl = 0;
+    static int tc_on = -1;
+    if (tc_on < 0){ const char *e = getenv("NFSU2_PS20_TC"); tc_on = !(e && !strcmp(e, "0")); }   /* 0 = old (A/B) */
+    if (tc_on && p->is_ps && ((p->version >> 8) & 0xFFu) >= 2u)
+        for (unsigned q2 = 0; q2 < p->n; q2++)
+            if (p->ins[q2].op == O_DCL && RT(p->ins[q2].dst) == R_ADDR && RN(p->ins[q2].dst) < 4)
+                tdcl |= 1u << RN(p->ins[q2].dst);
+    for (int k = 0; k < 4; k++) if (tdcl & (1u << k)) EMIT("  t[%d] = i.uv%d;\n", k, k);
     /* D3D9: in ps_1_1 - ps_2_0 the color inputs (v0/v1) are clamped to [0,1] before
      * the shader uses them ("diffuse and specular colors are saturated").  The
      * vertex shader can write values outside [0,1] to oD0/oD1 (measured
@@ -922,6 +937,7 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
         EMIT("  for (int hd_ev = 0; hd_ev < 3; hd_ev++) {\n");
         EMIT("  for (int q=0;q<16;q++) r[q]=float4(0.0);\n");
         EMIT("  for (int q=0;q<4;q++) t[q]=float4(0.0);\n");
+        for (int k = 0; k < 4; k++) if (tdcl & (1u << k)) EMIT("  t[%d] = i.uv%d;\n", k, k);
         EMIT("  oC = float4(0.0);\n");
     }
     int hd_seen = 0;

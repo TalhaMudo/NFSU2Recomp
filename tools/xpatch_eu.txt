@@ -1,0 +1,11 @@
+# xpatch sites for the European v1.2 SPEED2.EXE (sha256 8f6a9ae2...).
+# Format: see the header of tools/xpatch.py.  Features add their own sites here.
+
+# High-FPS fixes (runtime/highfps.c; behaviour of ThirteenAG's NFSU2 Widescreen Fix,
+# re-implemented: the sites were found by disassembling the European EXE).
+# hf_tick: PrepareRealTimestep forces at least one 1/60 s tick per frame (jne over mov eax, 1),
+# so at 120 fps tick-driven game time ran twice as fast; the remainder carries over instead
+w    hf_tick        57a094 eb
+# hf_intro60: an NIS scene starts with the frame target 1/30 (0x435fa3 push 30.0; call 0x576cc0);
+# 60.0 instead (the widescreen fix's HighFPSCutscenes; above 60 the race intro camera goes wrong)
+w    hf_intro60     435fa4 00007042
