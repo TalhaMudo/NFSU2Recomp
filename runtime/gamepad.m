@@ -63,7 +63,7 @@ void gamepad_install(void){
     if ((e = getenv("NFSU2_PAD_DEADZONE"))) g_dead = (float)atof(e);
     if ((e = getenv("NFSU2_PAD_FAKE"))){ g_fake = 1; parse_fake(e); snprintf(g_name, sizeof g_name, "Fake Pad"); }
     @autoreleasepool {
-        if ([GCController respondsToSelector:@selector(setShouldMonitorBackgroundEvents:)])
+        if (@available(macOS 11.3, *))
             GCController.shouldMonitorBackgroundEvents = YES;
         [[NSNotificationCenter defaultCenter]
             addObserverForName:GCControllerDidConnectNotification object:nil queue:nil
