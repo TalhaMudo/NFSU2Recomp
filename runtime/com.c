@@ -1131,7 +1131,7 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog, const
                         cw, vsk->f[cw][0],vsk->f[cw][1],vsk->f[cw][2],vsk->f[cw][3]); } }
         return vsk; } }
     g_asp_persp++; g_asp_np[vs]++;
-    { int ws_game_fov(void); if (ws_game_fov()) return vsk; }   /* LOCAL PATCH: wsfov.c */
+    { int ws_game_fov(void); if (ws_game_fov()) return vsk; }   /* wsfov.c */
     static VSConst tmp;
     vsk_copy_used(&tmp, vsk, prog);
     for (int k = 0; k < 4; k++) tmp.f[cx][k] *= g_aspfix;
@@ -4292,7 +4292,7 @@ void draw_stats_save(uint64_t *a, uint64_t *b){ g_ptype=a; g_stride=b; }
 
 void com_report(void){
     fprintf(stderr,"\n=== COM / D3D9 KATMANI ===\n");
-    { void ws_report(void); ws_report(); }   /* LOCAL PATCH */
+    { void ws_report(void); ws_report(); }   /* wsfov.c */
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
                   g_aspfix, g_asp_persp, g_asp_ortho);
