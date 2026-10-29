@@ -190,7 +190,7 @@ void enh_view_setup(uint32_t id, const float *m, uint32_t cam){
     if (id != 1u) return;
     void metal_hd_set_camera(const float *m48, float k, const float *cube9);
     float com_aspfix(void);
-    int ws_game_fov(void);   /* LOCAL PATCH: wsfov.c */
+    int ws_game_fov(void);   /* wsfov.c */
     metal_hd_set_camera(m, ws_game_fov() ? 1.f : com_aspfix(), cube_b);
 }
 

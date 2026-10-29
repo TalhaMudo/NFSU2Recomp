@@ -1618,7 +1618,7 @@ class Lifter:
                 if self.comments:
                     body.append(f"    /* {i.address:08x}  {i.mnemonic} {i.op_str} */")
                 if i.address in self.hooks:
-                    # LOCAL PATCH: a hook reads and may change ST(0) (wsfov.c):
+                    # A hook reads and may change ST(0) (wsfov.c):
                     # write the open X87OPT region back first; the next x87
                     # instruction reloads from c->st.
                     if x87opt and xb.active:
