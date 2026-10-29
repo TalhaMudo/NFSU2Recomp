@@ -1053,8 +1053,8 @@ out:
  *   tex->AddRef, old->Release, [y+4] = tex; if o40 exists, the pool ring
  *   ([o40+0x10] .. o40, node: +0 effect, +8 index table) does the same for every
  *   effect's slot: AddRef(new), Release(old), write.  Returns 0.
- * In com.c texture AddRef/Release have no side effects (they return 1/0):
- *   if the target is a com.c texture the call is skipped.
+ * A com.c texture's AddRef/Release only change its reference count, so the call
+ *   is skipped and the count is updated directly (com_tex_ref_skipped).
  * sub_0066d7e9 SetTexture(this, h, tex) ret 12: if h < 0, record = ~h
  *   (string handle -> original); if an array parameter without an element, or the
  *   type isn't 5..9, 0x8876086c; [this+0x3c]==3 -> original (the 666a78 path);
@@ -1068,10 +1068,11 @@ static inline int n8_init(void){
     if (g_n8_on < 0){ const char *e = getenv("D3DXNATIVE8"); g_n8_on = e ? atoi(e) != 0 : 1; }
     return g_n8_on;
 }
+void com_tex_ref_skipped(uint32_t obj, int addref);   /* com.c: keep the reference count */
 static inline void n8_ref(CPU *c, uint32_t obj, uint32_t off, uint32_t ret){
     uint32_t fn = MR32(MR32(obj) + off);
     if ((fn & 0xF0000000u) == 0xE0000000u && ((fn >> 16) & 0x1fffu) == 3u && !(g_fxtr && fxtr_now())){
-        n8_refskip++; return; }
+        n8_refskip++; com_tex_ref_skipped(obj, off == 4u); return; }
     PUSH32(obj); PUSH32(ret); dispatch_indirect(c, fn);
 }
 static void n8_store(CPU *c, uint32_t th, uint32_t tex, uint32_t ix, uint32_t o40){
