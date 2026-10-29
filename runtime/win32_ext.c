@@ -50,6 +50,8 @@ static _Thread_local void *tl_obj = 0;   /* this thread's object */
 static int wait_legacy(void){ static int v=-1; if (v<0){ const char *e=getenv("NFSU2_WAIT_LEGACY"); v = (e && *e && *e!='0'); } return v; }
 static uint64_t wait_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000u + (uint64_t)t.tv_nsec/1000000u; }
 static int wait_thread_killed(void);
+/* THREADLOG=1: log thread creation, termination and stack recycling */
+static int thread_log(void){ static int v=-1; if (v<0){ const char *e=getenv("THREADLOG"); v = (e && *e && *e!='0'); } return v; }
 
 /* CPU state of all guest threads: to be able to dump the stack traces of ALL
  * of them at stall time (a single thread's can be misleading). */
@@ -341,7 +343,7 @@ static void guest_thread_die(void){            /* called WITH the guest lock hel
     Obj *o = (Obj*)tl_obj;
     if (o){ pthread_mutex_lock(&o->mtx); o->signaled=1;
             pthread_cond_broadcast(&o->cv); pthread_mutex_unlock(&o->mtx); }
-    { static int sh = 0; if (sh++ < 200)
+    { static int sh = 0; if (thread_log() && sh++ < 200)
         fprintf(stderr, "  [thread] tid=%u ends, stack slot %08x recycled\n", o ? o->tid : 0u, tl_stack_lo); }
     tstack_put(tl_stack_lo); tl_stack_lo = 0;
     __sync_fetch_and_add(&g_threads_exited, 1);
@@ -861,7 +863,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     /* --- thread --- */
     else if (!strcmp(n,"CreateThread")){
         uint32_t entry=A(c,2), arg=A(c,3), ptid=A(c,5);
-        { static int sc=0; if (sc++ < 200) fprintf(stderr, "  [thread] CreateThread entry=0x%08x arg=0x%08x flags=0x%x\n", entry, arg, A(c,4)); }
+        { static int sc=0; if (thread_log() && sc++ < 200) fprintf(stderr, "  [thread] CreateThread entry=0x%08x arg=0x%08x flags=0x%x\n", entry, arg, A(c,4)); }
         { static int sh=0; if (getenv("VERBOSE") && sh<40){ sh++;
             fprintf(stderr,"      [thread] CreateThread(attr=0x%08x stack=0x%x entry=0x%08x arg=0x%08x flags=0x%x ptid=0x%08x)\n",
                     A(c,0),A(c,1),entry,arg,A(c,4),ptid); } }
@@ -904,7 +906,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         r=1; }
     else if (!strcmp(n,"TerminateThread")){
         Obj *to = obj_get(A(c,0));
-        { static int sh = 0; if (sh++ < 200)
+        { static int sh = 0; if (thread_log() && sh++ < 200)
             fprintf(stderr, "  [thread] TerminateThread tid=%u%s\n", to ? to->tid : 0u, to == tl_obj ? " (self)" : ""); }
         if (to && to->kind == OB_THREAD){
             if (to == (Obj*)tl_obj) guest_thread_die();
