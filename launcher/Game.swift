@@ -86,6 +86,8 @@ enum PictureOptions {
                       choices: [("As on PC (original)", ""), ("Less tint", "less"), ("No tint", "none"), ("Cool", "cool")]),
         PictureOption(key: "LauncherGamma", title: "Gamma", env: "CONSOLEGAMMA",
                       choices: [("As on PC (original)", ""), ("Console", "1")]),
+        PictureOption(key: "LauncherEdgeSmoothing", title: "Edge smoothing", env: "EDGEAA",
+                      choices: [("Off, as on PC (original)", ""), ("On", "1")]),
     ]
 }
 

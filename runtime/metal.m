@@ -4536,6 +4536,33 @@ static long scr_redirect_plan(int rb, id<MTLTexture> scr, unsigned *outT){
 #endif
 }
 
+/* ---- PICTURE OPTIONS (picture.m) -------------------------------------------
+ * EDGEAA works on the 3D scene before the HUD: the frame's last draw
+ * to the screen that covers it completely and reads a render target of the
+ * screen's size is the copy of the finished scene (in a race: ps 22 after the
+ * post-process chain); the HUD comes after it.  That draw reads picture.m's
+ * output instead of the target; EDGEAA also reads the scene's depth (the
+ * implicit Z surface, still the scene's then).  A frame without such a draw
+ * (2D menus) is left alone.  CONSOLEGAMMA runs over the finished frame (end of encoding).
+ * ABTEST=PICTURE turns both off in the measurement's off slices. */
+int pic_pre_on(void);
+id<MTLTexture> pic_pre(id<MTLDevice>, id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTexture>);
+static long pic_plan(int rb, id<MTLTexture> scr){
+    if (rb < 0 || !scr || !pic_pre_on() || abt_off("PICTURE")) return -1;
+    const MDraw *D = g_dbuf[rb];
+    for (long k = (long)g_dn[rb] - 1; k >= 0; k--){
+        const MDraw *x = &D[k];
+        if (x->target || x->is_clear || x->is_blit || x->is_up || !x->count) continue;
+        unsigned t = x->tex;
+        if (!t || t >= MAXTEX || !g_tex[t]) continue;
+        id<MTLTexture> T = g_tex[t];
+        if (T.textureType != MTLTextureType2D || !(T.usage & MTLTextureUsageRenderTarget) ||
+            T.width != scr.width || T.height != scr.height) continue;
+        if (draw_covers(x, scr.width, scr.height)) return k;
+    }
+    return -1;
+}
+
 /* ---- HUD ANCHORING (HUDPOS=1) ---------------------------------------------
  * The game lays its HUD out for 640x480; on a wider screen HUDFIX squeezes it
  * into the centered 4:3 area (round gauges stay round).  With HUDPOS the
@@ -6496,6 +6523,8 @@ void metal_run_main_loop(void){
                         /* see POST-PROCESS CHAIN: fbrole[i] 1 = chain start, 2 = continuation */
                         static uint8_t fbrole[MAXD];
                         int nfb = rb >= 0 ? fb_plan(rb, fbrole, g_dn[rb]) : 0;
+                        long pic_at = pic_plan(rb, dtex);   /* see PICTURE OPTIONS */
+                        id<MTLTexture> pic_tex = nil;
                         int fbv_pend = 0; unsigned fbv_s = 0, fbv_e = 0;   /* FBZINCIR=2: verification pending */
 #if NFS_ENHANCED
                         int hd_scene_open = 1;          /* main scene up to the first copy from the screen */
@@ -6851,6 +6880,17 @@ void metal_run_main_loop(void){
                                         [bc endEncoding];
                                     }
                                     continue;
+                                }
+                                if ((long)i == pic_at){
+                                    /* PICTURE OPTIONS: the scene is complete, the copy to the screen follows */
+#if NFS_ENHANCED
+                                    if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
+                                              [enc endEncoding]; enc = nil;
+                                              if (pe) hd_ms_fallback(cb, dtex, pe); }
+#endif
+                                    if (enc){ [enc endEncoding]; enc = nil; }
+                                    cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
+                                    pic_tex = pic_pre(g_dev, cb, g_tex[dr->tex], g_ztex[1]);   /* the scene's Z: the implicit surface */
                                 }
                                 if (nfb && fbrole[i] == 1){
                                     unsigned e = i; while (e + 1 < g_dn[rb] && fbrole[e + 1] == 2) e++;
@@ -7252,6 +7292,7 @@ void metal_run_main_loop(void){
                                                          | MTLTextureUsageShaderRead   /* SSR reads depth */
 #endif
                                                          ;
+                                                if (pic_pre_on()) zd.usage |= MTLTextureUsageShaderRead;   /* EDGEAA: picture.m reads it */
                                                 zd.storageMode = MTLStorageModePrivate;
                                                 g_ztex[zid] = zt = [g_dev newTextureWithDescriptor:zd];
                                                 zclear = 1;
@@ -7532,6 +7573,7 @@ void metal_run_main_loop(void){
                                       freed_use(tt, 0);
                                       id<MTLTexture> txn = (tt && tt < MAXTEX && g_tex[tt])
                                                            ? g_tex[tt] : g_white;
+                                      if (q4 == 0 && pic_tex && (long)i == pic_at){ txn = pic_tex; c_tex[0] = ~0u; }
                                       [enc setFragmentTexture:txn atIndex:(NSUInteger)q4];
                                   } }
                                 atomic_fetch_add(&g_draw_n, 1ull);
@@ -7587,7 +7629,7 @@ void metal_run_main_loop(void){
                             [e2 endEncoding];
                         }
                         /* picture.m: CONSOLEGAMMA over the finished frame (HUD included);
-                         * ABTEST=PICTURE measures its cost */
+                         * ABTEST=PICTURE measures the picture passes' cost */
                         { void pic_gamma(id<MTLDevice>, id<MTLCommandBuffer>, id<MTLTexture>);
                           if (!abt_off("PICTURE")) pic_gamma(g_dev, cb, dtex); }
                         /* PERFLOG counters must be taken BEFORE the buffer is GIVEN BACK to the game:

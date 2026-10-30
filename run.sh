@@ -26,7 +26,8 @@ fi
 # Picture options (the launcher's Picture card; unset = the original game):
 #   TINT=less|none|cool    the screen filter's yellow-green tint: half / none / none + cooler
 #   CONSOLEGAMMA=1         the Xbox 360 version's brightness curve
-#   Details: runtime/visual.c (TINT), runtime/picture.m (CONSOLEGAMMA)
+#   EDGEAA=1               edge smoothing (post-process) of the 3D scene, not the HUD
+#   Details: runtime/visual.c (TINT), runtime/picture.m (the others)
 # In game, Cmd+Shift+D: a PNG of that frame + the draw list (~/Library/Logs/NFSU2/
 #   or the PERFLOG directory).  Measurement recording while playing: tools/session.sh [hd].
 MODE="${1:-window}"
