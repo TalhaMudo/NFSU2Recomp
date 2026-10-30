@@ -21,6 +21,8 @@ final class LauncherModel: ObservableObject {
     @Published var showAtStartup: Bool { didSet { defaults.set(showAtStartup, forKey: Prefs.showAtStartup) } }
     @Published var wideHUD: Bool { didSet { defaults.set(wideHUD, forKey: Prefs.wideHUD) } }
     private var setHUDPOS = false        // HUDPOS was set by us (not by the caller)
+    @Published var xtendedInput: Bool { didSet { defaults.set(xtendedInput, forKey: Prefs.xtendedInput) } }
+    private let xtendedInputFromEnv = ProcessInfo.processInfo.environment["NFSU2_XTINPUT"] != nil
     @Published var job: Job? = nil
     @Published var notice: String? = nil
 
@@ -51,7 +53,11 @@ final class LauncherModel: ObservableObject {
         fullscreen = defaults.bool(forKey: Prefs.fullscreen)
         showAtStartup = defaults.bool(forKey: Prefs.showAtStartup)
         wideHUD = defaults.bool(forKey: Prefs.wideHUD)
+        xtendedInput = defaults.bool(forKey: Prefs.xtendedInput)
     }
+
+    /// runtime/xtinput.c has the North American v1.2 executable's addresses only.
+    var canUseXtendedInput: Bool { location?.build?.engineSuffix == "-na" }
 
     var location: GameLocation? {
         switch game {
@@ -118,6 +124,7 @@ final class LauncherModel: ObservableObject {
             if wideHUD { setenv("HUDPOS", "1", 1); setHUDPOS = true }
             else if setHUDPOS { unsetenv("HUDPOS"); setHUDPOS = false }
         }
+        if !xtendedInputFromEnv { setenv("NFSU2_XTINPUT", xtendedInput && canUseXtendedInput ? "1" : "0", 1) }
         var e = engine
         if !hasEngine(e) { e = (e == .hd) ? .original : .hd }
         let path = Paths.engine(loc.build, hd: e == .hd).path

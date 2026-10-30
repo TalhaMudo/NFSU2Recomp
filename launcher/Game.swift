@@ -68,6 +68,7 @@ enum Prefs {
     static let engine = "LauncherEngine"           // "original" | "hd"
     static let showAtStartup = "LauncherShowAtStartup"
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
+    static let xtendedInput = "LauncherXtendedInput"  // passed to the engine as NFSU2_XTINPUT
 }
 
 enum Locator {
