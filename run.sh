@@ -23,6 +23,11 @@ fi
 #   HD_GSEP=1 (G-buffer in a separate single-sampled pass), HD_MBFIX=1 (the scene stays
 #   multisampled during motion blur), HD_RT_FAR / HD_RT_BMIN (ray limits; off by default).
 #   Details: runtime/enhance.c, runtime/metal.m (sections of the same name)
+# Reflections (both builds, off by default; the launcher sets them, runtime/reflect.c):
+#   NFSU2_REFLECTIONS=sharp|sharpest (original build: larger reflection targets),
+#   NFSU2_REFLECT_SKY=1 (sky in the road reflection and the mirror),
+#   NFSU2_REFLECT_LIGHTS=1 (car lights in the road reflection),
+#   NFSU2_REFLECT_DETAIL=1 (full detail models in reflections, car cube map far plane 10 km)
 # In game, Cmd+Shift+D: a PNG of that frame + the draw list (~/Library/Logs/NFSU2/
 #   or the PERFLOG directory).  Measurement recording while playing: tools/session.sh [hd].
 MODE="${1:-window}"

@@ -4653,6 +4653,7 @@ void draw_stats_save(uint64_t *a, uint64_t *b){ g_ptype=a; g_stride=b; }
 void com_report(void){
     fprintf(stderr,"\n=== COM / D3D9 KATMANI ===\n");
     { void ws_report(void); ws_report(); }   /* wsfov.c */
+    { void refl_report(void); refl_report(); }   /* reflect.c */
     { void gamepad_report(void); gamepad_report(); }   /* gamepad.m */
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
