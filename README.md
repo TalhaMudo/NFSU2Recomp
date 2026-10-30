@@ -288,8 +288,9 @@ logs folder and manages saves (**Saves…**: the career profiles, backups, ZIP
 export and import; the current saves are backed up before an import replaces
 them; tests/save_manager.sh). **Settings…** (Cmd-,) holds the options on tabs:
 Original or HD graphics and the HUD on **Graphics**; on **Controls**, the game
-controller on or off and its stick dead zone (`NFSU2_PAD` / `NFSU2_PAD_DEADZONE`,
-which still win when set by hand); on **More**, **Make Copy…** builds a portable
+controller on or off, its stick dead zone and the XtendedInput layout
+(`NFSU2_PAD` / `NFSU2_PAD_DEADZONE` / `NFSU2_XTINPUT`, which still win when set by
+hand); on **More**, **Make Copy…** builds a portable
 app with the game files inside (APFS clones, seconds on the same disk), so nobody
 needs `pack.sh --embed` or a terminal for that.
 **Restore Original Game** sets every option back to the original, unmodified
@@ -358,6 +359,16 @@ No. Only Apple Silicon is targeted and tested.
 **What does not work yet?**
 There is no wheel support and no online play.
 See [Known limitations](#known-limitations).
+
+**Can the controller work like it does with the XtendedInput mod on Windows?**
+Yes, with the North American v1.2 executable: in **Settings… › Controls**, with the
+controller on, switch on **XtendedInput layout**. The triggers are then separate analog throttle (RT) and
+brake (LT), and every button, in races and in the menus, does what it does with
+[NFSU-XtendedInput](https://github.com/xan1242/NFSU-XtendedInput)
+(`runtime/xtinput.c` is a port of its NFSU2 code, MIT licence). The game
+folder's `scripts/NFSU_XtendedInput.ini` is used if there is one, as in a Windows
+install with the mod; otherwise the mod's stock settings. Without the switch the
+pad is a DirectInput gamepad, bound in the game's own controller options.
 
 **How is this different from other NFSU2 projects?**
 

@@ -4341,7 +4341,8 @@ int com_call(CPU *c, uint32_t magic){
              * REALLY call the callback: report a keyboard and a mouse. */
             uint32_t devtype=A(c,1), cb=A(c,2), ref=A(c,3);
             if (cb && devtype == 4u){                 /* DI8DEVCLASS_GAMECTRL: the host pad */
-                if (gamepad_present()){
+                int xtinput_active(void);         /* runtime/xtinput.c reads the pad itself */
+                if (!xtinput_active() && gamepad_present()){
                     uint32_t args[2] = { make_devinst(3), ref };
                     call_guest(c, cb, 2, args);
                     fprintf(stderr,"  [DI] game pad offered to the game: %s\n", gamepad_name());
@@ -4743,6 +4744,7 @@ void com_report(void){
     { void gamepad_report(void); gamepad_report(); }   /* gamepad.m */
     { void xpatch_report(void); xpatch_report(); }
     { void highfps_report(void); highfps_report(); }   /* LOCAL PATCH: highfps.c */
+    { void xtinput_report(void); xtinput_report(); }   /* xtinput.c */
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
                   g_aspfix, g_asp_persp, g_asp_ortho);

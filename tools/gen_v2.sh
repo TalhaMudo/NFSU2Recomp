@@ -19,8 +19,9 @@ PY="$ROOT/.venv/bin/python"
 # (see PROJECT.md "Commands", D3DX_HLE.md "Regeneration").  OVR is in European
 # addresses; OVR_NA is the same list mapped to the North American build
 # (tools/addrmap.py list out/na/addrmap.json "$OVR").
+# 572120 (FindScannerConfig, runtime/xtinput.c) is North American only.
 OVR=60fab0,61e390,61f130,5c7ed0,50d510,65ae35,6623ea,66aa3f,66ace2,6691b1,669296,664a2f,663a42,688e89,663275,662edc,660a52,668e0d,664792,66ac27,65addb,65acf5,66d13a,66d303,66d7e9,66e8a9,66f501,66ca38,65ab24,67193e,66056c,65cf44,640c12,668cd0,65ccd8
-OVR_NA=60faa0,61e380,61f120,5c7ec0,50d510,65ae25,6623da,66aa2f,66acd2,6691a1,669286,664a1f,663a32,688e79,663265,662ecc,660a42,668dfd,664782,66ac17,65adcb,65ace5,66d12a,66d2f3,66d7d9,66e899,66f4f1,66ca28,65ab14,67192e,66055c,65cf34,640c02,668cc0,65ccc8
+OVR_NA=60faa0,61e380,61f120,5c7ec0,50d510,65ae25,6623da,66aa2f,66acd2,6691a1,669286,664a1f,663a32,688e79,663265,662ecc,660a42,668dfd,664782,66ac17,65adcb,65ace5,66d12a,66d2f3,66d7d9,66e899,66f4f1,66ca28,65ab14,67192e,66055c,65cf34,640c02,668cc0,65ccc8,572120
 
 SHA="$(shasum -a 256 "$EXE" | cut -c1-64)"
 case "$SHA" in
