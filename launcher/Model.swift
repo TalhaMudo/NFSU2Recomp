@@ -23,6 +23,15 @@ final class LauncherModel: ObservableObject {
     private var setHUDPOS = false        // HUDPOS was set by us (not by the caller)
     @Published var job: Job? = nil
     @Published var notice: String? = nil
+    // Data mods (DataMods.swift): which are turned on, what each one's row says while
+    // it is being fetched or failed, and the overlay build in progress.
+    @Published var modsOn: Set<String> { didSet { defaults.set(Array(modsOn).sorted(), forKey: Prefs.dataMods) } }
+    @Published var modNote: [String: String] = [:]
+    @Published var modBusy: Set<String> = []
+    @Published var modsApplying: String? = nil
+    @Published private(set) var modsHave: Set<String> = []
+    let modStore: URL
+    private var modsPending = false, playAfterMods = false
 
     private let defaults = UserDefaults.standard
     private var builder: PortableBuilder?
@@ -51,6 +60,10 @@ final class LauncherModel: ObservableObject {
         fullscreen = defaults.bool(forKey: Prefs.fullscreen)
         showAtStartup = defaults.bool(forKey: Prefs.showAtStartup)
         wideHUD = defaults.bool(forKey: Prefs.wideHUD)
+        modsOn = Set(defaults.stringArray(forKey: Prefs.dataMods) ?? [])
+        let st = ProcessInfo.processInfo.environment["NFSU2_MODS_STORE"] ?? ""
+        modStore = st.isEmpty ? DataMods.defaultStore : URL(fileURLWithPath: st)
+        refreshMods()
     }
 
     var location: GameLocation? {
@@ -107,6 +120,14 @@ final class LauncherModel: ObservableObject {
     func play() {
         guard case .ready(let loc) = game else { return }
         let env = ProcessInfo.processInfo.environment
+        // Data mods: their files must be built for this game folder first.
+        let mods = activeMods
+        if modsApplying != nil || (!mods.isEmpty && !DataMods.isBuilt(mods, game: loc.folder, store: modStore)) {
+            playAfterMods = true
+            if modsApplying == nil { applyMods() }
+            return
+        }
+        if !mods.isEmpty { setenv("NFSU2_MODS", DataMods.overlay(modStore).path, 0) }
         let fromEnv = !(env["NFSU2_DATA"] ?? "").isEmpty      // a one-off override: don't remember it
         if !loc.embedded && !fromEnv { defaults.set(loc.folder.path, forKey: Prefs.gameFolder) }
         if !engineForced { defaults.set(engine.rawValue, forKey: Prefs.engine) }
@@ -146,6 +167,116 @@ final class LauncherModel: ObservableObject {
         // Step aside: no window, no Dock icon of our own; the engine has its own.
         for w in NSApp.windows { w.orderOut(nil) }
         NSApp.setActivationPolicy(.accessory)
+    }
+
+    // MARK: data mods
+
+    var activeMods: [DataMods.Mod] { DataMods.catalog.filter { modsOn.contains($0.id) && modsHave.contains($0.id) } }
+
+    func refreshMods() {
+        modsHave = Set(DataMods.catalog.filter { DataMods.source($0, modStore) != nil }.map { $0.id })
+    }
+
+    func setMod(_ m: DataMods.Mod, _ on: Bool) {
+        if on { modsOn.insert(m.id) } else { modsOn.remove(m.id) }
+        applyMods()
+    }
+
+    /// Download: from the mod's page, checked against the tested release; then turned on.
+    func downloadMod(_ m: DataMods.Mod) {
+        modBusy.insert(m.id)
+        modNote[m.id] = "Downloading…"
+        let store = modStore
+        DispatchQueue.global(qos: .userInitiated).async {
+            var err: String? = nil
+            do {
+                try DataMods.download(m, store: store) { n in
+                    DispatchQueue.main.async {
+                        self.modNote[m.id] = "Downloading… \(formatBytes(n)) of \(formatBytes(m.size))"
+                    }
+                }
+            } catch let e as DataMods.Failure { err = e.message } catch { err = error.localizedDescription }
+            DispatchQueue.main.async { self.modAdded(m, err) }
+        }
+    }
+
+    /// Add File...: a copy of the mod the player already has (the archive or its folder).
+    func importMod(_ m: DataMods.Mod) {
+        let p = NSOpenPanel()
+        p.canChooseFiles = true
+        p.canChooseDirectories = true
+        p.allowsMultipleSelection = false
+        p.prompt = "Add"
+        p.message = "Choose the \(m.name) archive from nfsmods.xyz (or the folder it was extracted to)."
+        guard p.runModal() == .OK, let u = p.url else { return }
+        addModFile(m, u)
+    }
+
+    func addModFile(_ m: DataMods.Mod, _ u: URL) {
+        modBusy.insert(m.id)
+        modNote[m.id] = "Adding…"
+        let store = modStore, game = location?.folder ?? URL(fileURLWithPath: "/")
+        DispatchQueue.global(qos: .userInitiated).async {
+            var err: String? = nil
+            do { try DataMods.importCopy(u, as: m, game: game, store: store) }
+            catch let e as DataMods.Failure { err = e.message } catch { err = error.localizedDescription }
+            DispatchQueue.main.async { self.modAdded(m, err) }
+        }
+    }
+
+    private func modAdded(_ m: DataMods.Mod, _ err: String?) {
+        modBusy.remove(m.id)
+        refreshMods()
+        if let e = err { modNote[m.id] = e } else { modNote[m.id] = nil; modsOn.insert(m.id); applyMods() }
+        if ProcessInfo.processInfo.environment["NFSU2_LAUNCHER_TEST"] != nil {
+            print(err.map { "mod \(m.id) FAILED: \($0)" } ?? "mod \(m.id) added")
+            if err != nil { exit(1) }
+        }
+    }
+
+    func removeMod(_ m: DataMods.Mod) {
+        DataMods.remove(m, store: modStore)
+        modNote[m.id] = nil
+        modsOn.remove(m.id)
+        refreshMods()
+        applyMods()
+    }
+
+    func openModPage(_ m: DataMods.Mod) { NSWorkspace.shared.open(m.page) }
+
+    /// (Re)builds the mod files for the turned-on mods, off the main thread.
+    func applyMods() {
+        guard let folder = location?.folder else { return }
+        if modsApplying != nil { modsPending = true; return }
+        let mods = activeMods, store = modStore
+        if !mods.isEmpty && DataMods.isBuilt(mods, game: folder, store: store) { modsDone(nil); return }
+        modsApplying = mods.isEmpty ? "Removing the mod files…" : "Applying mods…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            var err: String? = nil
+            do {
+                try DataMods.build(mods, game: folder, store: store) { s in
+                    DispatchQueue.main.async { self.modsApplying = s }
+                }
+            } catch let e as DataMods.Failure { err = e.message } catch { err = error.localizedDescription }
+            DispatchQueue.main.async { self.modsDone(err) }
+        }
+    }
+
+    private func modsDone(_ err: String?) {
+        modsApplying = nil
+        if let e = err {
+            // the mod that failed is turned off again, with the reason in its row
+            if let m = activeMods.first(where: { e.hasPrefix($0.name + ":") }) {
+                modsOn.remove(m.id); modNote[m.id] = e
+            } else { notice = "The mods could not be applied: \(e)" }
+            playAfterMods = false
+        }
+        if modsPending { modsPending = false; applyMods(); return }
+        if ProcessInfo.processInfo.environment["NFSU2_LAUNCHER_TEST"]?.hasPrefix("mods") == true {
+            print(err.map { "mods FAILED: \($0)" } ?? "mods applied: \(activeMods.map { $0.id }.joined(separator: ","))")
+            exit(err == nil ? 0 : 1)
+        }
+        if playAfterMods && err == nil { playAfterMods = false; play() }
     }
 
     // MARK: tools
