@@ -4537,7 +4537,7 @@ static long scr_redirect_plan(int rb, id<MTLTexture> scr, unsigned *outT){
 }
 
 /* ---- PICTURE OPTIONS (picture.m) -------------------------------------------
- * EDGEAA works on the 3D scene before the HUD: the frame's last draw
+ * EDGEAA / SHARPEN work on the 3D scene before the HUD: the frame's last draw
  * to the screen that covers it completely and reads a render target of the
  * screen's size is the copy of the finished scene (in a race: ps 22 after the
  * post-process chain); the HUD comes after it.  That draw reads picture.m's

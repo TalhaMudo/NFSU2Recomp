@@ -24,10 +24,18 @@
  *   thresholds.  It cannot recover sub-pixel detail like the HD engine's
  *   MSAA.
  *
- *   metal.m finds the draw that copies the finished scene to the screen
- *   (PICTURE OPTIONS) and lets it read the pass's output instead; the game's
- *   own texture is not changed, so effects that read it in the next frame
- *   see the game's image.
+ * SHARPEN=<percent>  contrast adaptive sharpening of the 3D scene, also
+ *   before the HUD: each pixel is pushed away from its four neighbours by a
+ *   weight that shrinks where the neighbourhood already has strong contrast,
+ *   so flat areas sharpen and edges do not ring.  The idea and the weight
+ *   formula follow AMD FidelityFX CAS (MIT); the shader is our own.  100 =
+ *   CAS's strongest setting (-1/5), 50 = half of it.  Pixels that EDGEAA
+ *   smoothed are not sharpened again.
+ *
+ * Both run in the same pass: metal.m finds the draw that copies the finished
+ * scene to the screen (PICTURE OPTIONS) and lets it read the pass's output
+ * instead; the game's own texture is not changed, so effects that read it in
+ * the next frame see the game's image.
  *
  * Called from metal.m (PICTURE OPTIONS), on the encoding thread.            */
 #import <Metal/Metal.h>
@@ -52,7 +60,7 @@ static NSString *kPicSrc = @
     "fragment half4 pic_gamma(V in [[stage_in]], half4 d [[color(0)]]) {\n"
     "  float3 c = float3(d.rgb);\n"
     "  return half4(half3(float3(x360(c.r), x360(c.g), x360(c.b))), d.a); }\n"
-    "struct PP { float2 px; float aa; float hasz; };\n"
+    "struct PP { float2 px; float aa; float sharp; float hasz; float pad[3]; };\n"
     "static float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
     "static float q1(depth2d<float> z, int2 p) {\n"
     "  int2 m = int2(z.get_width(), z.get_height()) - 1;\n"
@@ -86,6 +94,14 @@ static NSString *kPicSrc = @
     "      float lb = luma(b);\n"
     "      return float4((lb < lo || lb > hi) ? a : b, c0.a);\n"
     "    }\n"
+    "  }\n"
+    "  if (P.sharp > 0.0) {\n"
+    "    float3 n = t.sample(s, uv, int2(0, -1)).rgb, so = t.sample(s, uv, int2(0, 1)).rgb;\n"
+    "    float3 e = t.sample(s, uv, int2(1, 0)).rgb, w = t.sample(s, uv, int2(-1, 0)).rgb;\n"
+    "    float3 mn = min(c, min(min(n, so), min(e, w))), mx = max(c, max(max(n, so), max(e, w)));\n"
+    "    float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1.0 / 256.0)));\n"
+    "    float3 wt = -amp * (0.2 * P.sharp);\n"
+    "    c = saturate((c + wt * (n + so + e + w)) / (1.0 + 4.0 * wt));\n"
     "  }\n"
     "  return float4(c, c0.a); }\n";
 
@@ -142,7 +158,7 @@ void pic_gamma(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> scr){
     g_gamma_n++;
 }
 
-static int g_aa = -1;
+static int g_aa = -1, g_sharp = -1;
 static id<MTLRenderPipelineState> g_pre_pso;
 static MTLPixelFormat g_pre_fmt;
 static id<MTLSamplerState> g_pre_smp;
@@ -152,19 +168,20 @@ static unsigned long g_pre_n, g_pre_z, g_pre_noz;
 int pic_pre_on(void){
     if (g_aa < 0){
         const char *e = getenv("EDGEAA"); g_aa = (e && *e == '1');
+        e = getenv("SHARPEN"); int v = e ? atoi(e) : 0; g_sharp = v < 0 ? 0 : v > 100 ? 100 : v;
     }
-    return g_aa;
+    return g_aa || g_sharp;
 }
 
 /* The finished scene in src (a render target the size of the screen, about to
  * be copied to the screen) and its depth zt (nil if not usable): returns a
- * texture with smoothing applied, for that copy to read instead; nil =
- * use src. */
+ * texture with smoothing / sharpening applied, for that copy to read
+ * instead; nil = use src. */
 id<MTLTexture> pic_pre(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> zt){
     if (!pic_pre_on() || !src || src.textureType != MTLTextureType2D) return nil;
     if (!g_pre_pso || g_pre_fmt != src.pixelFormat){
         g_pre_pso = pic_pso(dev, @"pic_pre", src.pixelFormat); g_pre_fmt = src.pixelFormat;
-        if (!g_pre_pso){ g_aa = 0; return nil; }
+        if (!g_pre_pso){ g_aa = g_sharp = 0; return nil; }
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
         sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
@@ -189,10 +206,10 @@ id<MTLTexture> pic_pre(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture
     int hasz = zt && zt.pixelFormat == MTLPixelFormatDepth32Float && (zt.usage & MTLTextureUsageShaderRead) &&
                zt.width == src.width && zt.height == src.height && zt.sampleCount == 1;
     if (hasz) [en setFragmentTexture:zt atIndex:1];
-    if (hasz) g_pre_z++; else g_pre_noz++;
+    if (g_aa){ if (hasz) g_pre_z++; else g_pre_noz++; }
     [en setFragmentSamplerState:g_pre_smp atIndex:0];
-    struct { float px[2]; float aa, hasz; } P = { { 1.f / (float)src.width, 1.f / (float)src.height },
-        g_aa ? 1.f : 0.f, hasz ? 1.f : 0.f };
+    struct { float px[2]; float aa, sharp, hasz, pad[3]; } P = { { 1.f / (float)src.width, 1.f / (float)src.height },
+        g_aa ? 1.f : 0.f, (float)g_sharp / 100.f, hasz ? 1.f : 0.f, { 0.f, 0.f, 0.f } };
     [en setFragmentBytes:&P length:sizeof P atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [en endEncoding];
@@ -202,6 +219,6 @@ id<MTLTexture> pic_pre(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture
 
 void pic_report(void){
     if (pic_gamma_on()) fprintf(stderr, "  console gamma    : %lu frames\n", g_gamma_n);
-    if (pic_pre_on()) fprintf(stderr, "  edge smoothing   : %lu frames (depth edges %lu, luma only %lu)\n",
-                              g_pre_n, g_pre_z, g_pre_noz);
+    if (pic_pre_on()) fprintf(stderr, "  scene pass       : edge smoothing %s (depth edges %lu frames, luma only %lu), sharpening %d%%, %lu frames\n",
+                              g_aa ? "on" : "off", g_pre_z, g_pre_noz, g_sharp, g_pre_n);
 }

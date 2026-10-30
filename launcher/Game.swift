@@ -88,6 +88,8 @@ enum PictureOptions {
                       choices: [("As on PC (original)", ""), ("Console", "1")]),
         PictureOption(key: "LauncherEdgeSmoothing", title: "Edge smoothing", env: "EDGEAA",
                       choices: [("Off, as on PC (original)", ""), ("On", "1")]),
+        PictureOption(key: "LauncherSharpening", title: "Sharpening", env: "SHARPEN",
+                      choices: [("Off, as on PC (original)", ""), ("Low", "50"), ("High", "100")]),
     ]
 }
 
