@@ -43,7 +43,7 @@ case "${BUILD:-eu}" in
 esac
 
 CSRC="mem dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance perflog wsfov gheap sndlead visual"
-MSRC="metal audio bundle gamepad"
+MSRC="metal audio bundle gamepad picture"
 FW="-lm -framework Cocoa -framework Metal -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreServices -framework AudioToolbox -framework GameController"
 SHARDS="$SOBJ/shard_*.o $SOBJ/fntab.o $SOBJ/stubs.o"
 

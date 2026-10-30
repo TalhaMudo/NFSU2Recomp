@@ -84,6 +84,8 @@ enum PictureOptions {
     static let all: [PictureOption] = [
         PictureOption(key: "LauncherColourTint", title: "Colour", env: "TINT",
                       choices: [("As on PC (original)", ""), ("Less tint", "less"), ("No tint", "none"), ("Cool", "cool")]),
+        PictureOption(key: "LauncherGamma", title: "Gamma", env: "CONSOLEGAMMA",
+                      choices: [("As on PC (original)", ""), ("Console", "1")]),
     ]
 }
 

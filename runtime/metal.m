@@ -7586,6 +7586,10 @@ void metal_run_main_loop(void){
                                 [cb renderCommandEncoderWithDescriptor:rp];
                             [e2 endEncoding];
                         }
+                        /* picture.m: CONSOLEGAMMA over the finished frame (HUD included);
+                         * ABTEST=PICTURE measures its cost */
+                        { void pic_gamma(id<MTLDevice>, id<MTLCommandBuffer>, id<MTLTexture>);
+                          if (!abt_off("PICTURE")) pic_gamma(g_dev, cb, dtex); }
                         /* PERFLOG counters must be taken BEFORE the buffer is GIVEN BACK to the game:
                          * afterwards the game thread zeroes and refills the same buffer.
                          * It used to be read after present; when the drawable wait got
