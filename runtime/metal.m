@@ -4838,7 +4838,20 @@ void metal_present(void){
     pthread_mutex_lock(&g_qlock);
     /* If the previous frame hasn't been put on screen yet, WAIT.  If we don't, the
      * guest writes over the next frame and the screen is blank at intervals
-     * (the "goes black and comes back" bug the user saw).               */
+     * (the "goes black and comes back" bug the user saw).
+     * The wait lasts until the main thread gets a drawable, i.e. up to vsync: 13 ms
+     * of a 16.7 ms frame in the menus.  It used to hold the big guest lock, so the
+     * game's other threads hardly ran; the music stream thread wrote 20-50% of what
+     * played and the menu music came in fragments (fine when minimised: no frames).
+     * The lock is given up for the wait and taken back after g_qlock is released,
+     * so the two are never waited for in opposite orders. */
+    int yielded = 0;
+    if (g_ready >= 0){
+        pthread_mutex_unlock(&g_qlock);
+        int guest_blocking_begin(void);
+        yielded = guest_blocking_begin();
+        pthread_mutex_lock(&g_qlock);
+    }
     int dropped = 0;
     if (g_ready >= 0){
         struct timespec ts, _w0; clock_gettime(CLOCK_MONOTONIC,&_w0);
@@ -4892,6 +4905,7 @@ void metal_present(void){
     atomic_store(&g_frame_pending, 1);
     pthread_cond_signal(&g_rcond);      /* let the main thread take it right away */
     pthread_mutex_unlock(&g_qlock);
+    if (yielded){ void guest_blocking_end(void); guest_blocking_end(); }
 }
 
 long metal_frames_dropped(void){ return atomic_load(&g_frames_dropped); }

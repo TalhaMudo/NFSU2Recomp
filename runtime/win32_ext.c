@@ -107,6 +107,11 @@ static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest);
 static void guest_thread_die(void);
 static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took();
     if (tl_obj && ((Obj*)tl_obj)->terminate) guest_thread_die(); }
+/* For runtime code that blocks on a guest thread outside Sleep/Wait* (metal_present
+ * waiting for the screen): give the big lock up for the wait.  Returns 0, and does
+ * nothing, on a thread that isn't a guest thread. */
+int  guest_blocking_begin(void){ if (!tl_cpu) return 0; guest_yield_begin(); return 1; }
+void guest_blocking_end(void){ guest_yield_end(); }
 /* Sleep while releasing the big lock (win32.c: the game's frame wait loop). */
 uint64_t g_sleep_late_ns, g_sleep_gil_ns, g_sleep_n;    /* diagnostics: sleep latency / lock wait */
 /* On macOS nanosleep wakes up with a timer coalescing margin: in the game a
