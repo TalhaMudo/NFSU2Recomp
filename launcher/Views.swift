@@ -154,6 +154,37 @@ struct GraphicsCard: View {
     }
 }
 
+struct PictureCard: View {
+    @ObservedObject var model: LauncherModel
+    private func row(_ i: Int) -> some View {
+        let o = PictureOptions.all[i]
+        return VStack(alignment: .leading, spacing: 3) {
+            Text(o.title).font(.system(size: 12)).foregroundColor(Theme.text)
+            Picker("", selection: $model.picture[i]) {
+                ForEach(0..<o.choices.count, id: \.self) { k in Text(o.choices[k].label).tag(k) }
+            }
+            .pickerStyle(MenuPickerStyle())
+            .labelsHidden()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    var body: some View {
+        Card("Picture") {
+            let n = PictureOptions.all.count
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(0..<(n + 1) / 2, id: \.self) { r in
+                    HStack(spacing: 18) {
+                        row(2 * r)
+                        if 2 * r + 1 < n { row(2 * r + 1) } else { Spacer().frame(maxWidth: .infinity) }
+                    }
+                }
+            }
+            Text("(original) is the game as it was on PC.")
+                .font(.system(size: 11)).foregroundColor(Theme.dim)
+        }
+    }
+}
+
 struct MoreCard: View {
     @ObservedObject var model: LauncherModel
     var body: some View {
@@ -253,6 +284,7 @@ struct LauncherView: View {
 
                 GameCard(model: model)
                 GraphicsCard(model: model)
+                PictureCard(model: model)
                 MoreCard(model: model)
 
                 Spacer(minLength: 0)
@@ -274,6 +306,6 @@ struct LauncherView: View {
             .padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 18)
             if let j = model.job { JobOverlay(model: model, job: j) }
         }
-        .frame(width: 560, height: 624)
+        .frame(width: 560, height: 690)
     }
 }

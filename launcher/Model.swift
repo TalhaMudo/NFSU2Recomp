@@ -21,6 +21,8 @@ final class LauncherModel: ObservableObject {
     @Published var showAtStartup: Bool { didSet { defaults.set(showAtStartup, forKey: Prefs.showAtStartup) } }
     @Published var wideHUD: Bool { didSet { defaults.set(wideHUD, forKey: Prefs.wideHUD) } }
     private var setHUDPOS = false        // HUDPOS was set by us (not by the caller)
+    /// PictureOptions.all[i] -> chosen index (0 = the original game).
+    @Published var picture: [Int] { didSet { savePicture() } }
     @Published var job: Job? = nil
     @Published var notice: String? = nil
 
@@ -51,6 +53,12 @@ final class LauncherModel: ObservableObject {
         fullscreen = defaults.bool(forKey: Prefs.fullscreen)
         showAtStartup = defaults.bool(forKey: Prefs.showAtStartup)
         wideHUD = defaults.bool(forKey: Prefs.wideHUD)
+        let d = UserDefaults.standard
+        picture = PictureOptions.all.map { o in min(max(d.integer(forKey: o.key), 0), o.choices.count - 1) }
+    }
+
+    private func savePicture() {
+        for (o, i) in zip(PictureOptions.all, picture) { defaults.set(i, forKey: o.key) }
     }
 
     var location: GameLocation? {
@@ -117,6 +125,10 @@ final class LauncherModel: ObservableObject {
         if setHUDPOS || env["HUDPOS"] == nil {
             if wideHUD { setenv("HUDPOS", "1", 1); setHUDPOS = true }
             else if setHUDPOS { unsetenv("HUDPOS"); setHUDPOS = false }
+        }
+        // Picture options: a variable set by hand still wins (overwrite 0).
+        for (o, i) in zip(PictureOptions.all, picture) where i > 0 {
+            setenv(o.env, o.choices[i].value, 0)
         }
         var e = engine
         if !hasEngine(e) { e = (e == .hd) ? .original : .hd }

@@ -583,6 +583,7 @@ static _Atomic unsigned long long g_abt_ns[2], g_abt_cnt[2];
 static int abt_off(const char *name){
     return g_abt_cur_off && g_abt_name && !strcmp(g_abt_name, name);
 }
+int metal_abt_off(const char *name){ return abt_off(name); }   /* for the other runtime files */
 /* called at the start of encoding: mode (-1 = outside A/B, 0 = on, 1 = off);
  * *cnt = whether the frame's GPU time counts */
 static int abt_frame(long f, int *cnt){

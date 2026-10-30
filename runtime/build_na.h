@@ -9,6 +9,7 @@
 #define GA_0x005BA11Du 0x005ba10du   /* function 005ba070 + 0xad */
 #define GA_0x005BA1DDu 0x005ba1cdu   /* function 005ba1b0 + 0x2d */
 #define GA_0x005BA559u 0x005ba549u   /* function 005ba4c0 + 0x99 */
+#define GA_0x005c6766u 0x005c6756u   /* function 005c6530 + 0x236 */
 #define GA_0x005c7ffeu 0x005c7feeu   /* function 005c7ed0 + 0x12e */
 #define GA_0x0065acf5u 0x0065ace5u   /* function 0065acf5 + 0x0 */
 #define GA_0x0065addbu 0x0065adcbu   /* function 0065addb + 0x0 */
@@ -79,6 +80,7 @@
 #define GA_0x0086549cu 0x0086549cu   /* operand pair */
 #define GA_0x008654a4u 0x008654a4u   /* operand pair */
 #define GA_0x00865558u 0x00865558u   /* operand pair */
+#define GA_0x0086f8acu 0x0086f8acu   /* operand pair */
 #define GA_0x00890080u 0x00890080u   /* operand pair */
 #define GA_0x43bdfeu 0x0043bdfeu   /* function 0043bdf0 + 0xe */
 #define GA_0x57eb79u 0x0057eb69u   /* function 0057eae0 + 0x99 */
