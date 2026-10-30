@@ -68,6 +68,24 @@ enum Prefs {
     static let engine = "LauncherEngine"           // "original" | "hd"
     static let showAtStartup = "LauncherShowAtStartup"
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
+
+    /// Each game option with its value in the original, unmodified game: Settings ›
+    /// Restore Original Game sets them all.  A new option adds its line here.  (The
+    /// game folder, full screen and showAtStartup are not game options.)
+    static let originalGame: [OriginalValue] = [
+        OriginalValue(\.engine, .original),
+        OriginalValue(\.wideHUD, false),
+    ]
+}
+
+/// An option of LauncherModel and the value that gives the original game.
+struct OriginalValue {
+    let restore: (LauncherModel) -> Void
+    let isSet: (LauncherModel) -> Bool
+    init<T: Equatable>(_ option: ReferenceWritableKeyPath<LauncherModel, T>, _ value: T) {
+        restore = { $0[keyPath: option] = value }
+        isSet = { $0[keyPath: option] == value }
+    }
 }
 
 enum Locator {
