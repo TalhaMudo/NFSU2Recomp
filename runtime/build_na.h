@@ -3,6 +3,9 @@
 #pragma once
 #define GA(x) GA_##x
 #define GA_0x004c4f50u 0x004c4f50u   /* function 004c4f50 + 0x0 */
+#define GA_0x004c5330u 0x004c5330u   /* function 004c5330 + 0x0 */
+#define GA_0x004c53a0u 0x004c53a0u   /* function 004c53a0 + 0x0 */
+#define GA_0x004c53d0u 0x004c53d0u   /* function 004c53d0 + 0x0 */
 #define GA_0x004ec35cu 0x004ec35cu   /* function 004ebec0 + 0x49c */
 #define GA_0x0051cbb0u 0x0051cba0u   /* function 0051cbb0 + 0x0 */
 #define GA_0x005BA0A7u 0x005ba097u   /* function 005ba070 + 0x37 */
@@ -151,6 +154,18 @@
 #define GA_0x8b466cu 0x008b466cu   /* operand pair */
 #define GA_0x8ba4a4u 0x008ba4a4u   /* operand pair */
 #define GA_0x8ba4a8u 0x008ba4a8u   /* operand pair */
+#define sub_004c5330 sub_004c5330
+#define sub_004c5330_orig sub_004c5330_orig
+#define sub_004c5330_m sub_004c5330_m
+#define sub_004c5330_orig_m sub_004c5330_orig_m
+#define sub_004c53a0 sub_004c53a0
+#define sub_004c53a0_orig sub_004c53a0_orig
+#define sub_004c53a0_m sub_004c53a0_m
+#define sub_004c53a0_orig_m sub_004c53a0_orig_m
+#define sub_004c53d0 sub_004c53d0
+#define sub_004c53d0_orig sub_004c53d0_orig
+#define sub_004c53d0_m sub_004c53d0_m
+#define sub_004c53d0_orig_m sub_004c53d0_orig_m
 #define sub_0050d510 sub_0050d510
 #define sub_0050d510_orig sub_0050d510_orig
 #define sub_0050d510_m sub_0050d510_m

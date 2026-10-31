@@ -402,9 +402,60 @@ static void sponsor_continue_install(void){
     else fprintf(stderr, "sponsor screens: rows not found, left unchanged\n");
 }
 
+/* --- BOOT MOVIES: skippable logos and notice ----------------------------------
+ * The screens at start play a movie each and go on when it has ended: their
+ * message handler gets 0xc3960eb9 from the player, sets [0x8383a8] and moves to
+ * the next screen (0x4c4f50).  The EA logo, the blank screen and the THX logo
+ * (handler 0x4c53a0) answer nothing else; the notice (PSA, 0x4c53d0) takes
+ * Accept/Start (0x406415e3 / 0xb5af2461) only once a profile exists; the opening
+ * movie (0x4c5330) takes them but not Escape, Space or B.  BOOTMOVIES:
+ *   skippable (default)  Accept or Start, or a new press of Enter, Escape, Space or
+ *                        a controller's A, B or Menu (seen on the screen's per-frame
+ *                        0xc98356ba), reaches the handler as "movie ended"
+ *   off                  they aren't opened (fileio.c); the game goes on as for a missing file
+ *   original             as the game has them
+ * Story and tutorial movies are other screens and never touched. */
+#define MSG_MOVIE_ENDED 0xc3960eb9u
+#define MSG_ACCEPT      0x406415e3u
+#define MSG_START       0xb5af2461u
+#define MSG_TICK        0xc98356bau
+int bootmovies_mode(void){                 /* 0 original, 1 skippable, 2 off */
+    static int m = -1;
+    if (m < 0){ const char *e = getenv("BOOTMOVIES");
+        m = !e || !*e ? 1 : !strcasecmp(e, "off") ? 2 : !strcasecmp(e, "original") ? 0 : 1; }
+    return m;
+}
+static int skip_key_fresh(void){
+    void metal_fill_keyboard(unsigned char *, unsigned); void gamepad_fill(unsigned char *);
+    unsigned char k[256], p[272];
+    metal_fill_keyboard(k, 256); gamepad_fill(p);
+    int down = ((k[0x1C] | k[0x9C] | k[0x01] | k[0x39]) & 0x80) || ((p[0x30] | p[0x31] | p[0x37]) & 0x80);
+    static int was = 1;                    /* a key held since before is no new press */
+    int fresh = down && !was; was = down;
+    return fresh;
+}
+static void boot_movie_message(CPU *c, int own_skip){
+    if (bootmovies_mode() != 1) return;
+    uint32_t msg = MR32(c->esp + 4u);
+    int pad = !own_skip && (msg == MSG_ACCEPT || msg == MSG_START);   /* own_skip: the screen takes them itself */
+    if (pad) (void)skip_key_fresh();       /* the same press must not skip the next movie too */
+    if (pad || (msg == MSG_TICK && skip_key_fresh())){
+        MR32(c->esp + 4u) = MSG_MOVIE_ENDED;
+        static int n = 0;
+        if (n++ < 8) fprintf(stderr, "  [movie] boot movie skipped\n");
+    }
+}
+void sub_004c53a0(CPU *c); void sub_004c53d0(CPU *c); void sub_004c5330(CPU *c);
+static void wrap_logo_screen(CPU *c){    boot_movie_message(c, 0); sub_004c53a0(c); }
+static void wrap_psa_screen(CPU *c){     boot_movie_message(c, 0); sub_004c53d0(c); }
+static void wrap_opening_screen(CPU *c){ boot_movie_message(c, 1); sub_004c5330(c); }
+
 void overrides_install(void){
     void dispatch_patch(uint32_t, void(*)(CPU*));
     dispatch_patch(GA(0x006e2be0u), wrap_6e2be0);
+    dispatch_patch(GA(0x004c53a0u), wrap_logo_screen);
+    dispatch_patch(GA(0x004c53d0u), wrap_psa_screen);
+    dispatch_patch(GA(0x004c5330u), wrap_opening_screen);
     region_install();
     shadow_install();
     sponsor_continue_install();
