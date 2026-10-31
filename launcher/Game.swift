@@ -64,9 +64,13 @@ enum Prefs {
     // Shared with the engine (same bundle id, same defaults domain).
     static let gameFolder = "OyunDizini"          // name kept for existing installs
     static let fullscreen = "NFSUFullScreen"
+    // Launcher only; passed to the engine as NFSU2_PAD / NFSU2_PAD_DEADZONE.
+    static let controller = "LauncherController"
+    static let stickDeadzone = "LauncherStickDeadzone"
     // Launcher only.
     static let engine = "LauncherEngine"           // "original" | "hd"
     static let showAtStartup = "LauncherShowAtStartup"
+    static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
 }
 
 enum Locator {

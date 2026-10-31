@@ -14,6 +14,7 @@ CPU *g_cur_cpu = 0;
 uint8_t *g_mem = 0;
 uint32_t g_eflags_hi = 0;   /* EFLAGS AC/ID bits, see eflags_get in cpu.h */
 uint32_t g_image_base = 0x400000u, g_res_dir_va = 0, g_res_dir_size = 0;
+uint32_t g_image_end = 0;            /* end of the loaded image (image base + SizeOfImage) */
 
 /* watch state: must be defined in every build (debug.c is optional) */
 uint32_t g_itrace[ITRACE_SIZE];
@@ -222,6 +223,7 @@ int mem_load_pe(const char *path){
     uint8_t *sh    = nt + 24 + optsz;
     mem_init();
     mem_commit(base, imgsz);                 /* the whole image range */
+    g_image_end = base + imgsz;
     for (int i=0;i<nsec;i++){
         uint8_t *s = sh + i*40;
         char nm[9]={0}; memcpy(nm,s,8);

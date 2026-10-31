@@ -140,6 +140,42 @@ struct GraphicsCard: View {
                 Spacer(minLength: 8)
                 Toggle("", isOn: $model.fullscreen).labelsHidden().toggleStyle(SwitchToggleStyle())
             }
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("HUD at the screen edges").font(.system(size: 12.5)).foregroundColor(Theme.text)
+                    Text("On wide screens the minimap moves to the left and the gauges to the right. Off: the HUD stays in the 4:3 middle.")
+                        .font(.system(size: 11)).foregroundColor(Theme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Toggle("", isOn: $model.wideHUD).labelsHidden().toggleStyle(SwitchToggleStyle())
+            }
+        }
+    }
+}
+
+struct ControllerCard: View {
+    @ObservedObject var model: LauncherModel
+    var body: some View {
+        Card("Controller") {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Use a game controller").font(.system(size: 12.5)).foregroundColor(Theme.text)
+                    Text("Xbox, PlayStation or MFi. Connect it before Play; buttons are set in the game's Controls menu.")
+                        .font(.system(size: 11)).foregroundColor(Theme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Toggle("", isOn: $model.controller).labelsHidden().toggleStyle(SwitchToggleStyle())
+            }
+            HStack(alignment: .center, spacing: 10) {
+                Text("Stick dead zone").font(.system(size: 12.5)).foregroundColor(Theme.text)
+                Slider(value: $model.stickDeadzone, in: 0...0.5, step: 0.01)
+                Text("\(Int((model.stickDeadzone * 100).rounded())) %")
+                    .font(.system(size: 11.5).monospacedDigit()).foregroundColor(Theme.dim)
+                    .frame(width: 40, alignment: .trailing)
+            }
+            .disabled(!model.controller).opacity(model.controller ? 1 : 0.5)
         }
     }
 }
@@ -151,7 +187,7 @@ struct MoreCard: View {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Portable copy").font(.system(size: 12.5, weight: .medium)).foregroundColor(Theme.text)
-                    Text("One app with the game inside (about 1.4 GB), for another Mac or a USB drive.")
+                    Text("One app with the game inside, for another Mac or a USB drive. Movies and language packs can be left out to make it smaller.")
                         .font(.system(size: 11)).foregroundColor(Theme.dim)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -161,7 +197,7 @@ struct MoreCard: View {
                     .disabled(!model.isReady)
             }
             HStack(spacing: 8) {
-                Button("Saves") { model.openSaves() }.buttonStyle(SecondaryButtonStyle())
+                Button("Saves…") { model.manageSaves() }.buttonStyle(SecondaryButtonStyle())
                 Button("Logs") { model.openLogs() }.buttonStyle(SecondaryButtonStyle())
                 Button("Reset Graphics Settings…") { model.resetGraphics() }.buttonStyle(SecondaryButtonStyle())
                 Spacer(minLength: 0)
@@ -243,6 +279,7 @@ struct LauncherView: View {
 
                 GameCard(model: model)
                 GraphicsCard(model: model)
+                ControllerCard(model: model)
                 MoreCard(model: model)
 
                 Spacer(minLength: 0)
@@ -264,6 +301,6 @@ struct LauncherView: View {
             .padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 18)
             if let j = model.job { JobOverlay(model: model, job: j) }
         }
-        .frame(width: 560, height: 624)
+        .frame(width: 560, height: 724)
     }
 }

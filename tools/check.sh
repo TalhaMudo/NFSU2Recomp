@@ -31,7 +31,7 @@ trap restore EXIT
 
 # From the menus to Quick Race (see PROJECT.md / the quick-race recipe), throttle after 4700.
 SEQ="1000:0x1C,1350:0x1C,1700:0x1C,2050:0x1C,2400:0x1C,2750:0x1C,3100:0x1C,3700:0x1C,4000:0x1C,4700:0xC8:2200"
-Q=${CHECK_FRAMES:-7000}   # LOCAL PATCH: CHECK_FRAMES / CHECK_SEQ for long soak runs
+Q=${CHECK_FRAMES:-7000}   # CHECK_FRAMES / CHECK_SEQ: longer soak runs
 SEQ=${CHECK_SEQ:-$SEQ}
 FAILED=0
 
@@ -50,9 +50,7 @@ for b in $BUILDS; do
     FIXMAT=1 FIXMAT_MODE=3 NOMOVIES=1 SNDSYNC=1 GPUVS=1 WINDOW=1 ALARM=0 \
     NOFOCUS=2 NOSOUND=1 NFSFULL=0 MOUSEAT=5,5 FSFAKE=300 \
     NFSU2_SAVEDIR="$TMP/saves_$b" AUTOSEQ="$SEQ" QUITFRAMES=$Q GPUWIN=6000,6900 \
-    ${NFSU2_HEAP_FREE:+NFSU2_HEAP_FREE="$NFSU2_HEAP_FREE"} ${NFSU2_HEAP_QUAR_MB:+NFSU2_HEAP_QUAR_MB="$NFSU2_HEAP_QUAR_MB"} ${HEAPPOISON:+HEAPPOISON="$HEAPPOISON"} ${NFSU2_HEAPLOG:+NFSU2_HEAPLOG="$NFSU2_HEAPLOG"} \
-    ${NFSU2_HEAP_FREE:+NFSU2_HEAP_FREE="$NFSU2_HEAP_FREE"} ${NFSU2_HEAP_QUAR_MB:+NFSU2_HEAP_QUAR_MB="$NFSU2_HEAP_QUAR_MB"} ${HEAPPOISON:+HEAPPOISON="$HEAPPOISON"} ${GBUF_SKIP_MB:+GBUF_SKIP_MB="$GBUF_SKIP_MB"} ${NFSU2_HEAPLOG:+NFSU2_HEAPLOG="$NFSU2_HEAPLOG"} \
-    ${NFSU2_HEAP_FREE:+NFSU2_HEAP_FREE="$NFSU2_HEAP_FREE"} ${NFSU2_HEAP_QUAR_MB:+NFSU2_HEAP_QUAR_MB="$NFSU2_HEAP_QUAR_MB"} ${HEAPPOISON:+HEAPPOISON="$HEAPPOISON"} ${GBUF_SKIP_MB:+GBUF_SKIP_MB="$GBUF_SKIP_MB"} ${NFSU2_GBUF_MERGE:+NFSU2_GBUF_MERGE="$NFSU2_GBUF_MERGE"} ${NFSU2_GBUF_QUAR:+NFSU2_GBUF_QUAR="$NFSU2_GBUF_QUAR"} ${NFSU2_GBUF_FREE0:+NFSU2_GBUF_FREE0="$NFSU2_GBUF_FREE0"} ${NFSU2_HEAPLOG:+NFSU2_HEAPLOG="$NFSU2_HEAPLOG"} \
+    ${NFSU2_HEAP_FREE:+NFSU2_HEAP_FREE="$NFSU2_HEAP_FREE"} ${NFSU2_HEAP_QUAR_MB:+NFSU2_HEAP_QUAR_MB="$NFSU2_HEAP_QUAR_MB"} ${HEAPPOISON:+HEAPPOISON="$HEAPPOISON"} ${GBUF_SKIP_MB:+GBUF_SKIP_MB="$GBUF_SKIP_MB"} ${NFSU2_GBUF_MERGE:+NFSU2_GBUF_MERGE="$NFSU2_GBUF_MERGE"} ${NFSU2_GBUF_QUAR:+NFSU2_GBUF_QUAR="$NFSU2_GBUF_QUAR"} ${NFSU2_GBUF_FREE0:+NFSU2_GBUF_FREE0="$NFSU2_GBUF_FREE0"} ${NFSU2_HEAPLOG:+NFSU2_HEAPLOG="$NFSU2_HEAPLOG"} ${THREADLOG:+THREADLOG="$THREADLOG"} \
     ${NFSU2_HIGHFPS:+NFSU2_HIGHFPS="$NFSU2_HIGHFPS"} ${NFSU2_HIGHFPS_OFF:+NFSU2_HIGHFPS_OFF="$NFSU2_HIGHFPS_OFF"} ${NFSU2_HIGHFPS_SET:+NFSU2_HIGHFPS_SET="$NFSU2_HIGHFPS_SET"} ${TIMELOG:+TIMELOG="$TIMELOG"} ${FILEOPLOG:+FILEOPLOG="$FILEOPLOG"} \
     "$BIN" "$EXE" > "$LOG" 2>&1
   rc=$?
@@ -63,9 +61,9 @@ for b in $BUILDS; do
   v=$(num "indirect calls unresolved" ': ([0-9]+)'); check "unresolved indirect calls = 0" "$([ "${v:-x}" = 0 ] && echo 1 || echo 0)" "${v:-?}"
   v=$(num "\[matrix\]" 'broken=([0-9]+).*'); check "broken matrices = 0" "$([ "${v:-x}" = 0 ] && echo 1 || echo 0)" "${v:-?}"
   v=$(num "command buffer error: [0-9]+ frames" 'error: ([0-9]+) frames'); check "GPU command buffer errors = 0" "$([ "${v:-x}" = 0 ] && echo 1 || echo 0)" "${v:-?}"
-  # LOCAL PATCH: guest heap (gheap.c): no failed allocations, no bad frees
+  # guest heap (gheap.c): no failed allocations, no bad frees
   check "heap: no failed allocations / bad frees" "$(grep -a -E "^  \[heap\] live" "$LOG" | tail -1 | grep -q "0 double / 0 bad / 0 corrupt frees, 0 failed" && echo 1 || echo 0)" "$(grep -a -E "^  \[heap\] live" "$LOG" | tail -1 | sed -E 's/.*; ([0-9]+ double.*failed).*/\1/')"
-  # LOCAL PATCH: buffer heap (com.c gbuf): no bad / double frees, no out-of-memory
+  # buffer heap (com.c gbuf): no bad / double frees, no out-of-memory
   v=$(num "^  buffer heap +: top" ' ([0-9]+) bad frees'); o=$(grep -a -c "\[gbuf\] OUT OF MEMORY" "$LOG")
   check "buffer heap: 0 bad frees, no OOM" "$([ "${v:-x}" = 0 ] && [ "$o" = 0 ] && echo 1 || echo 0)" "${v:-?} bad, $o OOM"
   v=$(num "[0-9]+ MISSING" ', ([0-9]+) MISSING'); check "missing mip levels = 0" "$([ "${v:-x}" = 0 ] && echo 1 || echo 0)" "${v:-?}"

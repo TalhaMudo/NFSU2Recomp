@@ -21,14 +21,37 @@ final class PortableBuilder {
     private let lock = NSLock()
     private var cancelFlag = false
 
-    // The engine never reads these: no video decoder (MOVIES, ~250 MB) and Windows-only plugins.
-    static let skippedGameItems: Set<String> = ["MOVIES", "SCRIPTS", "dinput8.dll", "server.dll",
+    // The engine never reads these: Windows-only plugins and scripts.
+    static let skippedGameItems: Set<String> = ["SCRIPTS", "dinput8.dll", "server.dll",
                                                 "server.cfg", "SafeMode.bat"]
+    // Copied unless left out (the Make Copy dialog's checkboxes): the game plays on without them.
+    struct Extra { let folder: String; let title: String; let without: String }
+    static let extras = [
+        Extra(folder: "MOVIES", title: "the movies", without: "the game skips its movies"),
+        Extra(folder: "LANGPACKS", title: "the language packs", without: "only the languages in LANGUAGES"),
+    ]
 
-    init(sourceApp: URL, gameFolder: URL, destination: URL) {
+    let leaveOut: Set<String>    // folder names of `extras`, upper case
+
+    init(sourceApp: URL, gameFolder: URL, destination: URL, leaveOut: Set<String> = []) {
         self.sourceApp = sourceApp
         self.gameFolder = gameFolder
         self.destination = destination
+        self.leaveOut = Set(leaveOut.map { $0.uppercased() })
+    }
+
+    /// The extras the game folder has, with their sizes.
+    static func extras(in gameFolder: URL) -> [(Extra, Int64)] {
+        let fm = FileManager.default
+        let names = (try? fm.contentsOfDirectory(atPath: gameFolder.path)) ?? []
+        return extras.compactMap { x in
+            guard let name = names.first(where: { $0.caseInsensitiveCompare(x.folder) == .orderedSame }),
+                  let e = fm.enumerator(at: gameFolder.appendingPathComponent(name),
+                                        includingPropertiesForKeys: [.fileSizeKey]) else { return nil }
+            var total: Int64 = 0
+            for case let u as URL in e { total += Int64((try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) }
+            return (x, total)
+        }
     }
 
     func cancel() { lock.lock(); cancelFlag = true; lock.unlock() }
@@ -101,7 +124,10 @@ final class PortableBuilder {
 
         report(Progress(done: 0, total: 0, phase: "Looking at the game files…"))
         let appItems = list(sourceApp) { rel, _ in rel == "Contents/Resources/Game" || rel == "Contents/_CodeSignature" }
-        let gameItems = list(gameFolder) { rel, level in level == 1 && Self.skippedGameItems.contains(rel) }
+        let gameItems = list(gameFolder) { rel, level in
+            level == 1 && (Self.skippedGameItems.contains(rel)
+                           || leaveOut.contains(rel.uppercased()))
+        }
         let total = (appItems + gameItems).reduce(Int64(0)) { $0 + $1.size }
 
         // Clones on the same disk need no space; on another disk the whole size is needed.

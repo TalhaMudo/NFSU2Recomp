@@ -45,8 +45,9 @@ BIN="$ROOT/out/nfsu2${NA}_boot"
 #            rows 2 and 3 written, 0-1 zero) -> every vertex collapses to
 #            (1,1).  MODE=3 injects the correct identity matrix; the raw
 #            positions are already in clip space.
-# NOMOVIES : no VP6 video decoder; if the video files aren't ignored the
-#            game waits forever at the first video.
+# NOMOVIES : 1 skips the videos (they play by default: the game decodes VP6
+#            itself; the old hang at the first video was the movie timer's
+#            CPU calibration, fixed with the "~MHz" registry value).
 # Don't let the diagnostic synthetic input/forcing variables leak in from the
 # shell: an old "export AUTOKEY=..." made the game look like it clicked by itself.
 unset AUTOKEY AUTOCLICK FORCESWITCH FETICK GAMELOG DUMPFRAME BOOTFLOW \
@@ -62,7 +63,7 @@ unset AUTOKEY AUTOCLICK FORCESWITCH FETICK GAMELOG DUMPFRAME BOOTFLOW \
       STALL MEMDUMP REGFIRST ADAPTERID FPSCAP BGFPS FBONLY
 
 export FIXMAT="${FIXMAT:-1}"
-export NOMOVIES="${NOMOVIES:-1}"
+export NOMOVIES="${NOMOVIES:-0}"
 export FIXMAT_MODE="${FIXMAT_MODE:-3}"
 # SNDSYNC : tie the playback rate to the ratio of the game's virtual clock to
 #           real time.  Since the clock now advances with real elapsed time the

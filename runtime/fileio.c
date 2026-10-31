@@ -158,6 +158,19 @@ static FH *fh_get(uint32_t h){
 }
 int fileio_is_handle(uint32_t h){ return fh_get(h)!=0; }
 
+/* ---- BOOT MOVIES (see overrides.c) ----------------------------------------------
+ * BOOTMOVIES=off: the logos, the blank screen, the notice and the opening movie
+ * are not opened; the game goes on as for a missing file. */
+int bootmovies_mode(void);                 /* overrides.c: 0 original, 1 skippable, 2 off */
+static int is_boot_movie(const char *path){
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    const char *ext = strrchr(b, '.');
+    if (!ext || strcasecmp(ext, ".vp6")) return 0;
+    static const char *const pre[] = { "ealogo", "THX_logo", "PSA", "blank", "FMVOpening" };
+    for (int i = 0; i < 5; i++) if (!strncasecmp(b, pre[i], strlen(pre[i]))) return 1;
+    return 0;
+}
+
 static uint32_t A(CPU *c,int i){ return MR32(c->esp + 4u*(uint32_t)i); }
 #define GS(a) ((const char*)(g_mem + (uint32_t)(a)))
 #define INVALID_HANDLE 0xFFFFFFFFu
@@ -281,6 +294,7 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
           /* mode 3: skip only the "blank" movie (let the real movies play) */
           const char *bn2 = strrchr(real, '/'); bn2 = bn2 ? bn2+1 : real;
           if (movie_mode == 3 && !strncasecmp(bn2, "blank", 5)) fd = -1;
+          else if (bootmovies_mode() == 2 && !(flags & O_CREAT) && is_boot_movie(real)) fd = -1;
           else if (movie_mode == 1 && ext &&
               (!strcasecmp(ext,".vp6") || !strcasecmp(ext,".vp8") ||
                !strcasecmp(ext,".bik") || !strcasecmp(ext,".mpg")))

@@ -371,6 +371,8 @@ typedef struct { unsigned first, count, tex, target, clear_argb, is_clear;
                  int vsid; unsigned rawoff, koff; float proj[4];
                  unsigned smp[4];
                  unsigned is_blit, blit_src; unsigned bcol; unsigned cull;
+                 /* StretchRect with a source rectangle: the part of the source to copy (uv) */
+                 unsigned blit_rect; float blit_uv[4];
                  float fogv[4];
                  unsigned clr_flags; float clr_z; unsigned ksz;
                  /* indexed draw (see PERSISTENT VERTEX / INDEX POOL): if ix_isz is 2/4,
@@ -386,6 +388,9 @@ typedef struct { unsigned first, count, tex, target, clear_argb, is_clear;
                  unsigned cuvok; float cuv[4];
                  /* UV SCALE: the corrected oT sets (also in K.pad1) and the difference (VS buffer 3) */
                  unsigned uvbm; float uvb[2];
+                 /* HUD ANCHORING: the 4:3 clip rectangle of a HUD draw (com.c) and the
+                  * x shift planned for it (VS buffer 3 .z) */
+                 unsigned hudok; float hud[4]; float xsh;
                  /* ORDERED TEXTURE UPLOADS: into tex's up_level / up_face, from the frame's
                   * upload area (rawoff), up_w x up_h, rows up_pitch bytes */
                  unsigned is_up, up_level, up_face, up_w, up_h, up_pitch; } MDraw;
@@ -976,6 +981,11 @@ static _Atomic long    g_frames_dropped = 0;
  * same buffer, the frame would be left half done or the new draws drawn with old
  * vertex data. */
 static int g_enc_rb = -1;
+/* OFF-SCREEN FLUSH (see READING BACK A LOCKABLE RENDER TARGET): buffer b is drawn
+ * into g_flush_tid's texture instead of the screen and not presented. */
+static int g_noshow[2], g_noshow_next;
+static unsigned g_flush_tid;
+static long g_flush_req, g_flush_done;     /* under g_qlock; done is signalled on g_qcond */
 static _Atomic unsigned long g_cb_err = 0;         /* frames that ended with an error on the GPU */
 static _Atomic unsigned long g_enc_late = 0;       /* encoding was still going when the 60 ms ran out */
 static long g_enc_late_f[8];                       /* frame numbers of the first few */
@@ -4507,7 +4517,7 @@ static long scr_redirect_plan(int rb, id<MTLTexture> scr, unsigned *outT){
     if (!scrredir_mode() || abt_off("SCRREDIR") || !scr || rb < 0) return -1;
     unsigned n = g_dn[rb], B, k; const MDraw *D = g_dbuf[rb];
     for (B = 0; B < n; B++) if (D[B].is_blit && !D[B].blit_src) break;
-    if (B >= n) return -1;
+    if (B >= n || D[B].blit_rect) return -1;
     unsigned T = TGT_ID(D[B].target);
     if (!D[B].target || TGT_FACE(D[B].target) || !T || T >= MAXTEX) return -1;
     id<MTLTexture> tt = g_tex[T];
@@ -4530,6 +4540,73 @@ static long scr_redirect_plan(int rb, id<MTLTexture> scr, unsigned *outT){
     }
     return -1;
 #endif
+}
+
+/* ---- HUD ANCHORING (HUDPOS=1) ---------------------------------------------
+ * The game lays its HUD out for 640x480; on a wider screen HUDFIX squeezes it
+ * into the centered 4:3 area (round gauges stay round).  With HUDPOS the
+ * elements on the left go to the left edge and the ones on the right to the
+ * right edge, still unstretched.  com.c hands over each HUD draw's 4:3 clip
+ * rectangle (only while the world is loaded); before a frame is encoded the
+ * draws are joined into elements (below) and each element is moved as one
+ * piece, so a text, a gauge, a panel or the mirror never splits. */
+static int g_nhud_ok = 0; static float g_nhud[4];
+void metal_set_next_hud(float x0, float x1, float y0, float y1){
+    g_nhud[0] = x0; g_nhud[1] = x1; g_nhud[2] = y0; g_nhud[3] = y1; g_nhud_ok = 1;
+}
+static _Atomic unsigned long long g_hud_moved = 0, g_hud_kept = 0;
+/* Elements are the connected pieces of the frame's HUD: draws whose rectangles
+ * overlap or touch (a song box with its frame pieces and text, a gauge with its
+ * needle and digits, the mirror with its frame, a 9-piece panel with its
+ * contents) form one element, found with a union-find over the frame's HUD
+ * draws.  An element crossing the middle stays; one on the left goes to the
+ * left edge, one on the right to the right edge.  If elements chain across
+ * the middle the result is the old centered layout, never a split element. */
+#define HUD_MAXN 1536
+static int hud_find(int *par, int x){ while (par[x] != x){ par[x] = par[par[x]]; x = par[x]; } return x; }
+static void hud_anchor_plan(int rb){
+    unsigned n = g_dn[rb]; MDraw *D = g_dbuf[rb];
+    float asp = atomic_load(&g_ui_asp) / 10000.0f;
+    for (unsigned i = 0; i < n; i++) D[i].xsh = 0.f;
+    if (!(asp < 0.999f)) return;
+    float sh = 1.f - asp;                       /* the 4:3 edge -> the screen edge */
+    static unsigned idx[HUD_MAXN]; static int par[HUD_MAXN]; static float bb[HUD_MAXN][4];
+    int m = 0;
+    for (unsigned i = 0; i < n; i++){
+        const MDraw *d = &D[i];
+        if (!d->hudok || d->target || d->is_clear || d->is_blit || d->is_up || d->vsid <= 0) continue;
+        if (m == HUD_MAXN) return;              /* unusual frame: leave it centered */
+        idx[m] = i; par[m] = m; m++;
+    }
+    if (!m) return;
+    const float tol = 0.02f;                    /* touching = within 1/100 of the 4:3 width */
+    for (int a = 0; a < m; a++){
+        const float *ra = D[idx[a]].hud;
+        for (int b = a + 1; b < m; b++){
+            const float *rb2 = D[idx[b]].hud;
+            if (ra[0] <= rb2[1] + tol && rb2[0] <= ra[1] + tol &&
+                ra[2] <= rb2[3] + tol && rb2[2] <= ra[3] + tol){
+                int x = hud_find(par, a), y = hud_find(par, b);
+                if (x != y) par[y] = x; }
+        }
+    }
+    for (int a = 0; a < m; a++){ bb[a][0] = bb[a][2] = 1e30f; bb[a][1] = bb[a][3] = -1e30f; }
+    for (int a = 0; a < m; a++){
+        int r = hud_find(par, a); const float *q = D[idx[a]].hud;
+        if (q[0] < bb[r][0]) bb[r][0] = q[0]; if (q[1] > bb[r][1]) bb[r][1] = q[1];
+        if (q[2] < bb[r][2]) bb[r][2] = q[2]; if (q[3] > bb[r][3]) bb[r][3] = q[3];
+    }
+    unsigned long long moved = 0, kept = 0;
+    for (int a = 0; a < m; a++){
+        int r = hud_find(par, a);
+        float x0 = bb[r][0], x1 = bb[r][1], c = (x0 + x1) * 0.5f, sx = 0.f;
+        if (!(x0 < -0.15f && x1 > 0.15f)){      /* not crossing the middle */
+            if (c < -0.25f) sx = -sh; else if (c > 0.25f) sx = sh;
+        }
+        D[idx[a]].xsh = sx;
+        if (sx != 0.f) moved++; else kept++;
+    }
+    atomic_fetch_add(&g_hud_moved, moved); atomic_fetch_add(&g_hud_kept, kept);
 }
 
 static MDraw *raw_rec(int b, unsigned stride, unsigned tex, int vsid,
@@ -4578,6 +4655,7 @@ static MDraw *raw_rec(int b, unsigned stride, unsigned tex, int vsid,
     memcpy(D->proj, g_cur_proj, sizeof D->proj);
     D->vsid = vsid; D->koff = koff; D->ksz = ksz;
     if (uvbm && uvb){ D->uvbm = uvbm; D->uvb[0] = uvb[0]; D->uvb[1] = uvb[1]; }
+    if (g_nhud_ok){ D->hudok = 1; memcpy(D->hud, g_nhud, sizeof D->hud); g_nhud_ok = 0; }
     return D;
 }
 int metal_draw_raw(const void *src, unsigned nverts, unsigned stride,
@@ -4798,13 +4876,35 @@ void metal_set_render_target(unsigned texid){
  * stayed empty, the composite produced black.  We put the copy into the draw list
  * as an ORDERED entry; at present time it runs as a full-screen quad (scaling
  * and format conversion come for free).        */
+/* The last copy the guest asked for (READING BACK A LOCKABLE RENDER TARGET redoes
+ * a copy from the screen out of the flushed frame's final image). */
+static unsigned g_lb_src, g_lb_dst; static float g_lb_uv[4];
+static id<MTLRenderPipelineState> g_pso_copy;
 void metal_blit(unsigned src_tex, unsigned dst_tex){
     pthread_mutex_lock(&g_qlock);
+    g_lb_src = src_tex; g_lb_dst = dst_tex;
+    g_lb_uv[0] = 0.f; g_lb_uv[1] = 0.f; g_lb_uv[2] = 1.f; g_lb_uv[3] = 1.f;
     int b = g_cur;
     if (g_dn[b] < MAXD){
         MDraw *D = &g_dbuf[b][g_dn[b]];
         memset(D, 0, sizeof *D);
         D->target = dst_tex; D->blit_src = src_tex; D->is_blit = 1;
+        g_dn[b]++;
+    }
+    pthread_mutex_unlock(&g_qlock);
+}
+/* StretchRect with a source rectangle (u0,v0)-(u1,v1) in 0..1 of the source.  The
+ * magazine and DVD covers are cut from the middle of the screen this way. */
+void metal_blit_rect(unsigned src_tex, unsigned dst_tex, float u0, float v0, float u1, float v1){
+    pthread_mutex_lock(&g_qlock);
+    g_lb_src = src_tex; g_lb_dst = dst_tex;
+    g_lb_uv[0] = u0; g_lb_uv[1] = v0; g_lb_uv[2] = u1; g_lb_uv[3] = v1;
+    int b = g_cur;
+    if (g_dn[b] < MAXD){
+        MDraw *D = &g_dbuf[b][g_dn[b]];
+        memset(D, 0, sizeof *D);
+        D->target = dst_tex; D->blit_src = src_tex; D->is_blit = 1;
+        D->blit_rect = 1; D->blit_uv[0] = u0; D->blit_uv[1] = v0; D->blit_uv[2] = u1; D->blit_uv[3] = v1;
         g_dn[b]++;
     }
     pthread_mutex_unlock(&g_qlock);
@@ -4838,7 +4938,20 @@ void metal_present(void){
     pthread_mutex_lock(&g_qlock);
     /* If the previous frame hasn't been put on screen yet, WAIT.  If we don't, the
      * guest writes over the next frame and the screen is blank at intervals
-     * (the "goes black and comes back" bug the user saw).               */
+     * (the "goes black and comes back" bug the user saw).
+     * The wait lasts until the main thread gets a drawable, i.e. up to vsync: 13 ms
+     * of a 16.7 ms frame in the menus.  It used to hold the big guest lock, so the
+     * game's other threads hardly ran; the music stream thread wrote 20-50% of what
+     * played and the menu music came in fragments (fine when minimised: no frames).
+     * The lock is given up for the wait and taken back after g_qlock is released,
+     * so the two are never waited for in opposite orders. */
+    int yielded = 0;
+    if (g_ready >= 0){
+        pthread_mutex_unlock(&g_qlock);
+        int guest_blocking_begin(void);
+        yielded = guest_blocking_begin();
+        pthread_mutex_lock(&g_qlock);
+    }
     int dropped = 0;
     if (g_ready >= 0){
         struct timespec ts, _w0; clock_gettime(CLOCK_MONOTONIC,&_w0);
@@ -4870,6 +4983,7 @@ void metal_present(void){
     }
     g_pool_fr[g_cur] = g_pool;       /* this frame's indexed draws are in this pool */
     g_gframe++;
+    g_noshow[g_cur] = g_noshow_next; g_noshow_next = 0;
     g_ready = g_cur;                 /* let the main thread draw this buffer */
     g_cur ^= 1;                      /* let the guest keep writing into the other one */
     /* see ORDERED TEXTURE UPLOADS: the uploads of a skipped (never encoded) frame must not be lost */
@@ -4892,6 +5006,86 @@ void metal_present(void){
     atomic_store(&g_frame_pending, 1);
     pthread_cond_signal(&g_rcond);      /* let the main thread take it right away */
     pthread_mutex_unlock(&g_qlock);
+    if (yielded){ void guest_blocking_end(void); guest_blocking_end(); }
+}
+
+/* ---- READING BACK A LOCKABLE RENDER TARGET -----------------------------------
+ * The magazine and DVD covers: the game makes a lockable render target
+ * (CreateRenderTarget, Lockable=1), StretchRects the middle of the screen into it
+ * and LockRects it to read the photo (0x5c2ee0, 0x5c3150), then saves the pixels.
+ * Our draws only reach the GPU when the frame is presented, so the lock used to
+ * hand back an empty buffer and every cover was saved black.  Here the frame so far
+ * is handed to the main thread as an OFF-SCREEN frame (drawn into g_flush_tid, not
+ * presented), we wait until the GPU has run it and copy the target's pixels.  The
+ * rest of the frame starts by copying that screen back, so what is shown is whole.
+ * Returns 1 when dst was filled. */
+int metal_rt_readback(unsigned mid, void *dst, unsigned pitch, unsigned w, unsigned h){
+    if (!g_dev || !g_layer || !g_vbuf[0] || !mid || mid >= MAXTEX || !g_tex[mid] || !dst) return 0;
+    if (g_tex[mid].pixelFormat != MTLPixelFormatBGRA8Unorm || g_tex[mid].storageMode != MTLStorageModeShared) return 0;
+    if (!g_flush_tid) g_flush_tid = metal_create_texture_ex(16, 16, 1, 21u, 1);
+    if (!g_flush_tid) return 0;
+    pthread_mutex_lock(&g_qlock);
+    int pending = g_dn[g_cur] > 0;
+    long my = 0;
+    if (pending){ g_noshow_next = 1; my = ++g_flush_req; }
+    /* was this target just filled from the screen?  (then copy it again below) */
+    int from_screen = (g_lb_dst == mid && g_lb_src == 0u);
+    float uv[4]; memcpy(uv, g_lb_uv, sizeof uv);
+    pthread_mutex_unlock(&g_qlock);
+    if (pending){
+        metal_present();
+        int guest_blocking_begin(void); void guest_blocking_end(void);
+        int yielded = guest_blocking_begin();
+        pthread_mutex_lock(&g_qlock);
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 2;
+        while (g_flush_done < my)
+            if (pthread_cond_timedwait(&g_qcond, &g_qlock, &ts) != 0) break;
+        int ok = g_flush_done >= my;
+        pthread_mutex_unlock(&g_qlock);
+        if (yielded) guest_blocking_end();
+        metal_blit(g_flush_tid, 0);                 /* the screen so far, back on the screen */
+        if (!ok){ fprintf(stderr, "metal: readback of texture %u timed out\n", mid); return 0; }
+        /* A copy from the screen: in the HD build the screen is only complete at
+         * the end of the frame (multisampled / composited passes), the copy made in
+         * the middle of the flushed frame read an unfinished screen.  Cut it again
+         * from the flushed frame's final image. */
+        id<MTLTexture> fs = (g_flush_tid < MAXTEX) ? g_tex[g_flush_tid] : nil;
+        if (from_screen && fs && g_pso_copy && g_blitvb){
+            MVert bq[6]; memcpy(bq, [g_blitvb contents], sizeof bq);
+            for (int q = 0; q < 6; q++){
+                float u = bq[q].t[0][0], v = bq[q].t[0][1];
+                bq[q].t[0][0] = uv[0] + u * (uv[2] - uv[0]);
+                bq[q].t[0][1] = uv[1] + v * (uv[3] - uv[1]); }
+            id<MTLCommandBuffer> cbc = [g_queue commandBuffer];
+            MTLRenderPassDescriptor *bp = [MTLRenderPassDescriptor renderPassDescriptor];
+            bp.colorAttachments[0].texture = g_tex[mid];
+            bp.colorAttachments[0].loadAction = MTLLoadActionClear;    /* opaque: alpha stays 1 */
+            bp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            bp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> be = [cbc renderCommandEncoderWithDescriptor:bp];
+            [be setRenderPipelineState:g_pso_copy];
+            [be setVertexBytes:bq length:sizeof bq atIndex:0];
+            [be setFragmentSamplerState:g_samp atIndex:0];
+            [be setFragmentTexture:fs atIndex:0];
+            { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } bf;
+              memset(&bf, 0, sizeof bf);
+              [be setFragmentBytes:&bf length:sizeof bf atIndex:0]; }
+            [be drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            [be endEncoding];
+            [cbc commit]; [cbc waitUntilCompleted];
+        }
+    } else {
+        /* nothing new this frame: let the GPU finish what was already sent */
+        id<MTLCommandBuffer> cbw = [g_queue commandBuffer]; [cbw commit]; [cbw waitUntilCompleted];
+    }
+    id<MTLTexture> t = g_tex[mid];
+    NSUInteger cw = t.width < w ? t.width : w, ch = t.height < h ? t.height : h;
+    [t getBytes:dst bytesPerRow:pitch fromRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0];
+    static int nlog = 0;
+    if (nlog < 8){ nlog++;
+        fprintf(stderr, "metal: lockable render target %u (%lux%lu) read back for the game%s\n", mid,
+                (unsigned long)cw, (unsigned long)ch, pending ? " (frame flushed off screen)" : ""); }
+    return 1;
 }
 
 long metal_frames_dropped(void){ return atomic_load(&g_frames_dropped); }
@@ -5054,6 +5248,12 @@ void metal_early_init(void){
             g_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e3];
             if (!g_pso) fprintf(stderr,"metal: pipeline could not be built: %s\n",
                                 [[e3 localizedDescription] UTF8String]);
+            /* a plain copy (no blending, RGB only) for READING BACK A LOCKABLE RENDER TARGET */
+            pd.colorAttachments[0].blendingEnabled = NO;
+            pd.colorAttachments[0].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+            g_pso_copy = [g_dev newRenderPipelineStateWithDescriptor:pd error:nil];
+            pd.colorAttachments[0].blendingEnabled = YES;
+            pd.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
 #if NFS_ENHANCED
             if (hd_msaa_n() > 1){
                 g_pso_ms_desc = [pd copy];
@@ -5383,7 +5583,7 @@ static void fb_encode_ctrl(id<MTLCommandBuffer> cb, int rb, unsigned s, unsigned
           for (int q = 1; q < 4; q++){
               unsigned tt = ts[q];
               [enc setFragmentTexture:(tt && tt < MAXTEX && g_tex[tt]) ? g_tex[tt] : g_white atIndex:(NSUInteger)q]; } }
-        { float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, 0, 0 };
+        { float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, dr->xsh, 0 };
           [enc setVertexBytes:u4 length:sizeof u4 atIndex:3]; }
         [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
         [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
@@ -5429,7 +5629,7 @@ static void fb_encode(id<MTLCommandBuffer> cb, int rb, unsigned s, unsigned e,
           for (int q = 0; q < 4; q++){
               unsigned tt = ts[q];
               [enc setFragmentTexture:(tt && tt < MAXTEX && g_tex[tt]) ? g_tex[tt] : g_white atIndex:(NSUInteger)q]; } }
-        { float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, 0, 0 };
+        { float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, dr->xsh, 0 };
           [enc setVertexBytes:u4 length:sizeof u4 atIndex:3]; }
         [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
         [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
@@ -5512,6 +5712,15 @@ static void dump_one_texture(unsigned id_, long frame){
                 for (NSUInteger q = 0; q < w*h; q++){ unsigned a = px[q*4+3]; sa += a; if (a < amin) amin = a; if (a > amax) amax = a; }
                 fprintf(stderr, "metal: texture %u (%lux%lu) RAW dump, alpha mean %.1f min %u max %u\n", id_,
                         (unsigned long)w, (unsigned long)h, sa/(double)(w*h), amin, amax);
+                /* DUMPALPHA=1: also write the alpha channel as a grey picture (frame 95000+id) */
+                if (ENVC("DUMPALPHA")){
+                    for (NSUInteger q = 0; q < w*h; q++){ uint8_t a = px[q*4+3]; px[q*4] = px[q*4+1] = px[q*4+2] = a; px[q*4+3] = 255; }
+                    MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                     width:w height:h mipmapped:NO];
+                    ad.storageMode = MTLStorageModeShared;
+                    id<MTLTexture> at = [g_dev newTextureWithDescriptor:ad];
+                    if (at){ [at replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0 withBytes:px bytesPerRow:w*4];
+                             dump_texture(at, 95000 + (long)id_); } }
                 free(px); }
             dump_texture(shd, tg);
             return;
@@ -5925,7 +6134,7 @@ static void hd_gpass(id<MTLCommandBuffer> cb, int rb, unsigned upto, unsigned zi
                            indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
                          indexBuffer:pl indexBufferOffset:dr->ix_ib instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
         } else if (dr->vsid > 0){
-            float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, 0, 0 };
+            float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, dr->xsh, 0 };
             [e setVertexBytes:u4 length:sizeof u4 atIndex:3];
             [e setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
             [e setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
@@ -6305,7 +6514,9 @@ void metal_run_main_loop(void){
                     } }
                 }
                 int have_new;
+                int noshow = 0;
                 pthread_mutex_lock(&g_qlock); have_new = (g_ready >= 0);
+                if (have_new) noshow = g_noshow[g_ready];
                 pthread_mutex_unlock(&g_qlock);
                 if (!have_new && atomic_load(&g_frame_pending)) g_skip_empty++;
                 if (have_new && atomic_exchange(&g_frame_pending, 0)){
@@ -6323,6 +6534,17 @@ void metal_run_main_loop(void){
                               od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
                               ot[k3] = [g_dev newTextureWithDescriptor:od]; }
                           dtex = ot[k3]; }
+                      else if (noshow && g_flush_tid && g_flush_tid < MAXTEX){
+                          /* an off-screen flush: the screen goes into a texture the next frame copies back */
+                          CGSize ds = g_layer.drawableSize;
+                          id<MTLTexture> ft = g_tex[g_flush_tid];
+                          if (!ft || ft.width != (NSUInteger)ds.width || ft.height != (NSUInteger)ds.height ||
+                              ft.pixelFormat != g_layer.pixelFormat){
+                              MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:g_layer.pixelFormat
+                                  width:(NSUInteger)ds.width height:(NSUInteger)ds.height mipmapped:NO];
+                              od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
+                              ft = [g_dev newTextureWithDescriptor:od]; g_tex[g_flush_tid] = ft; }
+                          dtex = ft; }
                       else { d = [g_layer nextDrawable]; dtex = d.texture;
                              if (d && fbonly_on()) dtex = fbonly_mid(d.texture); } }
                     clock_gettime(CLOCK_MONOTONIC,&_d1);
@@ -6384,7 +6606,7 @@ void metal_run_main_loop(void){
                         unsigned c_tex[4] = {~0u,~0u,~0u,~0u};
                         unsigned c_bcol = ~0u;
                         unsigned c_cull = ~0u;
-                        float c_uvb[2] = {0.f, 0.f};    /* UV difference bound in VS buffer 3 */
+                        float c_uvb[3] = {0.f, 0.f, 0.f};    /* UV difference (.xy) + HUD shift (.z) bound in VS buffer 3 */
                         unsigned c_depth = ~0u;
                         int c_zon = 0;                  /* the pass has a real Z surface */
                         int c_ms = 0;                   /* (HD) the pass is multisampled */
@@ -6396,6 +6618,7 @@ void metal_run_main_loop(void){
                         if (rb >= 0) pass_reorder(rb);  /* defer the intermediate pass splitting the scene (see PASS MERGING) */
                         /* see SCREEN REDIRECTION: screen records up to scr_b are drawn into scr_T */
                         unsigned scr_T = 0; int scr_after = 0;
+                        if (rb >= 0) hud_anchor_plan(rb);
                         long scr_b = rb >= 0 ? scr_redirect_plan(rb, dtex, &scr_T) : -1;
                         /* see POST-PROCESS CHAIN: fbrole[i] 1 = chain start, 2 = continuation */
                         static uint8_t fbrole[MAXD];
@@ -6897,7 +7120,7 @@ void metal_run_main_loop(void){
                                          * multiples of 32/64 pixels.)  copyFromTexture is
                                          * both correct and cheaper. */
                                         if (st2.width == dt2.width && st2.height == dt2.height &&
-                                            st2.pixelFormat == dt2.pixelFormat &&
+                                            st2.pixelFormat == dt2.pixelFormat && !dr->blit_rect &&
                                             !ENVC("BLITQUAD")){
                                             id<MTLBlitCommandEncoder> bc = pp_blit(cb, "blit (same-size copy)");
                                             [bc copyFromTexture:st2 sourceSlice:0 sourceLevel:0
@@ -6953,6 +7176,15 @@ void metal_run_main_loop(void){
                                         id<MTLRenderCommandEncoder> be =
                                             [cb renderCommandEncoderWithDescriptor:bp];
                                         [be setRenderPipelineState:g_pso];
+                                        if (dr->blit_rect){
+                                            /* the source rectangle only: the full-screen quad with its uv remapped */
+                                            MVert bq[6]; memcpy(bq, [g_blitvb contents], sizeof bq);
+                                            for (int q = 0; q < 6; q++){
+                                                float u = bq[q].t[0][0], v = bq[q].t[0][1];
+                                                bq[q].t[0][0] = dr->blit_uv[0] + u * (dr->blit_uv[2] - dr->blit_uv[0]);
+                                                bq[q].t[0][1] = dr->blit_uv[1] + v * (dr->blit_uv[3] - dr->blit_uv[1]); }
+                                            [be setVertexBytes:bq length:sizeof bq atIndex:0];
+                                        } else
                                         [be setVertexBuffer:g_blitvb offset:0 atIndex:0];
                                         [be setFragmentSamplerState:g_samp atIndex:0];
                                         [be setFragmentTexture:st2 atIndex:0];
@@ -7297,7 +7529,7 @@ void metal_run_main_loop(void){
                                     [enc setFragmentSamplerState:g_samp atIndex:0];
                                     { float z4[4] = {0, 0, 0, 0};          /* UV SCALE: VS buffer 3 */
                                       [enc setVertexBytes:z4 length:sizeof z4 atIndex:3];
-                                      c_uvb[0] = c_uvb[1] = 0.f; }
+                                      c_uvb[0] = c_uvb[1] = c_uvb[2] = 0.f; }
                                     /* new encoder = all state reset */
                                     c_pso = nil; c_bcol = ~0u; c_depth = ~0u; c_fp_valid = 0;
                                     c_cull = ~0u;
@@ -7439,6 +7671,10 @@ void metal_run_main_loop(void){
                                       [enc setFragmentTexture:txn atIndex:(NSUInteger)q4];
                                   } }
                                 atomic_fetch_add(&g_draw_n, 1ull);
+                                if (dr->vsid > 0 && dr->xsh != c_uvb[2]){   /* HUD ANCHORING */
+                                    float u4[4] = { dr->uvbm ? dr->uvb[0] : c_uvb[0], dr->uvbm ? dr->uvb[1] : c_uvb[1], dr->xsh, 0 };
+                                    [enc setVertexBytes:u4 length:sizeof u4 atIndex:3];
+                                    c_uvb[0] = u4[0]; c_uvb[1] = u4[1]; c_uvb[2] = dr->xsh; }
                                 if (dr->vsid > 0 && dr->ix_isz){
                                     id<MTLBuffer> pl = g_pool_fr[rb];
                                     [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
@@ -7449,7 +7685,7 @@ void metal_run_main_loop(void){
                                                  instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
                                 } else if (dr->vsid > 0){
                                     if (dr->uvbm && (dr->uvb[0] != c_uvb[0] || dr->uvb[1] != c_uvb[1])){
-                                        float u4[4] = { dr->uvb[0], dr->uvb[1], 0, 0 };
+                                        float u4[4] = { dr->uvb[0], dr->uvb[1], c_uvb[2], 0 };
                                         [enc setVertexBytes:u4 length:sizeof u4 atIndex:3];
                                         c_uvb[0] = dr->uvb[0]; c_uvb[1] = dr->uvb[1]; }
                                     [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
@@ -7584,6 +7820,14 @@ void metal_run_main_loop(void){
                         if (d && fbonly_on() && dtex != d.texture) fbonly_copy(cb, dtex, d.texture);
                         if (d) [cb presentDrawable:d];
                         [cb commit];
+                        if (noshow){
+                            /* the guest waits in metal_rt_readback until this is on the GPU */
+                            [cb waitUntilCompleted];
+                            pthread_mutex_lock(&g_qlock);
+                            g_flush_done = g_flush_req;
+                            pthread_cond_broadcast(&g_qcond);
+                            pthread_mutex_unlock(&g_qlock);
+                        }
                         long fno = atomic_fetch_add(&g_frames_drawn, 1) + 1;
                         if (g_perflog){ struct timespec _p1; clock_gettime(CLOCK_MONOTONIC, &_p1);
                             perflog_render_frame(fno, pl_nt,
@@ -7658,6 +7902,9 @@ void metal_run_main_loop(void){
           fprintf(stderr, "\n"); }
         fprintf(stderr, "metal: render targets released after Reset: %lu (used afterwards: texture %lu, target %lu)\n",
                 g_rt_freed, g_freed_use_smp, g_freed_use_tgt);
+        if (atomic_load(&g_hud_moved) || atomic_load(&g_hud_kept))
+            fprintf(stderr, "metal: HUD anchoring: %llu draws moved to the edges, %llu kept\n",
+                    atomic_load(&g_hud_moved), atomic_load(&g_hud_kept));
         fprintf(stderr, "metal: Z surface: %llu passes without Z, %llu passes size mismatch (scratch)\n",
                 (unsigned long long)g_z_null, (unsigned long long)g_z_mismatch);
         { unsigned long long tb = 0; unsigned live = 0;

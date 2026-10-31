@@ -58,7 +58,9 @@ void app_set_defaults(void){
     setdef("ALARM", "0");
     setdef("FIXMAT", "1");
     setdef("FIXMAT_MODE", "3");
-    setdef("NOMOVIES", "1");
+    /* Movies play (the game decodes VP6 itself; the first movie used to hang in the
+     * movie timer's CPU calibration, see win32_ext.c "~MHz").  NOMOVIES=1 skips them. */
+    setdef("NOMOVIES", "0");
     setdef("SNDSYNC", "1");
     setdef("GPUVS", "1");
 }

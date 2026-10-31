@@ -32,7 +32,8 @@ The game boots, reaches the menus, and races are playable with sound.
 | x86-32 → C lifter (integer, x87, MMX, SSE/SSE2, 3DNow!, string ops) | 23,278 functions, 137 MB of generated C |
 | Win32 layer (CRT startup, heap, TLS, threads, files, registry, window) | working |
 | Direct3D 9 → Metal, shader bytecode (vs/ps 1.x–2.x) → MSL | working |
-| DirectSound → CoreAudio, DirectInput (keyboard, mouse) | working |
+| DirectSound → CoreAudio, DirectInput (keyboard, mouse, game controllers) | working |
+| Videos (intro and story movies, decoded by the game itself) | working |
 | Windowed, fullscreen, Retina-native and 1080p widescreen | working |
 | Career mode: profile creation (name entry), save and load | working |
 | Double-clickable `.app` with a launcher window (`./pack.sh`) | working |
@@ -43,8 +44,8 @@ The game boots, reaches the menus, and races are playable with sound.
 - **Two builds of `SPEED2.EXE` are supported**, the European and the North
   American v1.2 ones (see [Game versions](#game-versions)); each has its own
   engine. Other builds would need their own lifting pass and address map.
-- Videos are skipped: there is no VP6 decoder.
-- Keyboard and mouse only; no gamepad or wheel support. No network play.
+- Keyboard, mouse and game controllers (Xbox / PlayStation / MFi); no wheel
+  support. No network play.
 - Structured exception handling is not implemented (`RtlUnwind` /
   `RaiseException` are stubs).
 - x87 is modelled with 64-bit doubles, not 80-bit extended precision.
@@ -56,9 +57,6 @@ The game boots, reaches the menus, and races are playable with sound.
   measured race scene.
 - Some visuals are unverified against a Windows reference (crowds / skinned
   meshes). See "Remaining graphics items" in `PROJECT.md`.
-- Under investigation: in career mode, the scene behind the post-race results
-  panel (car pulling up, crowd) can stay black; the same scene renders
-  correctly after a Quick Race drag.
 
 ## How it works
 
@@ -286,12 +284,15 @@ addresses written without `GA(...)` would be wrong in the North American engine.
 
 The app opens a small launcher window first (`launcher/`, built by `pack.sh`
 with `swiftc`): it finds and checks `SPEED2.EXE`, offers Original or HD graphics
-and full screen, opens the saves and logs folders, and **Make Copy…** builds a
+and full screen, opens the logs folder, manages saves (**Saves…**: the career
+profiles, backups, ZIP export and import; the current saves are backed up before
+an import replaces them; tests/save_manager.sh), and **Make Copy…** builds a
 portable app with the game files inside (APFS clones, seconds on the same disk),
 so nobody needs `pack.sh --embed` or a terminal for that. Untick "Show this
 window when the app opens" to go straight into the game (hold Option to get the
 window back). `NFSU2_SKIP_LAUNCHER=1` / `NFSU2_ENGINE=original|hd` do the same
-from scripts.
+from scripts. The Controller card turns the game controller on or off and sets its stick
+dead zone (`NFSU2_PAD` / `NFSU2_PAD_DEADZONE`, which still win when set by hand).
 
 ![Launcher window](screenshots/selected/launcher.png)
 
@@ -333,7 +334,7 @@ the app › Open). If macOS says the app is damaged, run once in Terminal:
 
 **Can I carry the game to another Mac in one piece?**
 Yes. In the app's window, **Make Copy…** creates "NFSU2 Portable.app" with the
-game files inside (about 1.4 GB). It runs on its own; saves stay in
+game files inside: about 1.4 GB, plus the movies (1.1 GB) and the language packs in `LANGPACKS` if the game folder has them. Untick those when saving it for a smaller copy. It runs on its own; saves stay in
 `~/Library/Application Support/NFSU2 Saves` on each Mac. It contains the game,
 so keep it for yourself.
 
@@ -352,7 +353,7 @@ Mac](#installing-from-the-pc-discs-on-a-mac).
 No. Only Apple Silicon is targeted and tested.
 
 **What does not work yet?**
-Videos are skipped, there is no gamepad or wheel support and no online play.
+There is no wheel support and no online play.
 See [Known limitations](#known-limitations).
 
 **How is this different from other NFSU2 projects?**

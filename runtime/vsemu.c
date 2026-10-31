@@ -837,7 +837,7 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
     EMIT("    device atomic_uint *atdbg [[buffer(6), function_constant(kATD)]]) {\n");
     EMIT("  float4 r[16]; for (int q=0;q<16;q++) r[q]=float4(0.0);\n");
     EMIT("  float4 t[4]; for (int q=0;q<4;q++) t[q]=float4(0.0);\n");
-    /* LOCAL PATCH: ps_2_0 texture coordinate inputs.  "dcl t0.xy" declares an
+    /* ps_2_0 texture coordinate inputs.  "dcl t0.xy" declares an
      * interpolated input and "texld r1, t0, s0" reads it, but t[] was only filled by
      * the ps_1_x forms (tex / texcoord), so in ps_2_0 every t# stayed 0 and the shader
      * sampled one texel for the whole screen.  The race intro depth-of-field blend
@@ -1470,6 +1470,8 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
      * coordinate stays a pure interpolant in the pixel shader. */
     /* UV SCALE (metal.m): K.pad1 = the oT sets to correct, UVB.xy = the difference */
     VEMIT("  for (int q = 0; q < 4; q++) if ((K.pad1 >> q) & 1u) oT[q].xy += UVB.xy;\n");
+    /* HUD ANCHORING (metal.m): UVB.z = the x shift of this HUD draw, in clip units */
+    VEMIT("  O.pos.x += UVB.z * O.pos.w;\n");
     VEMIT("  O.uv0 = oT[(K.tsel      ) & 3u]; O.uv1 = oT[(K.tsel >>  8) & 3u];\n");
     VEMIT("  O.uv2 = oT[(K.tsel >> 16) & 3u]; O.uv3 = oT[(K.tsel >> 24) & 3u];\n");
     VEMIT("  O.fog = oFog.x;\n");

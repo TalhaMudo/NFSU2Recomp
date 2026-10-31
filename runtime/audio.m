@@ -318,7 +318,18 @@ static void mix_into(int16_t *out, unsigned frames){
                 uint32_t bpf2 = b->chans * (b->bits/8u);
                 uint32_t pbyte = ((uint32_t)(b->cursor * (double)bpf2)) % b->bytes;
                 uint32_t avail = (b->wpos + b->bytes - pbyte) % b->bytes;
-                if ((double)avail / (double)b->bytes > 0.85) b->over++;   /* counter only */
+                int ov_now = (double)avail / (double)b->bytes > 0.85;
+                if (ov_now) b->over++;   /* counter only */
+                /* Log the START of each overrun (audible as a click / short gap): the
+                 * mixer time, the buffer, and how long the game had not written. */
+                { static int ov_prev[MAXSND]; static int ov_logged = 0;
+                  int bi = (int)(b - g_snd);
+                  if (bi > 0 && bi < MAXSND){
+                      if (ov_now && !ov_prev[bi] && ov_logged < 300){ ov_logged++;
+                          fprintf(stderr, "  [sound] overrun t=%.2f s buffer #%d (%u bytes, %.0f ms)\n",
+                                  audio_time(), bi, b->bytes,
+                                  1000.0 * (double)b->bytes / (double)(b->rate * b->chans * (b->bits/8u))); }
+                      ov_prev[bi] = ov_now; } }
             }
             b->trim = 1.0;
         } else
