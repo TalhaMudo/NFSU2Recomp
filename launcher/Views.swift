@@ -154,6 +154,52 @@ struct GraphicsCard: View {
     }
 }
 
+struct ModsCard: View {
+    @ObservedObject var model: LauncherModel
+    var body: some View {
+        Card("Mods") {
+            ForEach(DataMods.catalog, id: \.id) { m in ModRow(model: model, mod: m) }
+            if let s = model.modsApplying {
+                Text(s).font(.system(size: 11)).foregroundColor(Theme.accent)
+            }
+        }
+    }
+}
+
+/// One data mod: Download / Add File... until it is here, then a switch (off: the game's own files).
+struct ModRow: View {
+    @ObservedObject var model: LauncherModel
+    let mod: DataMods.Mod
+    var body: some View {
+        let have = model.modsHave.contains(mod.id), busy = model.modBusy.contains(mod.id)
+        HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(mod.name).font(.system(size: 12.5)).foregroundColor(Theme.text)
+                    Text("by \(mod.author)").font(.system(size: 11)).foregroundColor(Theme.dim)
+                }
+                Text(model.modNote[mod.id] ?? (have ? mod.summary + " Off: as in the original game."
+                                                    : mod.summary + " \(formatBytes(mod.size)) from nfsmods.xyz."))
+                    .font(.system(size: 11))
+                    .foregroundColor(model.modNote[mod.id] != nil && !busy ? Theme.warn : Theme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            if have {
+                Toggle("", isOn: Binding(get: { model.modsOn.contains(mod.id) }, set: { model.setMod(mod, $0) }))
+                    .labelsHidden().toggleStyle(SwitchToggleStyle())
+            } else {
+                Button("Download") { model.downloadMod(mod) }.buttonStyle(SecondaryButtonStyle()).disabled(busy)
+                Button("Add File…") { model.importMod(mod) }.buttonStyle(SecondaryButtonStyle()).disabled(busy)
+            }
+        }
+        .contextMenu {
+            Button("Open the Mod's Page") { model.openModPage(mod) }
+            if have { Button("Remove \(mod.name)") { model.removeMod(mod) } }
+        }
+    }
+}
+
 struct MoreCard: View {
     @ObservedObject var model: LauncherModel
     var body: some View {
@@ -253,6 +299,7 @@ struct LauncherView: View {
 
                 GameCard(model: model)
                 GraphicsCard(model: model)
+                ModsCard(model: model)
                 MoreCard(model: model)
 
                 Spacer(minLength: 0)
@@ -274,6 +321,6 @@ struct LauncherView: View {
             .padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 18)
             if let j = model.job { JobOverlay(model: model, job: j) }
         }
-        .frame(width: 560, height: 624)
+        .frame(width: 560, height: 788)
     }
 }

@@ -18,6 +18,11 @@
 //   NFSU2_LAUNCHER_TEST=portable:<game folder>:<destination.app>   build a portable copy, quit
 //   NFSU2_LAUNCHER_TEST=play     window off screen, press Play after a second (tests the
 //                                normal path: window open -> Play -> engine)
+//   NFSU2_LAUNCHER_TEST=mods:<game folder>:<id,id...>   build the data mods' files for
+//                                these mods (turned on), quit
+//   NFSU2_LAUNCHER_TEST=mods-download:<game folder>:<id>  download (checked), add, build, quit
+//   NFSU2_LAUNCHER_TEST=mods-add:<game folder>:<id>:<file>  Add File... with this file, build, quit
+//   NFSU2_MODS_STORE=<folder>    the data mods' folder (default ~/Library/Application Support/NFSU2/Mods)
 import AppKit
 import SwiftUI
 
@@ -36,6 +41,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        if let t = env["NFSU2_LAUNCHER_TEST"], t.hasPrefix("mods") {
+            let parts = t.split(separator: ":", maxSplits: 3).map(String.init)
+            guard parts.count >= 3, let exe = Locator.find(under: URL(fileURLWithPath: parts[1])) else {
+                print("bad NFSU2_LAUNCHER_TEST"); exit(2)
+            }
+            model.game = Locator.check(GameLocation(exe: exe, embedded: false))
+            let mods = DataMods.catalog.filter { parts[2].split(separator: ",").map(String.init).contains($0.id) }
+            switch parts[0] {
+            case "mods": model.modsOn = Set(mods.map { $0.id }); model.applyMods()
+            case "mods-download" where mods.count == 1: model.downloadMod(mods[0])
+            case "mods-add" where mods.count == 1 && parts.count == 4: model.addModFile(mods[0], URL(fileURLWithPath: parts[3]))
+            default: print("bad NFSU2_LAUNCHER_TEST"); exit(2)
+            }
+            return
+        }
+
         let snapshot = env["NFSU2_LAUNCHER_SNAPSHOT"]
         let option = NSEvent.modifierFlags.contains(.option)
         if snapshot == nil, model.isReady, !option,
@@ -46,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         if let s = env["NFSU2_LAUNCHER_STATE"] { fakeState(s) }
         buildMenu()
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 624),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 788),
                          styleMask: [.titled, .closable, .miniaturizable],
                          backing: .buffered, defer: false)
         w.titlebarAppearsTransparent = true
@@ -103,6 +124,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case "embedded": model.game = .ready(GameLocation(exe: exe, embedded: true))
         case "copying":
             model.job = LauncherModel.Job(phase: "Copying the game files…", done: 612_000_000, total: 1_430_000_000)
+        case "mods":
+            model.game = .ready(GameLocation(exe: exe, embedded: false))
+            if let m = DataMods.catalog.first(where: { !model.modsHave.contains($0.id) }) {
+                model.modBusy.insert(m.id)
+                model.modNote[m.id] = "Downloading… \(formatBytes(m.size / 3)) of \(formatBytes(m.size))"
+            }
         case "done":
             var j = LauncherModel.Job(phase: "", done: 1, total: 1)
             j.result = URL(fileURLWithPath: "/Applications/NFSU2 Portable.app")
