@@ -1,0 +1,7 @@
+# xpatch sites for the North American v1.2 SPEED2.EXE (sha256 f9dd86c0...).  Format: see
+# the header of tools/xpatch.py.  The European sites mapped with tools/addrmap.py and checked against
+# the disassembly: the same instructions, the code 0x10 earlier.
+# hf_tick: PrepareRealTimestep, jne over "mov eax, 1" (European 0x57a094)
+w    hf_tick        57a084 eb
+# hf_intro60: push 30.0 before call 0x576cc0 (the same address as in the European build)
+w    hf_intro60     435fa4 00007042
