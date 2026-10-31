@@ -71,6 +71,7 @@ enum Prefs {
     static let engine = "LauncherEngine"           // "original" | "hd"
     static let showAtStartup = "LauncherShowAtStartup"
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
+    static let dataMods = "LauncherDataMods"       // ids of the turned-on data mods (DataMods.swift)
 }
 
 enum Locator {

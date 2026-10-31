@@ -11,6 +11,9 @@ fi
 # NFSU2_REGION=na|eu: the game's region.  Default: detected from the data's region
 #   cars (CARS/CIVIC + RSX without CORSA + PEUGOT106 = North American, e.g. US discs).
 #   See runtime/overrides.c, region_install.
+# NFSU2_MODS=<folder>: data mods.  Changed copies of game files at their game-folder
+#   paths (TRACKS/..., GLOBAL/...), read before the game's own; the launcher's Mods card
+#   builds ~/Library/Application Support/NFSU2/Mods/Files.  See runtime/fileio.c.
 # TWO BUILDS (see link.sh):
 #   ./run.sh [mode]          original  (out/nfsu2_boot)
 #   NFSHD=1 ./run.sh [mode]  HD        (out/nfsu2_hd_boot) -- graphics improvements

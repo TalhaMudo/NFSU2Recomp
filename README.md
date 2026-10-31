@@ -105,7 +105,7 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
 | `runtime/overrides.c`, `d3dx_hle.c` | hand-written replacements for specific game functions |
 | `runtime/enhance.c` | HD build only (`-DNFS_ENHANCED=1`) |
 | `runtime/bundle.m`, `pack.sh` | `.app` behaviour and packaging |
-| `launcher/*.swift` | the app's launcher window (Swift/SwiftUI): finds and checks the game, Original/HD, portable copy |
+| `launcher/*.swift` | the app's launcher window (Swift/SwiftUI): finds and checks the game, Original/HD, portable copy, data mods |
 | `tests/boot.c` | program entry point (runs the game from its PE entry point) |
 
 ## Verification
@@ -293,6 +293,18 @@ window when the app opens" to go straight into the game (hold Option to get the
 window back). `NFSU2_SKIP_LAUNCHER=1` / `NFSU2_ENGINE=original|hd` do the same
 from scripts. The Controller card turns the game controller on or off and sets its stick
 dead zone (`NFSU2_PAD` / `NFSU2_PAD_DEADZONE`, which still win when set by hand).
+
+The **Mods** card adds a few PC mods that change the game's own data files, each
+with a switch (off by default, which is the original game): JeansBig's
+[Detailed Map](https://nfsmods.xyz/mod/4485), XoLSt94's
+[Upscaled Freeway Signs](https://nfsmods.xyz/mod/7342) and
+[Carbon 4K](https://nfsmods.xyz/mod/7401).  The mods are not part of the app:
+**Download** fetches the tested release from the mod's page on nfsmods.xyz and
+checks its SHA-256, **Add File…** takes a copy you already have.  The launcher
+applies them (`launcher/DataMods.swift`: replacement files, and the parts of
+nlgxzef's Binary scripts these mods use) into
+`~/Library/Application Support/NFSU2/Mods/Files`, which the engine reads before
+the game folder (`NFSU2_MODS`); the game folder is never changed.
 
 ![Launcher window](screenshots/selected/launcher.png)
 
