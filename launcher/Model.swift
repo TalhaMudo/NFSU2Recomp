@@ -24,6 +24,8 @@ final class LauncherModel: ObservableObject {
     @Published var controller: Bool { didSet { defaults.set(controller, forKey: Prefs.controller) } }
     @Published var stickDeadzone: Double { didSet { defaults.set(stickDeadzone, forKey: Prefs.stickDeadzone) } }
     private var setPad = false           // NFSU2_PAD / NFSU2_PAD_DEADZONE were set by us
+    /// PictureOptions.all[i] -> chosen index (0 = the original game).
+    @Published var picture: [Int] { didSet { savePicture() } }
     @Published var job: Job? = nil
     @Published var notice: String? = nil
 
@@ -56,6 +58,12 @@ final class LauncherModel: ObservableObject {
         wideHUD = defaults.bool(forKey: Prefs.wideHUD)
         controller = defaults.bool(forKey: Prefs.controller)
         stickDeadzone = min(0.5, max(0, defaults.double(forKey: Prefs.stickDeadzone)))
+        let d = UserDefaults.standard
+        picture = PictureOptions.all.map { o in min(max(d.integer(forKey: o.key), 0), o.choices.count - 1) }
+    }
+
+    private func savePicture() {
+        for (o, i) in zip(PictureOptions.all, picture) { defaults.set(i, forKey: o.key) }
     }
 
     var location: GameLocation? {
@@ -129,6 +137,10 @@ final class LauncherModel: ObservableObject {
             setenv("NFSU2_PAD", controller ? "1" : "0", 1)
             setenv("NFSU2_PAD_DEADZONE", String(format: "%.2f", stickDeadzone), 1)
             setPad = true
+        }
+        // Picture options: a variable set by hand still wins (overwrite 0).
+        for (o, i) in zip(PictureOptions.all, picture) where i > 0 {
+            setenv(o.env, o.choices[i].value, 0)
         }
         var e = engine
         if !hasEngine(e) { e = (e == .hd) ? .original : .hd }

@@ -3831,9 +3831,15 @@ int com_call(CPU *c, uint32_t magic){
                 if (is_cube2)
                     metal_upload_texture_face(mid, level, (face2 < 6u) ? face2 : 0u, g_mem+buf,
                                               metal_level_pitch(w,level,fmt), w, h, fmt);
-                else
-                    metal_upload_texture(mid, level, g_mem+buf,
-                                         metal_level_pitch(w,level,fmt), w, h, fmt);
+                else {
+                    /* visual.c: NOTINT rewrites the screen filter's colour ramp on the way */
+                    const void *visual_tex_upload(uint32_t, const void *, uint32_t, uint32_t, uint32_t, uint32_t, void *, uint32_t);
+                    static uint8_t vtmp[1024];
+                    uint32_t pitch = metal_level_pitch(w,level,fmt);
+                    const void *src = level ? (const void *)(g_mem+buf)
+                                            : visual_tex_upload(self, g_mem+buf, w, h, fmt, pitch, vtmp, sizeof vtmp);
+                    metal_upload_texture(mid, level, src, pitch, w, h, fmt);
+                }
             }
             if (ENVC("LOCKLOG") && w==640 && h==480){
                 static int nl=0;
@@ -4653,6 +4659,8 @@ void draw_stats_save(uint64_t *a, uint64_t *b){ g_ptype=a; g_stride=b; }
 void com_report(void){
     fprintf(stderr,"\n=== COM / D3D9 KATMANI ===\n");
     { void ws_report(void); ws_report(); }   /* wsfov.c */
+    { void visual_report(void); visual_report(); }   /* visual.c */
+    { void pic_report(void); pic_report(); }         /* picture.m */
     { void gamepad_report(void); gamepad_report(); }   /* gamepad.m */
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
