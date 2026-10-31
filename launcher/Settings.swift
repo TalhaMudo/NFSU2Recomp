@@ -151,14 +151,22 @@ struct MoreSettings: View {
 
 // MARK: window
 
+/// The selected tab.  An ObservableObject rather than @State: with the command line
+/// tools' Swift 6.4 compiler @State is a macro whose plugin isn't there (pack.sh).
+final class SettingsSelection: ObservableObject {
+    @Published var tab: SettingsTab
+    init(_ tab: SettingsTab) { self.tab = tab }
+}
+
 struct SettingsView: View {
     static let size = CGSize(width: 560, height: 470)
     @ObservedObject var model: LauncherModel
-    @State private var tab: SettingsTab
+    @ObservedObject private var selection: SettingsSelection
+    private var tab: SettingsTab { selection.tab }
 
     init(model: LauncherModel, tab: SettingsTab = SettingsTab.shown[0]) {
         self.model = model
-        _tab = State(initialValue: tab)
+        self.selection = SettingsSelection(tab)
     }
 
     @ViewBuilder private var page: some View {
@@ -173,7 +181,7 @@ struct SettingsView: View {
     private var tabBar: some View {
         HStack(spacing: 4) {
             ForEach(SettingsTab.shown, id: \.self) { t in
-                Button(action: { tab = t }) {
+                Button(action: { selection.tab = t }) {
                     VStack(spacing: 3) {
                         Image(systemName: t.icon).font(.system(size: 17))
                             .frame(height: 22)
