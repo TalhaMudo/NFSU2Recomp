@@ -5,7 +5,8 @@ sys.path.insert(0,'tools')
 import pefile
 from capstone import *
 from capstone.x86 import *
-from lift import Lifter, Unsupported
+from lift import Lifter, Unsupported, XPatchError
+import xpatch
 
 EXE = sys.argv[1]
 NSHARD = int(sys.argv[2]) if len(sys.argv)>2 else 128
@@ -99,6 +100,7 @@ def _init(inl=None):
     cov   = os.environ.get('COVERAGE','') == '1'
     _L = Lifter(EXE, comments=os.environ.get('COMMENTS','') == '1', trap=True, hooks=hooks, watch=watch)
     _L.cov = cov
+    _L.xp = xpatch.load(os.environ.get('XPATCH'))   # LOCAL PATCH: run-time switchable patches
 
 def _inlprobe(a):
     """leaf + small + not overridden -> (address, code) or (address, None)"""
@@ -121,6 +123,8 @@ def _shard(args):
         L.traps=0; L.truncated=0
         try:
             code,tg = L.lift(a)
+        except XPatchError:
+            raise
         except Exception as e:
             fb = f"void sub_{a:08x}(CPU *c){{ unsupported_insn(c,0x{a:x}u,\"lift-error\"); POP32(c->eip); }}"
             parts.append(_memarg(fb) if MEMARG else fb)
@@ -148,7 +152,7 @@ def _shard(args):
                     f"static inline __attribute__((always_inline)) void inl_{x:08x}(CPU *restrict c) {{") + "\n")
         f.write("\n".join(parts))
         f.write("\n")
-    return idx, defined, sorted(refs), traps, trunc, dict(kinds), os.path.getsize(path)
+    return idx, defined, sorted(refs), traps, trunc, dict(kinds), os.path.getsize(path), sorted(L.xp_hits)
 
 if __name__=='__main__':
     t0=time.time()
@@ -171,8 +175,9 @@ if __name__=='__main__':
         print(f"  [inline: {len(inl)} leaf functions <= {INLINE_MAX} instructions]  ({time.time()-t1:.0f}s)")
     defined=set(); refs=set(); traps=0; trunc=0; kinds=collections.Counter(); bytes_=0
     with mp.Pool(mp.cpu_count(), initializer=_init, initargs=(inl,)) as pool:
-        for n,(idx,d,r,tp,tr,kk,sz) in enumerate(pool.imap_unordered(_shard, chunks)):
-            defined |= set(d); refs |= set(r); traps+=tp; trunc+=tr
+        xhits=set()
+        for n,(idx,d,r,tp,tr,kk,sz,xh) in enumerate(pool.imap_unordered(_shard, chunks)):
+            defined |= set(d); refs |= set(r); traps+=tp; trunc+=tr; xhits |= set(xh)
             kinds.update(kk); bytes_+=sz
             if (n+1)%16==0: print(f"  {n+1}/{NSHARD} shard  ({time.time()-t1:.0f}s)")
     print(f"  generation done ({time.time()-t1:.0f}s)")
@@ -186,10 +191,21 @@ if __name__=='__main__':
         while True:
             more = sorted(a for a in refs - defined if _L.in_text(a))
             if not more: break
-            idx, d, r, tp, tr, kk, sz = _shard((extra, more))
+            idx, d, r, tp, tr, kk, sz, xh = _shard((extra, more)); xhits |= set(xh)
             print(f"  [lift-missing] shard_{extra:04d}: {', '.join(hex(a) for a in more)}")
             defined |= set(d); refs |= set(r); traps += tp; trunc += tr; kinds.update(kk); bytes_ += sz
             extra += 1
+    # LOCAL PATCH: xpatch header + a check that every site was found in some function
+    spec = xpatch.load(os.environ.get('XPATCH'))
+    with open(f"{OUT}/xpatch.h",'w') as f:
+        f.write(spec.header() if spec else "#pragma once\n#define XP_COUNT 0\n#define XPV_COUNT 0\n"
+                "static const char *const xp_names[] = { 0 };\nstatic const char *const xpv_names[] = { 0 };\n")
+    if spec:
+        hit_names = {n for n, a in xhits}
+        lost = [n for n in spec.names if n not in hit_names]
+        print(f"  [xpatch: {len(spec.names)} switches, {len(xhits)} sites lifted]")
+        for n, a in sorted(xhits, key=lambda t: t[1]): print(f"    {a:#x}  {n}")
+        if lost: raise SystemExit(f"xpatch: no site found for {lost}")
     missing = sorted(refs - defined)
     print(f"\n  defined: {len(defined)}   referenced: {len(refs)}   MISSING: {len(missing)}")
     if missing or (MEMARG and OVERRIDES):
@@ -207,6 +223,7 @@ if __name__=='__main__':
         f.write("#ifndef DECLS_H\n#define DECLS_H\n#include \"cpu.h\"\n")
         f.write("void dispatch_indirect(CPU*,uint32_t);\nvoid unsupported_insn(CPU*,uint32_t,const char*);\n")
         f.write("void cpuid_shim(CPU*);\nuint64_t rdtsc_shim(void);\n")
+        f.write("extern unsigned char g_xpatch[];\nextern unsigned int g_xpval[];\n")   # LOCAL PATCH: xpatch
         for a in allf: f.write(f"void sub_{a:08x}(CPU*);\n")
         for a in sorted(OVERRIDES): f.write(f"void sub_{a:08x}_orig(CPU*);\n")
         if MEMARG:
