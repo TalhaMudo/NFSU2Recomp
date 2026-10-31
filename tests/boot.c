@@ -152,6 +152,7 @@ int main(int argc,char**argv){
     dispatch_init(); win32_init();
     { extern void overrides_install(void); overrides_install(); }
     { extern void gamepad_install(void); gamepad_install(); }   /* runtime/gamepad.m */
+    { extern void xtinput_install(void); xtinput_install(); }   /* runtime/xtinput.c */
     if (getenv("BT")) g_bt_on = 1;
     g_report_fn = all_reports;
     com_set_trace(getenv("COMTRACE")?1:0);

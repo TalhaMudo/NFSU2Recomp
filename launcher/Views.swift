@@ -154,6 +154,27 @@ struct GraphicsCard: View {
     }
 }
 
+struct ControllerCard: View {
+    @ObservedObject var model: LauncherModel
+    var body: some View {
+        Card("Controller") {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("XtendedInput layout").font(.system(size: 12.5)).foregroundColor(Theme.text)
+                    Text(model.canUseXtendedInput
+                         ? "RT accelerates, LT brakes, buttons as in the NFSU-XtendedInput mod; its scripts/NFSU_XtendedInput.ini in the game folder is used if there is one."
+                         : "Needs the North American v1.2 SPEED2.EXE.")
+                        .font(.system(size: 11)).foregroundColor(Theme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Toggle("", isOn: $model.xtendedInput).labelsHidden().toggleStyle(SwitchToggleStyle())
+                    .disabled(!model.canUseXtendedInput)
+            }
+        }
+    }
+}
+
 struct MoreCard: View {
     @ObservedObject var model: LauncherModel
     var body: some View {
@@ -253,6 +274,7 @@ struct LauncherView: View {
 
                 GameCard(model: model)
                 GraphicsCard(model: model)
+                ControllerCard(model: model)
                 MoreCard(model: model)
 
                 Spacer(minLength: 0)
@@ -274,6 +296,6 @@ struct LauncherView: View {
             .padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 18)
             if let j = model.job { JobOverlay(model: model, job: j) }
         }
-        .frame(width: 560, height: 624)
+        .frame(width: 560, height: 770)
     }
 }

@@ -353,6 +353,16 @@ No. Only Apple Silicon is targeted and tested.
 There is no wheel support and no online play.
 See [Known limitations](#known-limitations).
 
+**Can the controller work like it does with the XtendedInput mod on Windows?**
+Yes, with the North American v1.2 executable: switch on **XtendedInput layout**
+in the app's window. The triggers are then separate analog throttle (RT) and
+brake (LT), and every button, in races and in the menus, does what it does with
+[NFSU-XtendedInput](https://github.com/xan1242/NFSU-XtendedInput)
+(`runtime/xtinput.c` is a port of its NFSU2 code, MIT licence). The game
+folder's `scripts/NFSU_XtendedInput.ini` is used if there is one, as in a Windows
+install with the mod; otherwise the mod's stock settings. Without the switch the
+pad is a DirectInput gamepad, bound in the game's own controller options.
+
 **How is this different from other NFSU2 projects?**
 
 | Project | Approach | Platforms |

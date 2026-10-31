@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <os/lock.h>
 
 int  gamepad_present(void);
 void gamepad_fill(unsigned char *dst);
@@ -57,11 +58,65 @@ static GCController *pick(void){
     return nil;
 }
 
+/* XInput snapshot for gamepad_xinput_state.  The controller's value-changed handler
+ * fills it on a queue of its own and the game thread only copies it: GameController
+ * calls made from the game thread (+controllers in particular) wait for the main
+ * thread, which is busy presenting frames, and stalled the game and its audio. */
+typedef struct { uint16_t buttons; uint8_t trig[2]; int16_t sticks[4]; int connected; } XSnap;
+static os_unfair_lock    g_xs_lock = OS_UNFAIR_LOCK_INIT;
+static XSnap             g_xs;
+static GCController     *g_xs_ctl = nil;          /* main thread only */
+static dispatch_queue_t  g_xs_queue;
+
+static void xs_snapshot(GCExtendedGamepad *g){
+    static const uint16_t xbit[14] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200,
+        0x0020, 0x0010, 0x0040, 0x0080, 0x0001, 0x0002, 0x0004, 0x0008 };
+    #define S16(v) ((int16_t)lroundf(fmaxf(-1.f, fminf(1.f, (v))) * 32767.f))
+    #define U8(v)  ((uint8_t)lroundf(fmaxf(0.f, fminf(1.f, (v))) * 255.f))
+    XSnap s = { 0 };
+    s.connected = 1;
+    s.sticks[0] = S16(g.leftThumbstick.xAxis.value);   s.sticks[1] = S16(g.leftThumbstick.yAxis.value);
+    s.sticks[2] = S16(g.rightThumbstick.xAxis.value);  s.sticks[3] = S16(g.rightThumbstick.yAxis.value);
+    s.trig[0] = U8(g.leftTrigger.value);  s.trig[1] = U8(g.rightTrigger.value);
+    GCControllerButtonInput *bs[14] = { g.buttonA, g.buttonB, g.buttonX, g.buttonY,
+        g.leftShoulder, g.rightShoulder, g.buttonOptions, g.buttonMenu,
+        g.leftThumbstickButton, g.rightThumbstickButton,
+        g.dpad.up, g.dpad.down, g.dpad.left, g.dpad.right };
+    for (int i = 0; i < 14; i++) if (bs[i] && bs[i].pressed) s.buttons |= xbit[i];
+    #undef S16
+    #undef U8
+    os_unfair_lock_lock(&g_xs_lock); g_xs = s; os_unfair_lock_unlock(&g_xs_lock);
+}
+
+static void xs_attach(GCController *c){              /* main thread */
+    GCExtendedGamepad *g = c.extendedGamepad;
+    if (!g || g_xs_ctl) return;
+    g_xs_ctl = c;
+    { const char *n = c.vendorName.UTF8String; if (n && *n) snprintf(g_name, sizeof g_name, "%s", n); }
+    g_seen = 1;
+    c.handlerQueue = g_xs_queue;
+    g.valueChangedHandler = ^(GCExtendedGamepad *gp, GCControllerElement *el){ (void)el; xs_snapshot(gp); };
+    dispatch_async(g_xs_queue, ^{ xs_snapshot(g); });
+    fprintf(stderr, "[pad] reading %s (%s) for XtendedInput controls\n",
+            c.vendorName.UTF8String ?: "controller", c.productCategory.UTF8String ?: "?");
+}
+
+static void xs_detach(GCController *c){              /* main thread */
+    if (c != g_xs_ctl) return;
+    c.extendedGamepad.valueChangedHandler = nil;
+    g_xs_ctl = nil;
+    dispatch_async(g_xs_queue, ^{                    /* after any snapshot still queued */
+        os_unfair_lock_lock(&g_xs_lock); memset(&g_xs, 0, sizeof g_xs); os_unfair_lock_unlock(&g_xs_lock);
+    });
+    for (GCController *o in [GCController controllers]) if (o != c && o.extendedGamepad){ xs_attach(o); break; }
+}
+
 void gamepad_install(void){
     const char *e = getenv("NFSU2_PAD");
     if (e && !strcmp(e, "0")){ g_pad_off = 1; return; }
     if ((e = getenv("NFSU2_PAD_DEADZONE"))) g_dead = (float)atof(e);
     if ((e = getenv("NFSU2_PAD_FAKE"))){ g_fake = 1; parse_fake(e); snprintf(g_name, sizeof g_name, "Fake Pad"); }
+    g_xs_queue = dispatch_queue_create("nfsu2.pad", DISPATCH_QUEUE_SERIAL);
     @autoreleasepool {
         if (@available(macOS 11.3, *))
             GCController.shouldMonitorBackgroundEvents = YES;
@@ -70,12 +125,16 @@ void gamepad_install(void){
             usingBlock:^(NSNotification *n){
                 GCController *c = n.object;
                 fprintf(stderr, "[pad] connected: %s\n", c.vendorName.UTF8String ?: "controller");
+                xs_attach(c);
             }];
         [[NSNotificationCenter defaultCenter]
             addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil
             usingBlock:^(NSNotification *n){
                 fprintf(stderr, "[pad] disconnected\n");
+                xs_detach(n.object);
             }];
+        dispatch_async(dispatch_get_main_queue(), ^{   /* pads connected before the start */
+            GCController *c = pick(); if (c) xs_attach(c); });
     }
 }
 
@@ -150,9 +209,46 @@ void gamepad_fill(unsigned char *dst){
     for (int i = 0; i < 10; i++) if (bs[i] && bs[i].pressed){ btn[i] = 0x80; g_pressed++; }
 }
 
+/* XInput view of the pad for runtime/xtinput.c (XINPUT_GAMEPAD: wButtons bits, triggers
+ * 0..255, sticks -32768..32767 with up = positive).  No dead zone: the caller applies its
+ * own.  Returns 0 (and a neutral state) when no pad is connected.  Only copies the
+ * snapshot above, so it never waits on GameController.
+ * NFSU2_PAD_FAKE maps X/Y -> left stick, RX/RY -> right stick (DirectInput sense,
+ * forward = negative), Z -> LT, RZ -> RT, B0..B9 -> A B X Y LB RB Back Start LS RS,
+ * POV -> d-pad. */
+int gamepad_xinput_state(uint16_t *buttons, uint8_t trig[2], int16_t sticks[4]){
+    *buttons = 0; trig[0] = trig[1] = 0;
+    for (int i = 0; i < 4; i++) sticks[i] = 0;
+    if (g_pad_off) return 0;
+    static const uint16_t xbit[10] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200,
+                                       0x0020, 0x0010, 0x0040, 0x0080 };
+    #define S16(v) ((int16_t)lroundf(fmaxf(-1.f, fminf(1.f, (v))) * 32767.f))
+    #define U8(v)  ((uint8_t)lroundf(fmaxf(0.f, fminf(1.f, (v))) * 255.f))
+    if (g_fake){
+        sticks[0] = S16(g_fake_ax[0]);  sticks[1] = S16(-g_fake_ax[1]);
+        sticks[2] = S16(g_fake_ax[3]);  sticks[3] = S16(-g_fake_ax[4]);
+        trig[0] = U8(fabsf(g_fake_ax[2]));  trig[1] = U8(fabsf(g_fake_ax[5]));
+        for (int i = 0; i < 10; i++) if (g_fake_btn[i]) *buttons |= xbit[i];
+        switch (g_fake_pov){                     /* d-pad: up 1, down 2, left 4, right 8 */
+        case 0: *buttons |= 1; break;      case 4500: *buttons |= 1|8; break;
+        case 9000: *buttons |= 8; break;   case 13500: *buttons |= 2|8; break;
+        case 18000: *buttons |= 2; break;  case 22500: *buttons |= 2|4; break;
+        case 27000: *buttons |= 4; break;  case 31500: *buttons |= 1|4; break;
+        default: break; }
+        return 1;
+    }
+    #undef S16
+    #undef U8
+    os_unfair_lock_lock(&g_xs_lock); XSnap s = g_xs; os_unfair_lock_unlock(&g_xs_lock);
+    g_polls++;
+    *buttons = s.buttons; trig[0] = s.trig[0]; trig[1] = s.trig[1];
+    for (int i = 0; i < 4; i++) sticks[i] = s.sticks[i];
+    return s.connected;
+}
+
 void gamepad_report(void){
     if (g_pad_off) return;
     fprintf(stderr, "[pad] %s: %s, %llu state polls, %llu button-presses seen\n",
-            g_fake ? "fake" : "GameController", g_ctl || g_fake ? g_name : "no controller",
+            g_fake ? "fake" : "GameController", g_ctl || g_fake || g_seen ? g_name : "no controller",
             g_polls, g_pressed);
 }
