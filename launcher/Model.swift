@@ -21,6 +21,10 @@ final class LauncherModel: ObservableObject {
     @Published var showAtStartup: Bool { didSet { defaults.set(showAtStartup, forKey: Prefs.showAtStartup) } }
     @Published var wideHUD: Bool { didSet { defaults.set(wideHUD, forKey: Prefs.wideHUD) } }
     private var setHUDPOS = false        // HUDPOS was set by us (not by the caller)
+    /// Frames a second (the game's own is 120); passed as NFSU2_FPS.
+    @Published var frameRate: Int { didSet { defaults.set(frameRate, forKey: Prefs.frameRate) } }
+    @Published var fpsCounter: Bool { didSet { defaults.set(fpsCounter, forKey: Prefs.fpsCounter) } }
+    private var setFPS = false           // NFSU2_FPS / NFSU2_FPSCOUNTER were set by us
     @Published var controller: Bool { didSet { defaults.set(controller, forKey: Prefs.controller) } }
     @Published var stickDeadzone: Double { didSet { defaults.set(stickDeadzone, forKey: Prefs.stickDeadzone) } }
     private var setPad = false           // NFSU2_PAD / NFSU2_PAD_DEADZONE were set by us
@@ -54,6 +58,9 @@ final class LauncherModel: ObservableObject {
         fullscreen = defaults.bool(forKey: Prefs.fullscreen)
         showAtStartup = defaults.bool(forKey: Prefs.showAtStartup)
         wideHUD = defaults.bool(forKey: Prefs.wideHUD)
+        let fr = defaults.integer(forKey: Prefs.frameRate)
+        frameRate = [30, 60, 120, 240].contains(fr) ? fr : 120
+        fpsCounter = defaults.bool(forKey: Prefs.fpsCounter)
         controller = defaults.bool(forKey: Prefs.controller)
         stickDeadzone = min(0.5, max(0, defaults.double(forKey: Prefs.stickDeadzone)))
     }
@@ -122,6 +129,12 @@ final class LauncherModel: ObservableObject {
         if setHUDPOS || env["HUDPOS"] == nil {
             if wideHUD { setenv("HUDPOS", "1", 1); setHUDPOS = true }
             else if setHUDPOS { unsetenv("HUDPOS"); setHUDPOS = false }
+        }
+        // Frame rate and counter (engine: overrides.c, metal.m); values set by hand win.
+        if setFPS || (env["NFSU2_FPS"] == nil && env["NFSU2_FPSCOUNTER"] == nil) {
+            if frameRate == 120 { unsetenv("NFSU2_FPS") } else { setenv("NFSU2_FPS", String(frameRate), 1) }
+            setenv("NFSU2_FPSCOUNTER", fpsCounter ? "1" : "0", 1)
+            setFPS = true
         }
         // Controller settings; NFSU2_PAD / NFSU2_PAD_DEADZONE set by hand still win.  Ours
         // are overwritten on every Play, so a change takes effect without restarting.

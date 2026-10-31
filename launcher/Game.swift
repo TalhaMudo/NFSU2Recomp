@@ -71,6 +71,8 @@ enum Prefs {
     static let engine = "LauncherEngine"           // "original" | "hd"
     static let showAtStartup = "LauncherShowAtStartup"
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
+    static let frameRate = "LauncherFrameRate"      // 30 | 60 | 120 | 240 -> NFSU2_FPS
+    static let fpsCounter = "LauncherFPSCounter"    // -> NFSU2_FPSCOUNTER
 
     /// Each game option with its value in the original, unmodified game: Settings ›
     /// Restore Original Game sets them all.  A new option adds its line here.  (The
@@ -78,6 +80,8 @@ enum Prefs {
     static let originalGame: [OriginalValue] = [
         OriginalValue(\.engine, .original),
         OriginalValue(\.wideHUD, false),
+        OriginalValue(\.frameRate, 120),
+        OriginalValue(\.fpsCounter, false),
     ]
 }
 

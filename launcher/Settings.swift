@@ -102,6 +102,18 @@ struct GraphicsSettings: View {
                            description: "On wide screens the minimap moves to the left and the gauges to the right. Off: the HUD stays in the 4:3 middle.",
                            isOn: $model.wideHUD)
             }
+            Card("Frame rate") {
+                SettingRow(title: "Frames a second",
+                           description: "The game's own limit is 120. 60 uses less power and suits 60 Hz screens; the screen's refresh rate is the upper limit. The game runs at the same speed either way.") {
+                    Picker("", selection: $model.frameRate) {
+                        Text("30").tag(30); Text("60").tag(60); Text("120").tag(120); Text("240").tag(240)
+                    }
+                    .pickerStyle(SegmentedPickerStyle()).labelsHidden().fixedSize()
+                }
+                SettingRow(title: "Show the frame rate",
+                           description: "Frames a second in the top left corner while playing.",
+                           isOn: $model.fpsCounter)
+            }
         }
     }
 }
