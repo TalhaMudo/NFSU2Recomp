@@ -90,12 +90,19 @@ _OPAQUE = ('call','ret','retf','int','int3','iret','iretd',
 # those flags as dead above and skip the real computation -> a stale value.
 # Only the fcomi/fucomi family really writes EFLAGS (the FCOMI macro all 6).
 _FCOMI = ('fcomi','fcomip','fucomi','fucomip')
+# fcmovCC is the one x87 instruction that READS EFLAGS: ST(0) = ST(i) when the
+# condition (the jcc of the same name) holds.  Its flags must count as used.
+_X87_CMOV = {'fcmovb':'b', 'fcmovnb':'ae', 'fcmove':'e', 'fcmovne':'ne',
+             'fcmovbe':'be', 'fcmovnbe':'a', 'fcmovu':'p', 'fcmovnu':'np'}
+_CC_READS = {'b':F_CF, 'ae':F_CF, 'e':F_ZF, 'ne':F_ZF, 'be':F_CF|F_ZF, 'a':F_CF|F_ZF,
+             'p':F_PF, 'np':F_PF}
 
 def _flag_defuse(i):
     if i.mnemonic in _OPAQUE:
         return 0, F_ALL
     base = i.mnemonic.split()[-1]          # "repe cmpsb" -> "cmpsb"
     if base[:1] == 'f' or X86_GRP_FPU in i.groups:
+        if base in _X87_CMOV: return 0, _CC_READS[_X87_CMOV[base]]
         return (F_ALL, 0) if base in _FCOMI else (0, 0)
     ef = getattr(i, 'eflags', 0) or 0
     d = u = 0
@@ -684,6 +691,12 @@ class Lifter:
         if m=='fsqrt':  return ["{ double _a=ST(0); ST(0)=x87_r1(_a, sqrt(_a)); }"]
         if m=='fsin':   return ["ST(0) = sin(ST(0));"]
         if m=='fcos':   return ["ST(0) = cos(ST(0));"]
+        # fsincos: x in ST(0) -> ST(1) = sin x, ST(0) = cos x (the D3DX rotation helpers)
+        if m=='fsincos': return ["FPUSH(ST(0));", "ST(1) = sin(ST(1));", "ST(0) = cos(ST(0));"]
+        if m=='fxam':    return ["X87_EXAMINE(ST(0));"]
+        if m in _X87_CMOV:
+            src = sti(len(o)-1) if o and is_st(len(o)-1) else 1
+            return [f"if ({CC[_X87_CMOV[m]]}) ST(0) = ST({src});"]
         if m=='fptan':  return ["ST(0) = tan(ST(0));","FPUSH(1.0);"]
         if m=='fpatan': return ["ST(1) = atan2(ST(1), ST(0));","FPOP();"]
         if m=='fyl2x':  return ["ST(1) = ST(1) * log2(ST(0));","FPOP();"]
@@ -818,6 +831,8 @@ class Lifter:
         if m=='bswap': return [W(0,f"__builtin_bswap32({E(0)})")]
         if m=='sahf':  return ["{ uint32_t _f=(c->eax>>8)&0xffu; c->cf=_f&1; c->pf=(_f>>2)&1; c->af=(_f>>4)&1; c->zf=(_f>>6)&1; c->sf=(_f>>7)&1; }"]
         if m=='lahf':  return ["c->eax = (c->eax & 0xffff00ffu) | ((c->sf<<7|c->zf<<6|c->af<<4|c->pf<<2|2u|c->cf)<<8);"]
+        if m in ('xlatb','xlat'):    # AL = the byte at EBX + AL (a table lookup)
+            return ["{ uint32_t _t = c->ebx + (c->eax & 0xffu); c->eax = (c->eax & 0xffffff00u) | MR8(_t); }"]
         if m=='cpuid': return ["cpuid_shim(c);"]
         if m=='rdtsc': return ["{ uint64_t _t=rdtsc_shim(); c->eax=(uint32_t)_t; c->edx=(uint32_t)(_t>>32); }"]
         if m in ('clc',): return ["c->cf=0;"]
@@ -870,6 +885,9 @@ class Lifter:
         def is_mem(k): return o[k].type==X86_OP_MEM
 
         if m=='emms': return ["/* emms */"]
+        # MXCSR is kept (c->mxcsr) but not applied: SSE arithmetic rounds to nearest
+        if m=='stmxcsr': return [f"MR32{self.ea(o[0].mem)} = c->mxcsr;"]
+        if m=='ldmxcsr': return [f"c->mxcsr = MR32{self.ea(o[0].mem)};"]
         if m in ('movq','movd'):
             w = 8 if m=='movq' else 4
             T = 'uint64_t' if w==8 else 'uint32_t'

@@ -175,7 +175,7 @@ int main(int argc,char**argv){
     { extern CPU *g_cur_cpu; g_cur_cpu = &cpu; }
     memset(&cpu,0,sizeof cpu);
     cpu.esp = STACK_HI - 0x1000u;
-    cpu.top = 0; cpu.fcw = 0x037f;
+    cpu.top = 0; cpu.fcw = 0x037f; cpu.mxcsr = 0x1F80u;
     cpu.fs_base = TEB_BASE;
     cpu.gs_base = TEB_BASE;
 
