@@ -46,6 +46,7 @@ typedef struct CPU {
     /* MMX (not shared with x87, kept separately) */
     uint64_t mm[8];
     /* SSE */
+    uint32_t mxcsr;      /* SSE control/status: only stored and read back (ldmxcsr/stmxcsr) */
     union { uint8_t b[16]; float f[4]; double d[2]; uint32_t u32[4]; uint64_t u64[2]; } xmm[8];
 } CPU;
 
@@ -150,6 +151,21 @@ static inline uint32_t parity8(uint32_t v){ v&=0xff; v^=v>>4; v^=v>>2; v^=v>>1; 
 #define FSW_C1 (1u<<9)
 #define FSW_C2 (1u<<10)
 #define FSW_C3 (1u<<14)
+/* FXAM: the class of v in C3/C2/C0, its sign in C1.  The x87 registers carry no
+ * tags here, so "empty" (C3+C0) is never answered; a value counts as denormal
+ * by the double's range. */
+static inline uint16_t x87_class_bits(double v){
+    uint16_t k;
+    switch (fpclassify(v)){
+    case FP_NAN:       k = FSW_C0;          break;
+    case FP_INFINITE:  k = FSW_C2 | FSW_C0; break;
+    case FP_ZERO:      k = FSW_C3;          break;
+    case FP_SUBNORMAL: k = FSW_C3 | FSW_C2; break;
+    default:           k = FSW_C2;          break;
+    }
+    return signbit(v) ? (uint16_t)(k | FSW_C1) : k;
+}
+#define X87_EXAMINE(v) (c->fsw = (uint16_t)((c->fsw & (uint16_t)~(FSW_C0|FSW_C1|FSW_C2|FSW_C3)) | x87_class_bits(v)))
 /* fnstsw: on real hardware the TOP field (bits 11-13) is read too. */
 static inline uint16_t fsw_get(const struct CPU *c){
     return (uint16_t)((c->fsw & (uint16_t)~0x3800u) | (uint16_t)((c->top & 7u) << 11));
@@ -263,11 +279,29 @@ static inline double x87_round(uint16_t fcw, double v){
  * NaN, it must be fixed separately.  If one of the inputs is a NaN, that one
  * propagates.                                                            */
 #define X87_INDEF (-__builtin_nan(""))
-static inline double x87_r2(double a, double b, double r){
-    if (r == r) return r;
-    if (a != a) return a;
-    if (b != b) return b;
+/* A NaN operand of an x87 operation (Intel SDM vol. 1, table 4-7): the result is
+ * that NaN made quiet.  With two NaNs, a quiet one beats a signaling one, and of
+ * two of the same kind the larger significand wins (a, the destination, on a tie).
+ * ARM simply takes the first operand, so a two-NaN result differed from Windows.
+ * Out of line: the NaN path is cold and x87_r2 is inlined at every operation. */
+static inline double x87_quiet(double v){
+    uint64_t u; memcpy(&u, &v, 8); u |= 1ull << 51; memcpy(&v, &u, 8); return v;
+}
+static __attribute__((noinline, cold, unused)) double x87_nan2(double a, double b){
+    if (a != a && b != b){
+        uint64_t ua, ub; memcpy(&ua, &a, 8); memcpy(&ub, &b, 8);
+        unsigned qa = (unsigned)(ua >> 51) & 1u, qb = (unsigned)(ub >> 51) & 1u;
+        if (qa != qb) return qa ? a : b;
+        uint64_t sa = ua & 0x0007FFFFFFFFFFFFull, sb = ub & 0x0007FFFFFFFFFFFFull;
+        return x87_quiet(sb > sa ? b : a);
+    }
+    if (a != a) return x87_quiet(a);
+    if (b != b) return x87_quiet(b);
     return X87_INDEF;
+}
+static inline double x87_r2(double a, double b, double r){
+    if (__builtin_expect(r == r, 1)) return r;
+    return x87_nan2(a, b);
 }
 static inline double x87_r1(double a, double r){
     if (r == r) return r;
@@ -285,7 +319,13 @@ static inline float sse_r1f(float a, float r){
     if (a != a) return a;
     return (float)X87_INDEF;
 }
-static inline double sse_r2d(double a, double b, double r){ return x87_r2(a,b,r); }
+/* SSE: the first operand's NaN wins whatever the second is (made quiet) */
+static inline double sse_r2d(double a, double b, double r){
+    if (r == r) return r;
+    if (a != a) return x87_quiet(a);
+    if (b != b) return x87_quiet(b);
+    return X87_INDEF;
+}
 static inline double sse_r1d(double a, double r){ return x87_r1(a,r); }
 
 /* Out of range / NaN -> "integer indefinite" (the most negative value). */

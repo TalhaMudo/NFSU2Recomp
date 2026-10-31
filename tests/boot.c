@@ -151,6 +151,7 @@ int main(int argc,char**argv){
     { const char *sd = app_save_dir(); if (sd) fileio_set_write_root(sd); }
     dispatch_init(); win32_init();
     { extern void overrides_install(void); overrides_install(); }
+    { extern void highfps_install(void); highfps_install(); }   /* runtime/highfps.c */
     { extern void gamepad_install(void); gamepad_install(); }   /* runtime/gamepad.m */
     if (getenv("BT")) g_bt_on = 1;
     g_report_fn = all_reports;
@@ -175,7 +176,7 @@ int main(int argc,char**argv){
     { extern CPU *g_cur_cpu; g_cur_cpu = &cpu; }
     memset(&cpu,0,sizeof cpu);
     cpu.esp = STACK_HI - 0x1000u;
-    cpu.top = 0; cpu.fcw = 0x037f;
+    cpu.top = 0; cpu.fcw = 0x037f; cpu.mxcsr = 0x1F80u;
     cpu.fs_base = TEB_BASE;
     cpu.gs_base = TEB_BASE;
 

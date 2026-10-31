@@ -400,7 +400,7 @@ static void *guest_thread_main(void *p){
     mem_commit(stack_lo, GTHREAD_STACK);
     memset(g_mem + stack_lo, 0, GTHREAD_STACK);     /* a recycled slot starts clean */
     cpu.esp = stack_hi - 0x1000u;
-    cpu.top = 0; cpu.fcw = 0x037f;
+    cpu.top = 0; cpu.fcw = 0x037f; cpu.mxcsr = 0x1F80u;
     cpu.fs_base = t->teb; cpu.gs_base = t->teb;
     /* TEB */
     MR32(t->teb+0x00)=0xFFFFFFFFu; MR32(t->teb+0x04)=stack_hi; MR32(t->teb+0x08)=stack_lo;
@@ -466,7 +466,7 @@ static void *timer_thread_main(void *p){
     teb = 0x00C60000u;
     mem_commit(stack_lo, GTHREAD_STACK);
     mem_commit(teb, 0x2000);
-    cpu.top = 0; cpu.fcw = 0x037f;
+    cpu.top = 0; cpu.fcw = 0x037f; cpu.mxcsr = 0x1F80u;
     cpu.fs_base = teb; cpu.gs_base = teb;
     MR32(teb+0x00)=0xFFFFFFFFu; MR32(teb+0x04)=stack_hi; MR32(teb+0x08)=stack_lo;
     MR32(teb+0x18)=teb; MR32(teb+0x24)=999u;

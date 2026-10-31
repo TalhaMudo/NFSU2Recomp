@@ -95,6 +95,7 @@ void guest_hook(CPU *c, uint32_t ip){
     g_hook_hits++;
     { int ws_hook(CPU *, uint32_t); if (ws_hook(c, ip)) return; }   /* wsfov.c */
     { int sndlead_hook(CPU *, uint32_t); if (sndlead_hook(c, ip)) return; }   /* sndlead.c */
+    { int highfps_hook(CPU *, uint32_t); if (highfps_hook(c, ip)) return; }   /* highfps.c */
     if (ip == GA(0x0065ae35u)){
         uint32_t a1=MR32(c->esp+4u), a2=MR32(c->esp+8u), a3=MR32(c->esp+12u);
         if (!g_rec_esp0) g_rec_esp0 = c->esp;

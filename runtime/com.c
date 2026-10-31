@@ -2178,6 +2178,47 @@ static void fxtr_dev(CPU *c, int iface, int mid, int nargs, const char *nm){
     fprintf(stderr, "\n");
 }
 
+/* RBTEST=<Present#> (test): what the magazine cover capture does (0x5c3150), done
+ * by hand -- the middle of the screen StretchRect'ed into a 512x512 lockable target
+ * and read back; written to RBTEST_OUT (PPM).  It runs at the frame's first copy
+ * from the screen (where the game's capture sits: after the scene, before the
+ * post-process and the menus), or at Present if the frame has none. */
+static void rbtest_run(const char *where){
+    void metal_blit_rect(unsigned,unsigned,float,float,float,float);
+    int metal_rt_readback(unsigned,void*,unsigned,unsigned,unsigned);
+    unsigned tid = metal_create_texture_ex(512, 512, 1, 21u, 1);
+    metal_blit_rect(0, tid, 0.25f, 0.25f, 0.75f, 0.75f);
+    uint8_t *px = calloc(512u*512u, 4);
+    int ok = px ? metal_rt_readback(tid, px, 2048u, 512u, 512u) : 0;
+    unsigned long nz = 0, sum = 0;
+    for (unsigned q = 0; px && q < 512u*512u*4u; q++){ if (px[q]) nz++; sum += px[q]; }
+    fprintf(stderr, "  [rbtest] Present %u (%s): readback %d, %lu nonzero bytes, mean %.1f\n",
+            g_present_no, where, ok, nz, px ? (double)sum/(512.0*512.0*4.0) : 0.0);
+    const char *op = ENVC("RBTEST_OUT");
+    FILE *f = (op && px) ? fopen(op, "wb") : NULL;
+    if (f){ fprintf(f, "P6\n512 512\n255\n");
+        for (unsigned q = 0; q < 512u*512u; q++){ uint8_t rgb[3] = { px[q*4+2], px[q*4+1], px[q*4] }; fwrite(rgb, 1, 3, f); }
+        fclose(f); }
+    free(px);
+}
+static int g_rbtest_done = 0;
+
+/* TUNING GRAPH DRAG: while the ECU / turbo graph is up (overrides.c), moving the
+ * mouse up or down with the left button held turns the wheel for the game, one
+ * notch per 8 units of the 640x480 menu: the dot of the picked column follows the
+ * pointer.  TUNEDRAG=0 turns it off.  ms: DIMOUSESTATE(2), wheel at +8, button 0 at +12. */
+static void tunedrag(unsigned char *ms){
+    int tuning_graph_active(void); void metal_get_cursor(int *, int *);
+    static int on = -1, held = 0, acc = 0, lasty = 0;
+    if (on < 0){ const char *e = ENVC("TUNEDRAG"); on = !(e && *e == '0'); }
+    if (!on || !tuning_graph_active() || !(ms[12] & 0x80)){ held = 0; return; }
+    int x, y; metal_get_cursor(&x, &y); (void)x;
+    int y480 = g_bb_h ? (int)((long)y * 480 / (long)g_bb_h) : y;
+    if (!held){ held = 1; lasty = y480; acc = 0; return; }
+    acc += lasty - y480; lasty = y480;               /* up is positive, like the wheel */
+    int notches = acc / 8; acc -= notches * 8;
+    if (notches){ int32_t dz; memcpy(&dz, ms + 8, 4); dz += notches * 120; memcpy(ms + 8, &dz, 4); }
+}
 int com_call(CPU *c, uint32_t magic){
     uint32_t iface=(magic>>16)&0x1FFFu, m=magic&0xFFFFu;
     g_com_calls++;
@@ -3213,6 +3254,9 @@ int com_call(CPU *c, uint32_t magic){
                   void cov_reset(void); cov_reset();
                   fprintf(stderr,"  coverage reset (Present %u)\n", g_present_no);
               } }
+            { const char *rt = ENVC("RBTEST");
+              if (rt && metal_available() && !g_rbtest_done && g_present_no == (uint32_t)atoi(rt)){
+                  g_rbtest_done = 1; rbtest_run("at Present"); } }
             if (metal_available()) metal_present();
             { extern int g_perflog; void perflog_guest_frame(void);
               if (g_perflog) perflog_guest_frame(); }
@@ -3304,9 +3348,28 @@ int com_call(CPU *c, uint32_t magic){
                             stex, so, ss?MR32(ss+4):0, ss?MR32(ss+8):0,
                             dtex, doo, ds?MR32(ds+4):0, ds?MR32(ds+8):0); }
             }
+            { const char *rt = ENVC("RBTEST");
+              if (rt && !stex && metal_available() && !g_rbtest_done && g_present_no + 1u == (uint32_t)atoi(rt)){
+                  g_rbtest_done = 1; rbtest_run("first screen copy"); } }
             if (metal_available() && (stex || dtex) && stex != dtex){
                 void metal_blit(unsigned,unsigned);
-                metal_blit(stex, dtex);
+                void metal_blit_rect(unsigned,unsigned,float,float,float,float);
+                /* A source RECT (left, top, right, bottom): only that part is copied.
+                 * The magazine / DVD cover photo is cut from the middle of the screen
+                 * (0x5c3150); it used to be squeezed from the whole screen. */
+                uint32_t sr = A(c,2);
+                uint32_t sw = (ss && mem_is_committed(ss+11)) ? MR32(ss+4) : 0u;
+                uint32_t sh = (ss && mem_is_committed(ss+11)) ? MR32(ss+8) : 0u;
+                if (!stex){ sw = g_bb_w; sh = g_bb_h; }   /* the back buffer */
+                if (sr && mem_is_committed(sr+15) && sw && sh){
+                    int32_t l = (int32_t)MR32(sr), t = (int32_t)MR32(sr+4);
+                    int32_t rr = (int32_t)MR32(sr+8), b = (int32_t)MR32(sr+12);
+                    int whole = l <= 0 && t <= 0 && rr >= (int32_t)sw && b >= (int32_t)sh;
+                    if (rr > l && b > t && !whole)
+                        metal_blit_rect(stex, dtex, (float)l/(float)sw, (float)t/(float)sh,
+                                        (float)rr/(float)sw, (float)b/(float)sh);
+                    else metal_blit(stex, dtex);
+                } else metal_blit(stex, dtex);
             }
             r=0; }
         else if (MID(SetRenderTarget)){
@@ -3810,6 +3873,15 @@ int com_call(CPU *c, uint32_t magic){
             if(!buf){ buf = gbuf_alloc(pitch*rows + 64u); if(slot) MR32(slot)=buf;
                      if (iface==IF_SURF) g_gb_kept[2] += (pitch*rows + 127u) & ~63u; }
             if(plr){ mem_commit(plr,8); MR32(plr)=pitch; MR32(plr+4)=buf; }
+            /* A lockable render target (CreateRenderTarget, origin 3): the game reads
+             * what was drawn into it -- the magazine / DVD cover photo.  Bring the
+             * pixels back from the GPU (metal.m, READING BACK A LOCKABLE RENDER TARGET);
+             * the buffer used to stay empty and the covers were saved black. */
+            if (iface==IF_SURF && self && buf && mem_is_committed(self+43) && MR32(self+40)==3u &&
+                MR32(self+28) && metal_available()){
+                int metal_rt_readback(unsigned,void*,unsigned,unsigned,unsigned);
+                metal_rt_readback(MR32(self+28), g_mem+buf, pitch, w, h);
+            }
             r=0; }
         else if (MID(UnlockRect)){
             /* 2D: (Level)  |  CUBE: (FaceType, Level)  |  Surface: () */
@@ -4395,6 +4467,7 @@ int com_call(CPU *c, uint32_t magic){
                 }
                 else if (cb == 20u && metal_available()){        /* DIMOUSESTATE2 */
                     metal_fill_mouse(g_mem+p, cb);
+                    tunedrag(g_mem+p);
                     g_dikey_calls++;
                     for (uint32_t q=12;q<20;q++)
                         if (MR8(p+q)){ g_dikey_hits++; break; }
@@ -4402,6 +4475,7 @@ int com_call(CPU *c, uint32_t magic){
                 else if (cb == 16u && metal_available()){   /* DIMOUSESTATE */
                     unsigned char tmpm[20];
                     metal_fill_mouse(tmpm, 20);
+                    tunedrag(tmpm);
                     memcpy(g_mem+p, tmpm, 16);
                     g_dikey_calls++;
                 }
@@ -4654,6 +4728,8 @@ void com_report(void){
     fprintf(stderr,"\n=== COM / D3D9 KATMANI ===\n");
     { void ws_report(void); ws_report(); }   /* wsfov.c */
     { void gamepad_report(void); gamepad_report(); }   /* gamepad.m */
+    { void xpatch_report(void); xpatch_report(); }
+    { void highfps_report(void); highfps_report(); }   /* LOCAL PATCH: highfps.c */
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
                   g_aspfix, g_asp_persp, g_asp_ortho);
