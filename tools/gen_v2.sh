@@ -15,21 +15,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 EXE="${1:?usage: tools/gen_v2.sh <SPEED2.EXE>}"
 PY="$ROOT/.venv/bin/python"
 
-# The OVERRIDE list must MATCH runtime/overrides.c + runtime/d3dx_hle.c
+# The OVERRIDE list must MATCH runtime/overrides.c + runtime/d3dx_hle.c + runtime/reflect.c
 # (see PROJECT.md "Commands", D3DX_HLE.md "Regeneration").  OVR is in European
 # addresses; OVR_NA is the same list mapped to the North American build
 # (tools/addrmap.py list out/na/addrmap.json "$OVR").
-OVR=60fab0,61e390,61f130,5c7ed0,50d510,65ae35,6623ea,66aa3f,66ace2,6691b1,669296,664a2f,663a42,688e89,663275,662edc,660a52,668e0d,664792,66ac27,65addb,65acf5,66d13a,66d303,66d7e9,66e8a9,66f501,66ca38,65ab24,67193e,66056c,65cf44,640c12,668cd0,65ccd8
-OVR_NA=60faa0,61e380,61f120,5c7ec0,50d510,65ae25,6623da,66aa2f,66acd2,6691a1,669286,664a1f,663a32,688e79,663265,662ecc,660a42,668dfd,664782,66ac17,65adcb,65ace5,66d12a,66d2f3,66d7d9,66e899,66f4f1,66ca28,65ab14,67192e,66055c,65cf34,640c02,668cc0,65ccc8
+OVR=6154a0,494270,60fab0,61e390,61f130,5c7ed0,50d510,65ae35,6623ea,66aa3f,66ace2,6691b1,669296,664a2f,663a42,688e89,663275,662edc,660a52,668e0d,664792,66ac27,65addb,65acf5,66d13a,66d303,66d7e9,66e8a9,66f501,66ca38,65ab24,67193e,66056c,65cf44,640c12,668cd0,65ccd8
+OVR_NA=615490,494270,60faa0,61e380,61f120,5c7ec0,50d510,65ae25,6623da,66aa2f,66acd2,6691a1,669286,664a1f,663a32,688e79,663265,662ecc,660a42,668dfd,664782,66ac17,65adcb,65ace5,66d12a,66d2f3,66d7d9,66e899,66f4f1,66ca28,65ab14,67192e,66055c,65cf34,640c02,668cc0,65ccc8
 
 SHA="$(shasum -a 256 "$EXE" | cut -c1-64)"
 case "$SHA" in
   8f6a9ae2c4cfa01181d2fd755d99c6f4b7103f60273908ea1de1e719dfe2a297)
     BUILD=eu; DEF=gen/all; WORK=out
-    export HOOKS="${HOOKS:-0x5c7ffe,0x4ec35c,0x726336}" ;;   # runtime/wsfov.c, sndlead.c
+    export HOOKS="${HOOKS:-0x5c7ffe,0x4ec35c,0x726336,0x5cab69,0x5cae71,0x60f9f6,0x5d6666,0x63167d,0x6311fc}" ;;   # runtime/wsfov.c, sndlead.c, reflect.c
   f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7)
     BUILD=na; DEF=gen/na; WORK=out/na; OVR=$OVR_NA; export LIFT_MISSING=1
-    export HOOKS="${HOOKS:-0x5c7fee,0x4ec35c,0x726336}" ;;   # runtime/wsfov.c, sndlead.c (same sites, NA addresses)
+    export HOOKS="${HOOKS:-0x5c7fee,0x4ec35c,0x726336,0x5cab59,0x5cae61,0x60f9e6,0x5d6656,0x63166d,0x6311ec}" ;;   # runtime/wsfov.c, sndlead.c, reflect.c (same sites, NA addresses)
   *) echo "unsupported SPEED2.EXE (sha256 $SHA); see README, \"Game versions\""; exit 1 ;;
 esac
 OUT="${GENOUT:-$DEF}"

@@ -1297,8 +1297,9 @@ static void rt_free_pending(void){
     g_rtfree_done = upto;
 }
 
-#if NFS_ENHANCED
-/* HD: road reflection targets (see enhance.c "ROAD REFLECTION BLUR").
+/* ROAD REFLECTION BLUR: road reflection targets larger than the game's (see
+ * enhance.c "ROAD REFLECTION BLUR"; in the original build only with
+ * NFSU2_REFLECTIONS, reflect.c).
  * They are created with a mip chain; before a blur draw samples one of these
  * textures, its mips are generated if it got dirty since the last draw. */
 static uint8_t  g_hd_road[MAXTEX], g_hd_dirty[MAXTEX];
@@ -1312,6 +1313,7 @@ void metal_hd_mark_road(unsigned id_, unsigned ow, unsigned oh){
 }
 static int hd_is_road(unsigned t){ return t && t < MAXTEX && g_hd_road[t] && g_tex[t]; }
 
+#if NFS_ENHANCED
 /* HD: MSAA for the screen (HD_MSAA=4 default, 0/1 off).
  * Only SCREEN passes are multisampled: the game's scene and UI are drawn directly
  * to the back buffer.  Render targets (reflection, post-process, cube) stay
@@ -7083,23 +7085,24 @@ void metal_run_main_loop(void){
                                         if (enc && cur_z == zc){ [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu; }
                                     }
                                 }
-#if NFS_ENHANCED
-                                /* HD blur draw: from road target to road target.
+                                /* Road blur draw: from road target to road target.
                                  * If the source's mips aren't current close the pass,
                                  * generate, reopen with the same target (Load). */
                                 int hd_blur = !dr->is_clear && hd_is_road(dr->tex) &&
                                               hd_is_road(TGT_ID(dr->target));
                                 if (hd_blur && g_hd_dirty[dr->tex]){
+#if NFS_ENHANCED
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu;
                                               if (pe) hd_ms_fallback(cb, dtex, pe); }
+#endif
+                                    if (enc){ [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu; }
                                     id<MTLBlitCommandEncoder> mb = pp_blit(cb, "road reflection mip generation");
                                     [mb generateMipmapsForTexture:g_tex[dr->tex]];
                                     [mb endEncoding];
                                     g_hd_dirty[dr->tex] = 0;
                                     atomic_fetch_add(&g_hd_mipgen, 1ull);
                                 }
-#endif
                                 /* see PASS MERGING: a draw not using Z doesn't split a pass because of the Z surface */
                                 int zsplit = DEPTH_ZID(dr->depth) != cur_z &&
                                              !(enc && pass_merge_on() && !dr->is_clear && !(dr->depth & 3u));
@@ -7113,9 +7116,7 @@ void metal_run_main_loop(void){
                                               if (pe) hd_ms_fallback(cb, dtex, pe); }
 #endif
                                     if (enc){ [enc endEncoding]; enc = nil; }
-#if NFS_ENHANCED
                                     if (hd_is_road(TGT_ID(dr->target))) g_hd_dirty[TGT_ID(dr->target)] = 1;
-#endif
                                     id<MTLTexture> tgt = dtex;
                                     if (dr->target) freed_use(TGT_ID(dr->target), 1);
                                     if (dr->target && TGT_ID(dr->target) < MAXTEX &&
@@ -7482,11 +7483,9 @@ void metal_run_main_loop(void){
                                                     alpha:(float)((dr->bcol>>24)&0xFFu)/255.f]; }
                                 for (int si = 0; si < 4; si++){
                                     unsigned sk = dr->smp[si];
-#if NFS_ENHANCED
                                     /* mip filter LINEAR (bits 4-5 = 2): a level() read
                                      * is ignored on a sampler without mips. */
                                     if (hd_blur) sk = (sk & ~0x30u) | 0x20u;
-#endif
                                     if (sk != c_smp[si]){ c_smp[si] = sk;
                                         [enc setFragmentSamplerState:samp_for(sk) atIndex:si]; } }
                                 { unsigned dm = c_zon ? (dr->depth & 63u) : 0u;
@@ -7495,7 +7494,6 @@ void metal_run_main_loop(void){
                                 { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } fp;
                                   fp.aref = dr->alpha_ref;
                                   fp.usec = 0.f; fp.p0 = fp.p1 = 0.f;
-#if NFS_ENHANCED
                                   if (hd_blur){
                                       /* scale = Metal texture / the size the game assumes; so the sample
                                        * spacing stays ~1 texel at level L. */
@@ -7510,7 +7508,6 @@ void metal_run_main_loop(void){
                                       }
                                       atomic_fetch_add(&g_hd_blurdraw, 1ull);
                                   }
-#endif
                                   memcpy(fp.proj, dr->proj, sizeof fp.proj);
                                   memcpy(fp.fogv, dr->fogv, sizeof fp.fogv);
                                   /* same pool sequence + same small fields: no need to build and compare
@@ -7775,6 +7772,11 @@ void metal_run_main_loop(void){
  * "What are we spending hardware on" can only be answered by seeing these three
  * together. */
 void metal_budget_report(void){
+#if !NFS_ENHANCED
+    if (atomic_load(&g_hd_mipgen))
+        fprintf(stderr, "  reflections      : road blur %llu draws, %llu mip generations\n",
+                atomic_load(&g_hd_blurdraw), atomic_load(&g_hd_mipgen));
+#endif
 #if NFS_ENHANCED
     fprintf(stderr, "[HD] road blur: %llu draws, %llu mip generations\n",
             atomic_load(&g_hd_blurdraw), atomic_load(&g_hd_mipgen));
