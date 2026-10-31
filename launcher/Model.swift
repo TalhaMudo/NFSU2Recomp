@@ -19,6 +19,11 @@ final class LauncherModel: ObservableObject {
     private var engineForced = false     // NFSU2_ENGINE: this start only, not saved
     @Published var fullscreen: Bool { didSet { defaults.set(fullscreen, forKey: Prefs.fullscreen) } }
     @Published var showAtStartup: Bool { didSet { defaults.set(showAtStartup, forKey: Prefs.showAtStartup) } }
+    @Published var wideHUD: Bool { didSet { defaults.set(wideHUD, forKey: Prefs.wideHUD) } }
+    private var setHUDPOS = false        // HUDPOS was set by us (not by the caller)
+    @Published var controller: Bool { didSet { defaults.set(controller, forKey: Prefs.controller) } }
+    @Published var stickDeadzone: Double { didSet { defaults.set(stickDeadzone, forKey: Prefs.stickDeadzone) } }
+    private var setPad = false           // NFSU2_PAD / NFSU2_PAD_DEADZONE were set by us
     @Published var job: Job? = nil
     @Published var notice: String? = nil
 
@@ -39,7 +44,7 @@ final class LauncherModel: ObservableObject {
         let fm = FileManager.default
         let hasOriginal = fm.isExecutableFile(atPath: Paths.engine(nil, hd: false).path)
         let hasHD = fm.isExecutableFile(atPath: Paths.engine(nil, hd: true).path)
-        defaults.register(defaults: [Prefs.showAtStartup: true])
+        defaults.register(defaults: [Prefs.showAtStartup: true, Prefs.controller: true, Prefs.stickDeadzone: 0.10])
         var e = Engine(rawValue: defaults.string(forKey: Prefs.engine) ?? "") ?? .original
         if let env = ProcessInfo.processInfo.environment["NFSU2_ENGINE"], let f = Engine(rawValue: env) { e = f }
         if e == .hd && !hasHD { e = .original }
@@ -48,6 +53,9 @@ final class LauncherModel: ObservableObject {
         engineForced = ProcessInfo.processInfo.environment["NFSU2_ENGINE"] != nil
         fullscreen = defaults.bool(forKey: Prefs.fullscreen)
         showAtStartup = defaults.bool(forKey: Prefs.showAtStartup)
+        wideHUD = defaults.bool(forKey: Prefs.wideHUD)
+        controller = defaults.bool(forKey: Prefs.controller)
+        stickDeadzone = min(0.5, max(0, defaults.double(forKey: Prefs.stickDeadzone)))
     }
 
     var location: GameLocation? {
@@ -109,6 +117,19 @@ final class LauncherModel: ObservableObject {
         if !engineForced { defaults.set(engine.rawValue, forKey: Prefs.engine) }
         defaults.synchronize()
         if !fromEnv { setenv("NFSU2_DATA", loc.exe.path, 1) }
+        // HUD at the screen edges (engine: metal.m HUD ANCHORING).  A HUDPOS given by
+        // the caller wins; otherwise it follows the switch.
+        if setHUDPOS || env["HUDPOS"] == nil {
+            if wideHUD { setenv("HUDPOS", "1", 1); setHUDPOS = true }
+            else if setHUDPOS { unsetenv("HUDPOS"); setHUDPOS = false }
+        }
+        // Controller settings; NFSU2_PAD / NFSU2_PAD_DEADZONE set by hand still win.  Ours
+        // are overwritten on every Play, so a change takes effect without restarting.
+        if setPad || (env["NFSU2_PAD"] == nil && env["NFSU2_PAD_DEADZONE"] == nil) {
+            setenv("NFSU2_PAD", controller ? "1" : "0", 1)
+            setenv("NFSU2_PAD_DEADZONE", String(format: "%.2f", stickDeadzone), 1)
+            setPad = true
+        }
         var e = engine
         if !hasEngine(e) { e = (e == .hd) ? .original : .hd }
         let path = Paths.engine(loc.build, hd: e == .hd).path
@@ -141,9 +162,9 @@ final class LauncherModel: ObservableObject {
 
     // MARK: tools
 
-    func openSaves() {
-        try? FileManager.default.createDirectory(at: Paths.saves, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(Paths.saves)
+    func manageSaves() {
+        SaveManagerWindow.show(saves: Paths.saves, registry: Paths.registry,
+            gameRunning: { [weak self] in self?.isPlaying ?? true })
     }
 
     func openLogs() {
@@ -180,17 +201,41 @@ final class LauncherModel: ObservableObject {
         p.directoryURL = FileManager.default.isWritableFile(atPath: "/Applications")
             ? URL(fileURLWithPath: "/Applications")
             : FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+        // A checkbox for each optional folder the game has, all on: a full copy unless unticked.
+        var boxes: [(String, NSButton)] = []
+        for (x, size) in PortableBuilder.extras(in: loc.folder) {
+            let b = NSButton(checkboxWithTitle: "Include " + x.title + " ("
+                             + ByteCountFormatter.string(fromByteCount: size, countStyle: .file) + ")",
+                             target: nil, action: nil)
+            b.toolTip = "Without: " + x.without + "."
+            b.state = .on
+            b.sizeToFit()
+            boxes.append((x.folder, b))
+        }
+        if !boxes.isEmpty {
+            let h = boxes.reduce(CGFloat(16)) { $0 + $1.1.frame.height + 6 }
+            let w = boxes.map { $0.1.frame.width }.max()! + 40
+            let v = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+            var y = h - 8
+            for (_, b) in boxes {
+                y -= b.frame.height
+                b.setFrameOrigin(NSPoint(x: 20, y: y))
+                y -= 6
+                v.addSubview(b)
+            }
+            p.accessoryView = v
+        }
         guard p.runModal() == .OK, var dest = p.url else { return }
         if dest.pathExtension.lowercased() != "app" { dest.appendPathExtension("app") }
         if dest.standardizedFileURL == Paths.bundle.standardizedFileURL {
             alert("Choose another name", "The copy can't replace the app that is running.")
             return
         }
-        startPortable(from: loc.folder, to: dest)
+        startPortable(from: loc.folder, to: dest, leaveOut: Set(boxes.filter { $0.1.state == .off }.map { $0.0 }))
     }
 
-    func startPortable(from game: URL, to dest: URL) {
-        let b = PortableBuilder(sourceApp: Paths.bundle, gameFolder: game, destination: dest)
+    func startPortable(from game: URL, to dest: URL, leaveOut: Set<String> = []) {
+        let b = PortableBuilder(sourceApp: Paths.bundle, gameFolder: game, destination: dest, leaveOut: leaveOut)
         builder = b
         job = Job(phase: "Starting…")
         DispatchQueue.global(qos: .userInitiated).async {

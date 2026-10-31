@@ -292,6 +292,89 @@ enum { IF_D3D9=1, IF_DEV, IF_TEX, IF_VB, IF_IB, IF_SURF, IF_SIMPLE,
        IF_VSHADER, IF_VDECL, IF_STATEBLOCK, IF_SWAPCHAIN, IF_QUERY,
        IF_DI8, IF_DIDEV, IF_DS, IF_DSBUF };
 
+/* --- reference counts of textures, vertex and index buffers -----------------
+ * Kept on the host, keyed by the guest object address (objects are never reused:
+ * com_alloc only grows).  Created = 1, AddRef +1, Release -1; the buffer heap
+ * data is handed back when the count reaches 0.  All COM calls run under the
+ * guest lock.  NFSU2_GBUF_FREE0=1: never free (the old behaviour). */
+#define RC_CAP (1u << 20)                       /* live objects; linear probing */
+static uint32_t *g_rck; static int32_t *g_rcv; static uint32_t g_rc_n;
+static uint64_t g_rc_kept, g_rc_kept_data, g_rc_last, g_rc_unknown;
+static int gbuf_free_off(void){ return ENVC("NFSU2_GBUF_FREE0") != 0; }
+static uint32_t rc_hash(uint32_t o){ return (o * 2654435761u) & (RC_CAP - 1u); }
+static int32_t *rc_find(uint32_t o){
+    if (!g_rck || !o) return 0;
+    for (uint32_t i = rc_hash(o); g_rck[i]; i = (i + 1u) & (RC_CAP - 1u))
+        if (g_rck[i] == o) return &g_rcv[i];
+    return 0;
+}
+static void rc_set(uint32_t o, int32_t v){
+    if (!g_rck){ g_rck = calloc(RC_CAP, 4); g_rcv = calloc(RC_CAP, 4); }
+    if (!g_rck || !g_rcv || g_rc_n >= RC_CAP - RC_CAP / 8u) return;   /* full: never freed */
+    uint32_t i = rc_hash(o);
+    while (g_rck[i] && g_rck[i] != o) i = (i + 1u) & (RC_CAP - 1u);
+    if (!g_rck[i]) g_rc_n++;
+    g_rck[i] = o; g_rcv[i] = v;
+}
+static void rc_del(uint32_t o){                 /* backward-shift deletion */
+    uint32_t i = rc_hash(o);
+    while (g_rck[i] != o){ if (!g_rck[i]) return; i = (i + 1u) & (RC_CAP - 1u); }
+    for (uint32_t j = i;;){
+        g_rck[i] = 0; g_rcv[i] = 0;
+        for (;;){
+            j = (j + 1u) & (RC_CAP - 1u);
+            if (!g_rck[j]){ g_rc_n--; return; }
+            uint32_t h = rc_hash(g_rck[j]);
+            /* entry j may move to i if its home slot is not in (i, j] */
+            if ((i <= j) ? (h <= i || h > j) : (h <= i && h > j)) break;
+        }
+        g_rck[i] = g_rck[j]; g_rcv[i] = g_rcv[j]; i = j;
+    }
+}
+/* 1 if this Release dropped the last reference */
+static int rc_release(uint32_t o, uint32_t iface, uint32_t from){
+    int32_t *rc = rc_find(o);
+    if (!rc){ g_rc_unknown++;                   /* not counted (table full) or released again */
+        if (ENVC("RCLOG") && g_rc_unknown <= 40)
+            fprintf(stderr, "  [rc] Release of an uncounted object %08x (iface %u) from %08x\n", o, iface, from);
+        return 0; }
+    if (--*rc > 0){
+        g_rc_kept++;
+        /* would the old free-on-every-Release have taken live data away? */
+        if (mem_is_committed(o + 67u)){
+            uint32_t q0 = (iface == IF_TEX) ? 32u : 8u, q1 = (iface == IF_TEX) ? 64u : 12u;
+            for (uint32_t q = q0; q < q1; q += 4u) if (MR32(o + q)){ g_rc_kept_data++; break; }
+        }
+        return 0;
+    }
+    rc_del(o); g_rc_last++;
+    if (ENVC("RCLOG") && g_rc_last <= 4000)
+        fprintf(stderr, "  [rc] last release %08x (iface %u) from %08x\n", o, iface, from);
+    return 1;
+}
+static void rc_addref(uint32_t o){
+    if (gbuf_free_off()) return;
+    int32_t *rc = rc_find(o);
+    if (rc) ++*rc;
+}
+/* Release of a texture / vertex buffer / index buffer: hand the buffer heap data
+ * back when the last reference goes.  from = caller (RCLOG). */
+static void obj_release(uint32_t o, uint32_t iface, uint32_t from){
+    if (gbuf_free_off() || !o || !rc_release(o, iface, from)) return;
+    if (iface == IF_VB || iface == IF_IB){
+        if (mem_is_committed(o+11)){ gbuf_free(MR32(o+8)); MR32(o+8)=0; }
+    } else if (iface == IF_TEX && mem_is_committed(o+67)){
+        for (uint32_t q=32; q<64; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
+        if (mem_is_committed(o+143) && MR32(o+140)==0xC0BEC0BEu)
+            for (uint32_t q=104; q<136; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
+    }
+}
+/* d3dx_hle.c skips the guest's texture AddRef/Release calls on its native
+ * SetTexture path; it reports them here so the counts stay right. */
+void com_tex_ref_skipped(uint32_t o, int addref){
+    if (addref) rc_addref(o); else obj_release(o, IF_TEX, 0);
+}
+
 static uint32_t com_new(uint32_t iface, uint32_t extra){
     unsigned n = g_if[iface].n;
     uint32_t vt = com_alloc(n*4u);
@@ -302,6 +385,7 @@ static uint32_t com_new(uint32_t iface, uint32_t extra){
      * give fresh memory, garbage values are read. */
     for (uint32_t q = 0; q < 4u + extra; q += 4u) MR32(obj + q) = 0u;
     MR32(obj) = vt;
+    if ((iface == IF_TEX || iface == IF_VB || iface == IF_IB) && obj) rc_set(obj, 1);
     return obj;
 }
 
@@ -366,6 +450,7 @@ static uint32_t *g_lk_tid=0; static unsigned *g_lk_cnt=0; static uint64_t *g_lk_
 static uint32_t *g_lock_obj=0; static unsigned *g_lock_cnt=0; static int g_lock_n=0;
 static uint64_t g_snd_bytes=0, g_snd_nonzero=0, g_snd_zero=0, g_snd_play=0;
 static uint32_t g_cur_rt = 0;
+static uint32_t g_cur_rt_w = 0, g_cur_rt_h = 0;   /* its size as the game sees it (HD may enlarge it in Metal) */
 /* D3DRENDERSTATETYPE values; the defaults are D3D9's initial state */
 /* Resolutions to offer in the game's settings menu (desktop last). */
 /* The game's OWN internal resolution table.  Measured experimentally:
@@ -1275,6 +1360,7 @@ static int ortho_full_width(const VSConst *vsk, int cx, const VtxView *vv){
      * loading screen, y -1..1 or larger) keeps its 4:3 shape. */
     return lo <= -0.98f && hi >= 0.98f && (yhi - ylo) < 1.9f && yhi > -1.f && ylo < 1.f;
 }
+static int hudpos_on(void){ static int v = -1; if (v < 0){ const char *e = ENVC("HUDPOS"); v = (e && *e == '1'); } return v; }
 static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog, const VtxView *vv){
     if (g_aspfix == 1.f || !prog) return vsk;
     unsigned vs = g_cur_vs;
@@ -1294,6 +1380,12 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog, const
     g_asp_cw3[vs] = vsk->f[cw][3];
     { float ax = fabsf(vsk->f[cw][0]) + fabsf(vsk->f[cw][1]) + fabsf(vsk->f[cw][2]);
       if (ax < 1e-6f){ g_asp_ortho++; g_asp_no[vs]++;
+        /* Orthographic draws into a SMALL render target (the rear-view mirror, 256x256:
+         * its frame shade and shape mask) are not UI: squeezing them narrowed the mask
+         * and left strips of the mirror's scene at its sides.  Only the screen and
+         * screen-sized targets get the HUD treatment. */
+        if (g_cur_rt && g_cur_rt_w && g_cur_rt_h &&
+            (g_cur_rt_w * 2u < g_bb_w || g_cur_rt_h * 2u < g_bb_h)) return vsk;
         /* HUDFIX=1: also scale the UI about the center, so circles stay circular.
          * CAUTION: fullscreen post-process quads are orthographic too; if they get
          * shrunk, bars appear at the edges. */
@@ -1314,6 +1406,26 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog, const
                               (long)g_present_no, vs, g_cur_ps_id, g_tex_stage[0], vv->nv,
                               (double)g_wide_ylo, (double)g_wide_yhi); } }
               return vsk; }
+          /* HUDPOS=1 (see metal.m HUD ANCHORING): hand the draw's 4:3 clip-space
+           * rectangle to the renderer, which moves the HUD elements to the screen
+           * edges per element.  Only while the game world is loaded (TheWorld). */
+          if (hf && hudpos_on() && vv && vv->vp && vv->nv && vv->nv <= 4096u && vv->stride && vv->p_off >= 0
+              && (vv->p_type == 2 || vv->p_type == 3)
+              && mem_is_committed(GA(0x00890080u) + 3u) && MR32(GA(0x00890080u))){
+              const float *r = vsk->f[cx], *ry = vsk->f[cx + 1];
+              float lo = 1e30f, hi = -1e30f, ylo = 1e30f, yhi = -1e30f; int ok = 1;
+              for (uint32_t i = 0; i < vv->nv; i++){
+                  uint32_t a = vv->vp + i * vv->stride + (uint32_t)vv->p_off;
+                  if (!mem_is_committed(a + 11)){ ok = 0; break; }
+                  float x = MRF32(a), y = MRF32(a + 4), z = MRF32(a + 8);
+                  float w = (vv->p_type == 3) ? MRF32(a + 12) : 1.f;
+                  float cxv = x * r[0] + y * r[1] + z * r[2] + w * r[3];
+                  float cyv = x * ry[0] + y * ry[1] + z * ry[2] + w * ry[3];
+                  if (cxv < lo) lo = cxv; if (cxv > hi) hi = cxv;
+                  if (cyv < ylo) ylo = cyv; if (cyv > yhi) yhi = cyv; }
+              if (ok){ void metal_set_next_hud(float, float, float, float);
+                       metal_set_next_hud(lo, hi, ylo, yhi); }
+          }
           if (hf){ static VSConst ht; vsk_copy_used(&ht, vsk, prog);
                    for (int k = 0; k < 4; k++) ht.f[cx][k] *= g_aspfix;
                    return &ht; } }
@@ -1325,7 +1437,7 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog, const
                         cw, vsk->f[cw][0],vsk->f[cw][1],vsk->f[cw][2],vsk->f[cw][3]); } }
         return vsk; } }
     g_asp_persp++; g_asp_np[vs]++;
-    { int ws_game_fov(void); if (ws_game_fov()) return vsk; }   /* LOCAL PATCH: wsfov.c */
+    { int ws_game_fov(void); if (ws_game_fov()) return vsk; }   /* wsfov.c */
     static VSConst tmp;
     vsk_copy_used(&tmp, vsk, prog);
     for (int k = 0; k < 4; k++) tmp.f[cx][k] *= g_aspfix;
@@ -2066,6 +2178,47 @@ static void fxtr_dev(CPU *c, int iface, int mid, int nargs, const char *nm){
     fprintf(stderr, "\n");
 }
 
+/* RBTEST=<Present#> (test): what the magazine cover capture does (0x5c3150), done
+ * by hand -- the middle of the screen StretchRect'ed into a 512x512 lockable target
+ * and read back; written to RBTEST_OUT (PPM).  It runs at the frame's first copy
+ * from the screen (where the game's capture sits: after the scene, before the
+ * post-process and the menus), or at Present if the frame has none. */
+static void rbtest_run(const char *where){
+    void metal_blit_rect(unsigned,unsigned,float,float,float,float);
+    int metal_rt_readback(unsigned,void*,unsigned,unsigned,unsigned);
+    unsigned tid = metal_create_texture_ex(512, 512, 1, 21u, 1);
+    metal_blit_rect(0, tid, 0.25f, 0.25f, 0.75f, 0.75f);
+    uint8_t *px = calloc(512u*512u, 4);
+    int ok = px ? metal_rt_readback(tid, px, 2048u, 512u, 512u) : 0;
+    unsigned long nz = 0, sum = 0;
+    for (unsigned q = 0; px && q < 512u*512u*4u; q++){ if (px[q]) nz++; sum += px[q]; }
+    fprintf(stderr, "  [rbtest] Present %u (%s): readback %d, %lu nonzero bytes, mean %.1f\n",
+            g_present_no, where, ok, nz, px ? (double)sum/(512.0*512.0*4.0) : 0.0);
+    const char *op = ENVC("RBTEST_OUT");
+    FILE *f = (op && px) ? fopen(op, "wb") : NULL;
+    if (f){ fprintf(f, "P6\n512 512\n255\n");
+        for (unsigned q = 0; q < 512u*512u; q++){ uint8_t rgb[3] = { px[q*4+2], px[q*4+1], px[q*4] }; fwrite(rgb, 1, 3, f); }
+        fclose(f); }
+    free(px);
+}
+static int g_rbtest_done = 0;
+
+/* TUNING GRAPH DRAG: while the ECU / turbo graph is up (overrides.c), moving the
+ * mouse up or down with the left button held turns the wheel for the game, one
+ * notch per 8 units of the 640x480 menu: the dot of the picked column follows the
+ * pointer.  TUNEDRAG=0 turns it off.  ms: DIMOUSESTATE(2), wheel at +8, button 0 at +12. */
+static void tunedrag(unsigned char *ms){
+    int tuning_graph_active(void); void metal_get_cursor(int *, int *);
+    static int on = -1, held = 0, acc = 0, lasty = 0;
+    if (on < 0){ const char *e = ENVC("TUNEDRAG"); on = !(e && *e == '0'); }
+    if (!on || !tuning_graph_active() || !(ms[12] & 0x80)){ held = 0; return; }
+    int x, y; metal_get_cursor(&x, &y); (void)x;
+    int y480 = g_bb_h ? (int)((long)y * 480 / (long)g_bb_h) : y;
+    if (!held){ held = 1; lasty = y480; acc = 0; return; }
+    acc += lasty - y480; lasty = y480;               /* up is positive, like the wheel */
+    int notches = acc / 8; acc -= notches * 8;
+    if (notches){ int32_t dz; memcpy(&dz, ms + 8, 4); dz += notches * 120; memcpy(ms + 8, &dz, 4); }
+}
 int com_call(CPU *c, uint32_t magic){
     uint32_t iface=(magic>>16)&0x1FFFu, m=magic&0xFFFFu;
     g_com_calls++;
@@ -2152,7 +2305,9 @@ int com_call(CPU *c, uint32_t magic){
             mem_commit(ppv,4); MR32(ppv) = A(c,0); r = 0;
         } else r=0x80004002u;
     }
-    else if (MID(AddRef))  r=1;
+    else if (MID(AddRef)){
+        if (iface==IF_TEX || iface==IF_VB || iface==IF_IB) rc_addref(A(c,0));
+        r=1; }
     else if (MID(Release)){
         /* The game silences a sound buffer with Release, NOT Stop (measured: Stop=0,
          * Release=7 in a 3-minute session).  Without stopping it, the menu music
@@ -2166,18 +2321,8 @@ int com_call(CPU *c, uint32_t magic){
                                        if (g_sb_rec == bi) g_sb_rec = 0;
                                        MR32(self1+8) = 0; }
         }
-        if ((iface==IF_VB || iface==IF_IB) && !getenv("NFSU2_GBUF_FREE0")){
-            uint32_t o=A(c,0);
-            if (o && mem_is_committed(o+11)){ gbuf_free(MR32(o+8)); MR32(o+8)=0; }
-        }
-        else if (iface==IF_TEX && !getenv("NFSU2_GBUF_FREE0")){
-            uint32_t o=A(c,0);
-            if (o && mem_is_committed(o+67)){
-                for (uint32_t q=32; q<64; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
-                if (mem_is_committed(o+143) && MR32(o+140)==0xC0BEC0BEu)
-                    for (uint32_t q=104; q<136; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
-            }
-        }
+        /* The data goes back only when the LAST reference is released (rc_release). */
+        if (iface==IF_TEX || iface==IF_VB || iface==IF_IB) obj_release(A(c,0), iface, c->eip);
         if (iface==IF_DSBUF){
             uint32_t self0=A(c,0);
             if (self0 && mem_is_committed(self0+31) && MR32(self0+28)){
@@ -3109,6 +3254,9 @@ int com_call(CPU *c, uint32_t magic){
                   void cov_reset(void); cov_reset();
                   fprintf(stderr,"  coverage reset (Present %u)\n", g_present_no);
               } }
+            { const char *rt = ENVC("RBTEST");
+              if (rt && metal_available() && !g_rbtest_done && g_present_no == (uint32_t)atoi(rt)){
+                  g_rbtest_done = 1; rbtest_run("at Present"); } }
             if (metal_available()) metal_present();
             { extern int g_perflog; void perflog_guest_frame(void);
               if (g_perflog) perflog_guest_frame(); }
@@ -3200,9 +3348,28 @@ int com_call(CPU *c, uint32_t magic){
                             stex, so, ss?MR32(ss+4):0, ss?MR32(ss+8):0,
                             dtex, doo, ds?MR32(ds+4):0, ds?MR32(ds+8):0); }
             }
+            { const char *rt = ENVC("RBTEST");
+              if (rt && !stex && metal_available() && !g_rbtest_done && g_present_no + 1u == (uint32_t)atoi(rt)){
+                  g_rbtest_done = 1; rbtest_run("first screen copy"); } }
             if (metal_available() && (stex || dtex) && stex != dtex){
                 void metal_blit(unsigned,unsigned);
-                metal_blit(stex, dtex);
+                void metal_blit_rect(unsigned,unsigned,float,float,float,float);
+                /* A source RECT (left, top, right, bottom): only that part is copied.
+                 * The magazine / DVD cover photo is cut from the middle of the screen
+                 * (0x5c3150); it used to be squeezed from the whole screen. */
+                uint32_t sr = A(c,2);
+                uint32_t sw = (ss && mem_is_committed(ss+11)) ? MR32(ss+4) : 0u;
+                uint32_t sh = (ss && mem_is_committed(ss+11)) ? MR32(ss+8) : 0u;
+                if (!stex){ sw = g_bb_w; sh = g_bb_h; }   /* the back buffer */
+                if (sr && mem_is_committed(sr+15) && sw && sh){
+                    int32_t l = (int32_t)MR32(sr), t = (int32_t)MR32(sr+4);
+                    int32_t rr = (int32_t)MR32(sr+8), b = (int32_t)MR32(sr+12);
+                    int whole = l <= 0 && t <= 0 && rr >= (int32_t)sw && b >= (int32_t)sh;
+                    if (rr > l && b > t && !whole)
+                        metal_blit_rect(stex, dtex, (float)l/(float)sw, (float)t/(float)sh,
+                                        (float)rr/(float)sw, (float)b/(float)sh);
+                    else metal_blit(stex, dtex);
+                } else metal_blit(stex, dtex);
             }
             r=0; }
         else if (MID(SetRenderTarget)){
@@ -3229,6 +3396,8 @@ int com_call(CPU *c, uint32_t magic){
                             (unsigned long long)org[4],(unsigned long long)org[7]); } }
                 uint32_t face = (surf && mem_is_committed(surf+47)) ? MR32(surf+44) : 0u;
                 g_cur_rt = tid;
+                g_cur_rt_w = (tid && mem_is_committed(surf+11)) ? MR32(surf+4) : 0u;
+                g_cur_rt_h = (tid && mem_is_committed(surf+11)) ? MR32(surf+8) : 0u;
                 metal_set_render_target(tid | ((face & 7u) << 16));
                 if (tid) g_rt_set++; else g_rt_screen++;
             }
@@ -3336,7 +3505,7 @@ int com_call(CPU *c, uint32_t magic){
             g_cur_zid = 1;
             if (metal_available()){ void metal_set_zsurf(unsigned); metal_set_zsurf(1);
                                     metal_set_render_target(0); } }
-            g_cur_tex = 0; g_cur_rt = 0; g_cur_ps_id = 0;
+            g_cur_tex = 0; g_cur_rt = 0; g_cur_rt_w = g_cur_rt_h = 0; g_cur_ps_id = 0;
             for (int q6=0;q6<4;q6++) g_tex_stage[q6]=0;
             r=0; }
         else if (MID(SetFVF)){ g_cur_fvf=A(c,1); g_raw_fvf=g_cur_fvf; r=0; }
@@ -3704,6 +3873,15 @@ int com_call(CPU *c, uint32_t magic){
             if(!buf){ buf = gbuf_alloc(pitch*rows + 64u); if(slot) MR32(slot)=buf;
                      if (iface==IF_SURF) g_gb_kept[2] += (pitch*rows + 127u) & ~63u; }
             if(plr){ mem_commit(plr,8); MR32(plr)=pitch; MR32(plr+4)=buf; }
+            /* A lockable render target (CreateRenderTarget, origin 3): the game reads
+             * what was drawn into it -- the magazine / DVD cover photo.  Bring the
+             * pixels back from the GPU (metal.m, READING BACK A LOCKABLE RENDER TARGET);
+             * the buffer used to stay empty and the covers were saved black. */
+            if (iface==IF_SURF && self && buf && mem_is_committed(self+43) && MR32(self+40)==3u &&
+                MR32(self+28) && metal_available()){
+                int metal_rt_readback(unsigned,void*,unsigned,unsigned,unsigned);
+                metal_rt_readback(MR32(self+28), g_mem+buf, pitch, w, h);
+            }
             r=0; }
         else if (MID(UnlockRect)){
             /* 2D: (Level)  |  CUBE: (FaceType, Level)  |  Surface: () */
@@ -3761,6 +3939,10 @@ int com_call(CPU *c, uint32_t magic){
              * GetSurfaceLevel); if the face isn't written, SetRenderTarget draws all six
              * faces into slice 0 (same meaning as BRANCH1). */
             if (cube3){ uint32_t face = A(c,1); MR32(sf+44) = (face < 6u) ? face + 1u : 1u; }
+            /* In D3D9 a texture's surfaces share the texture's reference count, so this
+             * call AddRefs the texture.  The game balances it by releasing the texture
+             * (the car environment map: 6 faces, then 6 Releases of the cube). */
+            if (iface == IF_TEX) rc_addref(self0);
             uint32_t self=A(c,0);
             if (self && mem_is_committed(self+31)){
                 MR32(sf+4)=MR32(self+4); MR32(sf+8)=MR32(self+8);
@@ -4285,6 +4467,7 @@ int com_call(CPU *c, uint32_t magic){
                 }
                 else if (cb == 20u && metal_available()){        /* DIMOUSESTATE2 */
                     metal_fill_mouse(g_mem+p, cb);
+                    tunedrag(g_mem+p);
                     g_dikey_calls++;
                     for (uint32_t q=12;q<20;q++)
                         if (MR8(p+q)){ g_dikey_hits++; break; }
@@ -4292,6 +4475,7 @@ int com_call(CPU *c, uint32_t magic){
                 else if (cb == 16u && metal_available()){   /* DIMOUSESTATE */
                     unsigned char tmpm[20];
                     metal_fill_mouse(tmpm, 20);
+                    tunedrag(tmpm);
                     memcpy(g_mem+p, tmpm, 16);
                     g_dikey_calls++;
                 }
@@ -4542,8 +4726,8 @@ void draw_stats_save(uint64_t *a, uint64_t *b){ g_ptype=a; g_stride=b; }
 
 void com_report(void){
     fprintf(stderr,"\n=== COM / D3D9 KATMANI ===\n");
-    { void ws_report(void); ws_report(); }   /* LOCAL PATCH */
-    { void gamepad_report(void); gamepad_report(); }   /* LOCAL PATCH: gamepad.m */
+    { void ws_report(void); ws_report(); }   /* wsfov.c */
+    { void gamepad_report(void); gamepad_report(); }   /* gamepad.m */
     { void xpatch_report(void); xpatch_report(); }
     if (g_aspfix != 1.f)
         { fprintf(stderr,"  widescreen       : aspfix %.4f, %lu perspective / %lu orthographic draws\n",
@@ -4599,7 +4783,11 @@ void com_report(void){
       fprintf(stderr,"  buffer heap kept  : never freed: shader/decl copies %llu KB, sound buffers %llu KB, "
                      "surface lock buffers %llu KB, other %llu KB\n",
               (unsigned long long)(g_gb_kept[0]>>10), (unsigned long long)(g_gb_kept[1]>>10),
-              (unsigned long long)(g_gb_kept[2]>>10), (unsigned long long)(g_gb_kept[3]>>10)); }
+              (unsigned long long)(g_gb_kept[2]>>10), (unsigned long long)(g_gb_kept[3]>>10));
+      fprintf(stderr,"  refcounts         : %u live objects; %llu last releases (data freed), %llu releases kept "
+                     "(still referenced, %llu with data), %llu uncounted\n",
+              g_rc_n, (unsigned long long)g_rc_last, (unsigned long long)g_rc_kept,
+              (unsigned long long)g_rc_kept_data, (unsigned long long)g_rc_unknown); }
     fprintf(stderr,"  --- DirectInput / DirectSound calls ---\n");
     { int any=0;
       for (unsigned i=1;i<NEL(g_if) && i<MSTAT_IF;i++){

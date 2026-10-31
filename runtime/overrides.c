@@ -13,6 +13,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include "enhance.h"
 
 void guest_backtrace(CPU*,int);
@@ -347,10 +348,137 @@ static void region_install(void){
             want == GAME_REGION_NA ? "North American" : "European", cur, want, why);
 }
 
+/* --- Car shadow height ------------------------------------------------------
+ * The cars' shadow is laid 4 cm above the road (float [0x7a66bc] = 0.04, added to
+ * the ground height at 0x6171cb / 0x622645).  That puts the shadow's edge into the
+ * bottom of each tyre: the lower rim is darkened.  1.5 cm keeps it off the road
+ * surface and out of the tyres.  The lifted code reads the float each time, so
+ * one write at start is enough.  SHADOWZ=<cm> picks another height (4 = the
+ * original game). */
+static void shadow_install(void){
+    uint32_t a = GA(0x7a66bcu);
+    if (!mem_is_committed(a + 3u) || MR32(a) != 0x3d23d70au){          /* 0.04f */
+        fprintf(stderr, "shadow: unexpected value at the shadow height, left unchanged\n");
+        return;
+    }
+    float cm = 1.5f;
+    const char *e = getenv("SHADOWZ");
+    if (e && *e){ cm = (float)atof(e); if (!(cm >= 0.f && cm <= 20.f)) cm = 4.f; }
+    if (cm == 4.f) return;
+    MRF32(a) = cm / 100.f;
+    fprintf(stderr, "shadow: cars' shadows %.1f cm above the road (game: 4)\n", (double)cm);
+}
+
+/* --- Sponsor screens: a Continue button for the mouse ---------------------------
+ * The front end's screen table has a row per screen: package name, constructor,
+ * 0, the help bar's buttons, ...  After a career race the reward screen offers
+ * Continue + Back (0x404), but "Select a sponsor!" (UI_SponsorPopup.fng) and the
+ * sponsor list (UI_Sponsorship_new.fng) offer only Back (0x400).  With the mouse
+ * there was no way forward: Back led to the reward screen and its Continue back
+ * here.  Both get Continue too.  The rows are found by their package name, so the
+ * same code serves both executables. */
+static uint32_t image_find_bytes(const void *pat, uint32_t n, uint32_t from, uint32_t align){
+    extern uint32_t g_image_base, g_image_end;
+    uint32_t a = from ? from : g_image_base;
+    for (; a + n <= g_image_end; a += align)
+        if (!memcmp(g_mem + a, pat, n)) return a;
+    return 0;
+}
+static void sponsor_continue_install(void){
+    extern uint32_t g_image_base, g_image_end;
+    static const char *const pkg[] = { "UI_SponsorPopup.fng", "UI_Sponsorship_new.fng" };
+    int done = 0;
+    for (int k = 0; k < 2; k++){
+        uint32_t s = image_find_bytes(pkg[k], (uint32_t)strlen(pkg[k]) + 1u, 0, 1);
+        if (!s) continue;
+        /* the row: the name's address, then a constructor inside the image */
+        for (uint32_t r = image_find_bytes(&s, 4, 0, 4); r; r = image_find_bytes(&s, 4, r + 4u, 4)){
+            uint32_t ctor = MR32(r + 4u), mask = MR32(r + 12u);
+            if (ctor > g_image_base && ctor < g_image_end && MR32(r + 8u) == 0u && MR32(r + 20u) == 0x80u){
+                if (mask == 0x400u){ MR32(r + 12u) = 0x404u; done++; }
+                break; }
+        }
+    }
+    if (done) fprintf(stderr, "sponsor screens: Continue added to %d of 2\n", done);
+    else fprintf(stderr, "sponsor screens: rows not found, left unchanged\n");
+}
+
+/* --- BOOT MOVIES: skippable logos and notice ----------------------------------
+ * The screens at start play a movie each and go on when it has ended: their
+ * message handler gets 0xc3960eb9 from the player, sets [0x8383a8] and moves to
+ * the next screen (0x4c4f50).  The EA logo, the blank screen and the THX logo
+ * (handler 0x4c53a0) answer nothing else; the notice (PSA, 0x4c53d0) takes
+ * Accept/Start (0x406415e3 / 0xb5af2461) only once a profile exists; the opening
+ * movie (0x4c5330) takes them but not Escape, Space or B.  BOOTMOVIES:
+ *   skippable (default)  Accept or Start, or a new press of Enter, Escape, Space or
+ *                        a controller's A, B or Menu (seen on the screen's per-frame
+ *                        0xc98356ba), reaches the handler as "movie ended"
+ *   off                  they aren't opened (fileio.c); the game goes on as for a missing file
+ *   original             as the game has them
+ * Story and tutorial movies are other screens and never touched. */
+#define MSG_MOVIE_ENDED 0xc3960eb9u
+#define MSG_ACCEPT      0x406415e3u
+#define MSG_START       0xb5af2461u
+#define MSG_TICK        0xc98356bau
+int bootmovies_mode(void){                 /* 0 original, 1 skippable, 2 off */
+    static int m = -1;
+    if (m < 0){ const char *e = getenv("BOOTMOVIES");
+        m = !e || !*e ? 1 : !strcasecmp(e, "off") ? 2 : !strcasecmp(e, "original") ? 0 : 1; }
+    return m;
+}
+static int skip_key_fresh(void){
+    void metal_fill_keyboard(unsigned char *, unsigned); void gamepad_fill(unsigned char *);
+    unsigned char k[256], p[272];
+    metal_fill_keyboard(k, 256); gamepad_fill(p);
+    int down = ((k[0x1C] | k[0x9C] | k[0x01] | k[0x39]) & 0x80) || ((p[0x30] | p[0x31] | p[0x37]) & 0x80);
+    static int was = 1;                    /* a key held since before is no new press */
+    int fresh = down && !was; was = down;
+    return fresh;
+}
+static void boot_movie_message(CPU *c, int own_skip){
+    if (bootmovies_mode() != 1) return;
+    uint32_t msg = MR32(c->esp + 4u);
+    int pad = !own_skip && (msg == MSG_ACCEPT || msg == MSG_START);   /* own_skip: the screen takes them itself */
+    if (pad) (void)skip_key_fresh();       /* the same press must not skip the next movie too */
+    if (pad || (msg == MSG_TICK && skip_key_fresh())){
+        MR32(c->esp + 4u) = MSG_MOVIE_ENDED;
+        static int n = 0;
+        if (n++ < 8) fprintf(stderr, "  [movie] boot movie skipped\n");
+    }
+}
+void sub_004c53a0(CPU *c); void sub_004c53d0(CPU *c); void sub_004c5330(CPU *c);
+static void wrap_logo_screen(CPU *c){    boot_movie_message(c, 0); sub_004c53a0(c); }
+static void wrap_psa_screen(CPU *c){     boot_movie_message(c, 0); sub_004c53d0(c); }
+static void wrap_opening_screen(CPU *c){ boot_movie_message(c, 1); sub_004c5330(c); }
+
+/* --- Tuning graphs: drag a dot with the mouse ------------------------------------
+ * On the ECU and turbo graphs (UI_PerformanceTuning_Graph.fng, message handler
+ * 0x5654e0) the mouse picks a column, but only the wheel or the keys move its dot.
+ * The handler is only watched here: its per-frame message says the screen is up,
+ * and com.c then gives an up/down drag with the left button as wheel turns
+ * (TUNING GRAPH DRAG). */
+static _Atomic long g_graph_tick = -100;
+int tuning_graph_active(void){
+    long metal_frames(void);
+    return metal_frames() - atomic_load(&g_graph_tick) <= 3;
+}
+void sub_005654e0(CPU *c);
+static void wrap_tuning_graph(CPU *c){
+    long metal_frames(void);
+    if (MR32(c->esp + 4u) == MSG_TICK) atomic_store(&g_graph_tick, metal_frames());
+    sub_005654e0(c);
+}
+
 void overrides_install(void){
     void dispatch_patch(uint32_t, void(*)(CPU*));
+    dispatch_patch(GA(0x005654e0u), wrap_tuning_graph);
     dispatch_patch(GA(0x006e2be0u), wrap_6e2be0);
+    dispatch_patch(GA(0x004c53a0u), wrap_logo_screen);
+    dispatch_patch(GA(0x004c53d0u), wrap_psa_screen);
+    dispatch_patch(GA(0x004c5330u), wrap_opening_screen);
     region_install();
+    shadow_install();
+    sponsor_continue_install();
 }
 
 void overrides_report(void){

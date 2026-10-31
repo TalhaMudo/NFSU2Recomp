@@ -343,6 +343,41 @@ T("movhlps", [0x0F,0x28,0x05]+a32(FC+0x80)+[0x0F,0x12,0xC0]+[0x0F,0x29,0x05]+a32
   {}, mem={FC+0x80:1,FC+0x84:2,FC+0x88:3,FC+0x8C:4},
   fmem={FC+0x90:3, FC+0x94:4})
 
+# ---------------- x87 / SSE control instructions the lifter used to trap ----------------
+FX = 0x00C74000
+T("fsincos 1.0: cos on top, sin below",
+  [0xD9,0x05]+a32(FX)+[0xD9,0xFB]+[0xD9,0x1D]+a32(FX+4)+[0xD9,0x1D]+a32(FX+8),
+  {}, memf={FX:1.0}, fmemf={FX+4:0.5403023058681398, FX+8:0.8414709848078965})
+T("fxam 2.0 -> normal (C2)",  [0xD9,0x05]+a32(FX+0x10)+[0xD9,0xE5,0xDF,0xE0,0xDD,0xD8],
+  {}, memf={FX+0x10:2.0}, expect={'ah_and':(0x47,0x04)})
+T("fxam -0.0 -> zero, sign (C3,C1)", [0xD9,0x05]+a32(FX+0x14)+[0xD9,0xE5,0xDF,0xE0,0xDD,0xD8],
+  {}, mem={FX+0x14:0x80000000}, expect={'ah_and':(0x47,0x42)})
+T("fxam +inf -> infinity (C2,C0)", [0xD9,0x05]+a32(FX+0x18)+[0xD9,0xE5,0xDF,0xE0,0xDD,0xD8],
+  {}, mem={FX+0x18:0x7F800000}, expect={'ah_and':(0x47,0x05)})
+# fld 7, fld 3 (ST0=3, ST1=7); a flag setter; fcmovCC st0,st1; fstp result; pop
+def _fcm(name, flagop, op, base, want):
+    T(name, [0xD9,0x05]+a32(base)+[0xD9,0x05]+a32(base+4)+flagop+op+[0xD9,0x1D]+a32(base+8)+[0xDD,0xD8],
+      {}, memf={base:7.0, base+4:3.0}, fmemf={base+8:want})
+_fcm("fcmovbe, CF=1 -> copies",        [0xF9],            [0xDA,0xD1], FX+0x20, 7.0)
+_fcm("fcmovnbe, CF=0 ZF=0 -> copies",  [0x83,0xC8,0x01],  [0xDB,0xD1], FX+0x30, 7.0)
+_fcm("fcmove, ZF=0 -> keeps",          [0x83,0xC8,0x01],  [0xDA,0xC9], FX+0x40, 3.0)
+_fcm("fcmovnb, CF=1 -> keeps",         [0xF9],            [0xDB,0xC1], FX+0x50, 3.0)
+T("xlatb: AL = [EBX+AL]", [0xD7], {'ebx':FX+0x60, 'eax':0xAABBCC02}, mem={FX+0x60:0x44332211},
+  expect={'eax':0xAABBCC33})
+T("stmxcsr: power-on value", [0x0F,0xAE,0x1D]+a32(FX+0x70), {}, fmem={FX+0x70:0x1F80})
+T("ldmxcsr then stmxcsr", [0x0F,0xAE,0x15]+a32(FX+0x74)+[0x0F,0xAE,0x1D]+a32(FX+0x78),
+  {}, mem={FX+0x74:0x00009FC0}, fmem={FX+0x78:0x00009FC0})
+
+# x87 NaN results (SDM vol. 1, table 4-7): fld qword a; fadd qword b; fstp qword r
+def _nan(name, a, b, want, base):
+    T(name, [0xDD,0x05]+a32(base)+[0xDC,0x05]+a32(base+8)+[0xDD,0x1D]+a32(base+16),
+      {}, mem={base:a & 0xffffffff, base+4:a >> 32, base+8:b & 0xffffffff, base+12:b >> 32},
+      fmem={base+16:want & 0xffffffff, base+20:want >> 32})
+_nan("x87 NaN: two QNaNs, larger second",   0x7FF8000000000001, 0x7FF8000000000100, 0x7FF8000000000100, FX+0x80)
+_nan("x87 NaN: two QNaNs, larger first",    0xFFF8000000000300, 0x7FF8000000000002, 0xFFF8000000000300, FX+0xA0)
+_nan("x87 NaN: QNaN beats a larger SNaN",   0x7FF7FFFFFFFFFFFF, 0x7FF8000000000001, 0x7FF8000000000001, FX+0xC0)
+_nan("x87 NaN: lone SNaN comes back quiet", 0x7FF0000000000100, 0x3FF0000000000000, 0x7FF8000000000100, FX+0xE0)
+
 # =====================  GENERATOR / RUNNER  =====================
 BASE = 0x00401000
 def build():
@@ -383,7 +418,7 @@ def gen_c(fns, body):
         if fns[i] is None: continue
         nm = t['name'].replace('"','\\"')
         o.append(f'  /* --- {i}: {nm} --- */')
-        o.append('  { memset(&cpu,0,sizeof cpu); cpu.esp=STK; cpu.top=0; cpu.fcw=0x037f;')
+        o.append('  { memset(&cpu,0,sizeof cpu); cpu.esp=STK; cpu.top=0; cpu.fcw=0x037f; cpu.mxcsr=0x1F80u;')
         for r,v in t['setup'].items():
             o.append(f'    cpu.{r} = 0x{v & 0xffffffff:x}u;')
         for a,v in t['mem'].items():

@@ -98,10 +98,15 @@ chmod +x "$APP/Contents/MacOS/"*
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # --- icon ---
-if [ -x "$ROOT/.venv/bin/python" ]; then
-  "$ROOT/.venv/bin/python" "$ROOT/tools/mkicon.py" "$APP/Contents/Resources/AppIcon.icns" >/dev/null
-else
+# The game's own icon, traced to vectors, when SPEED2.EXE is here (tools/exeicon.py;
+# ICON_EXE= picks another one); otherwise the drawn speedometer (tools/mkicon.py).
+ICON_EXE="${ICON_EXE:-$ROOT/Need for Speed Underground 2 - Clean Edition/Need for Speed Underground 2/SPEED2.EXE}"
+if [ ! -x "$ROOT/.venv/bin/python" ]; then
   echo "warning: no .venv, icon not generated"
+elif [ -f "$ICON_EXE" ] && "$ROOT/.venv/bin/python" "$ROOT/tools/exeicon.py" "$ICON_EXE" "$APP/Contents/Resources/AppIcon.icns" >/dev/null; then
+  :
+else
+  "$ROOT/.venv/bin/python" "$ROOT/tools/mkicon.py" "$APP/Contents/Resources/AppIcon.icns" >/dev/null
 fi
 
 # --- embedded game data (--embed only) ---
