@@ -4,5 +4,5 @@
 capstone>=5.0.6,<6
 pefile>=2023.2.7
 
-# Only for tools/mkicon.py (pack.sh's app icon)
+# Only for pack.sh's app icon (tools/exeicon.py, tools/mkicon.py)
 Pillow>=10
