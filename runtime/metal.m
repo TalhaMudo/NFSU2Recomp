@@ -16,6 +16,7 @@
                      if (!_ei_){ _ei_ = 1; _ev_ = getenv(nm_); } _ev_; })
 
 #import <Metal/Metal.h>
+#import <CoreText/CoreText.h>
 #include "enhance.h"
 #include "perflog.h"
 #include <stdatomic.h>
@@ -6149,6 +6150,88 @@ static void hd_gpass(id<MTLCommandBuffer> cb, int rb, unsigned upto, unsigned zi
 #endif
 /* Must be called on the main thread.  Opens the window and runs the NSApp loop;
  * doesn't return (until the app quits).                                */
+/* ---- FRAME RATE COUNTER (NFSU2_FPSCOUNTER=1, the launcher's Settings) -------------
+ * Frames shown a second, in the top left corner over everything, measured over
+ * half a second.  The label is drawn with CoreText into a small texture only when
+ * the number changes and laid over the finished frame: one extra pass. */
+static int fpsc_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("NFSU2_FPSCOUNTER"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+static void fps_overlay(id<MTLCommandBuffer> cb, id<MTLTexture> dst){
+    enum { TW = 160, TH = 44 };
+    static id<MTLTexture> lab; static int shown = -1, fps = 0; static long f0 = -1; static double t0 = 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    long f = atomic_load(&g_frames_drawn);
+    if (f0 < 0){ f0 = f; t0 = now; }
+    else if (now - t0 >= 0.5){ fps = (int)lround((double)(f - f0) / (now - t0)); f0 = f; t0 = now; }
+    if (!lab){
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                        width:TW height:TH mipmapped:NO];
+        td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageShaderRead;
+        lab = [g_dev newTextureWithDescriptor:td];
+        if (!lab) return;
+    }
+    if (fps != shown){
+        shown = fps;
+        static uint8_t px[TW * TH * 4];
+        memset(px, 0, sizeof px);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef cx = CGBitmapContextCreate(px, TW, TH, 8, TW * 4, cs,
+                              kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+        CGColorSpaceRelease(cs);
+        if (!cx) return;
+        CGContextSetRGBFillColor(cx, 0, 0, 0, 0.55);                 /* dark plate */
+        CGPathRef pl = CGPathCreateWithRoundedRect(CGRectMake(0, 0, TW, TH), 9, 9, NULL);
+        CGContextAddPath(cx, pl); CGContextFillPath(cx); CGPathRelease(pl);
+        char txt[32]; snprintf(txt, sizeof txt, fps > 0 ? "%d fps" : "-- fps", fps);
+        CFStringRef str = CFStringCreateWithCString(NULL, txt, kCFStringEncodingUTF8);
+        CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 26, NULL);
+        CGColorRef white = CGColorCreateGenericRGB(1, 1, 1, 1);
+        CFStringRef keys[2] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
+        CFTypeRef vals[2] = { font, white };
+        CFDictionaryRef at = CFDictionaryCreate(NULL, (const void **)keys, (const void **)vals, 2,
+                                                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFAttributedStringRef as = CFAttributedStringCreate(NULL, str, at);
+        CTLineRef line = CTLineCreateWithAttributedString(as);
+        CGRect b = CTLineGetImageBounds(line, cx);
+        CGContextSetTextPosition(cx, (TW - b.size.width) / 2 - b.origin.x, (TH - b.size.height) / 2 - b.origin.y);
+        CTLineDraw(line, cx);
+        CFRelease(line); CFRelease(as); CFRelease(at); CGColorRelease(white); CFRelease(font); CFRelease(str);
+        CGContextRelease(cx);
+        [lab replaceRegion:MTLRegionMake2D(0, 0, TW, TH) mipmapLevel:0 withBytes:px bytesPerRow:TW * 4];
+    }
+    if (!g_pso || !dst) return;
+    /* about 3.5 % of the screen high, a little in from the top left corner */
+    float h = 0.07f, w = h * (float)TW / (float)TH * (float)dst.height / (float)dst.width;
+    float x0 = -1.f + 0.02f * (float)dst.height / (float)dst.width, y0 = 1.f - 0.02f;
+    float x1 = x0 + w, y1 = y0 - h;
+    MVert q[6]; memset(q, 0, sizeof q);
+    const float px6[6] = { x0, x1, x1, x0, x1, x0 }, py6[6] = { y0, y0, y1, y0, y1, y1 };
+    const float tu[6] = { 0, 1, 1, 0, 1, 0 }, tv[6] = { 0, 0, 1, 0, 1, 1 };
+    for (int i = 0; i < 6; i++){
+        q[i].x = px6[i]; q[i].y = py6[i]; q[i].z = 0.f; q[i].w = 1.f;
+        q[i].r = q[i].g = q[i].b = q[i].a = 1.f;
+        for (int k = 0; k < 4; k++){ q[i].t[k][0] = tu[i]; q[i].t[k][1] = tv[i]; q[i].t[k][2] = 0.f; q[i].t[k][3] = 1.f; }
+    }
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:g_pso];
+    [e setVertexBytes:q length:sizeof q atIndex:0];
+    [e setFragmentSamplerState:g_samp atIndex:0];
+    [e setFragmentTexture:lab atIndex:0];
+    { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } bf;
+      memset(&bf, 0, sizeof bf);
+      [e setFragmentBytes:&bf length:sizeof bf atIndex:0]; }
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    [e endEncoding];
+}
+
 void metal_run_main_loop(void){
     @autoreleasepool {
         metal_early_init();
@@ -7757,6 +7840,7 @@ void metal_run_main_loop(void){
                                 [cb renderCommandEncoderWithDescriptor:rp];
                             [e3 endEncoding];
                         }
+                        if (fpsc_on() && !noshow) fps_overlay(cb, dtex);
                         if (g_perflog && atomic_exchange(&g_pl_thumb_req, 0)) pl_thumb(cb, dtex, fno_pre);
                         /* Take a readable copy BEFORE present: reading back from a presented
                          * drawable's texture isn't reliable. */

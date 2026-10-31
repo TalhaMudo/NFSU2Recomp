@@ -3254,6 +3254,19 @@ int com_call(CPU *c, uint32_t magic){
                   void cov_reset(void); cov_reset();
                   fprintf(stderr,"  coverage reset (Present %u)\n", g_present_no);
               } }
+            /* TICKLOG=1 (measurement): every 2 s of real time, the game's 60 Hz ticks
+             * ([0x7fb708]) and frames per second.  Right at any frame rate: 60 ticks/s. */
+            { static int tl = -1; if (tl < 0) tl = ENVC("TICKLOG") ? 1 : 0;
+              if (tl){ static uint64_t t0 = 0; static uint32_t k0 = 0, f0 = 0;
+                  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                  uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+                  uint32_t k = MR32(GA(0x7fb708u));
+                  if (!t0){ t0 = now; k0 = k; f0 = g_present_no; }
+                  else if (now - t0 >= 2000000000ull){
+                      double s = (double)(now - t0) / 1e9;
+                      fprintf(stderr, "  [tick] Present %u: %.1f ticks/s, %.1f frames/s\n",
+                              g_present_no, (double)(k - k0) / s, (double)(g_present_no - f0) / s);
+                      t0 = now; k0 = k; f0 = g_present_no; } } }
             { const char *rt = ENVC("RBTEST");
               if (rt && metal_available() && !g_rbtest_done && g_present_no == (uint32_t)atoi(rt)){
                   g_rbtest_done = 1; rbtest_run("at Present"); } }

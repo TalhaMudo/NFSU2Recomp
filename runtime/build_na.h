@@ -145,6 +145,8 @@
 #define GA_0x7b6fe8u 0x007b6fe0u   /* operand pair */
 #define GA_0x7d7d3cu 0x007d7d3cu   /* operand pair */
 #define GA_0x7fa73cu 0x00864f24u   /* operand pair */
+#define GA_0x7fb708u 0x007fb708u   /* operand pair */
+#define GA_0x7fb710u 0x007fb710u   /* operand pair */
 #define GA_0x828028u 0x00828028u   /* operand pair */
 #define GA_0x8284e4u 0x008284e4u   /* operand pair */
 #define GA_0x828530u 0x00828530u   /* operand pair */

@@ -469,6 +469,27 @@ static void wrap_tuning_graph(CPU *c){
     sub_005654e0(c);
 }
 
+/* --- Frame rate ------------------------------------------------------------------
+ * The game's own frame limiter waits for a target frame time [0x865558]; its default
+ * [0x7fb710] is 1/120 s and the game goes back to it after a scene that sets its own
+ * (race intros 1/30 or 1/60, a loading step 1/30: 0x576cc0 sets, 0x576ce0 restores).
+ * NFSU2_FPS=<n> (30..240) makes that default 1/n, so menus and races run at n frames
+ * a second; the display's refresh still caps it (vsync).  Game time doesn't depend on
+ * it: the clock is real time and the 60 Hz tick carries its remainder (highfps.c). */
+static void framerate_install(void){
+    const char *e = getenv("NFSU2_FPS");
+    if (!e || !*e) return;
+    int n = atoi(e);
+    uint32_t a = GA(0x7fb710u);
+    if (n < 30 || n > 240 || !mem_is_committed(a + 3u)) return;
+    if (MR32(a) != 0x3c088889u){                                   /* 1/120 */
+        fprintf(stderr, "frame rate: unexpected default frame time, left unchanged\n");
+        return;
+    }
+    MRF32(a) = 1.f / (float)n;
+    fprintf(stderr, "frame rate: %d frames a second (game: 120)\n", n);
+}
+
 void overrides_install(void){
     void dispatch_patch(uint32_t, void(*)(CPU*));
     dispatch_patch(GA(0x005654e0u), wrap_tuning_graph);
@@ -479,6 +500,7 @@ void overrides_install(void){
     region_install();
     shadow_install();
     sponsor_continue_install();
+    framerate_install();
 }
 
 void overrides_report(void){
