@@ -425,6 +425,12 @@ permission. See `LICENSE`.
 **Permission:** to publish, share or build on this code, ask first by opening
 an issue in this repository.
 
+**License history:** early versions of this project were published under the
+MIT License, and a license change became necessary later. Anyone who obtained
+those early versions under the MIT License may keep using them under its
+terms; the license above applies to the current version and everything after
+it.
+
 This project is not affiliated with or endorsed by Electronic Arts. *Need for
 Speed* and *Need for Speed: Underground 2* are trademarks of Electronic Arts
 Inc. The repository contains none of the game's code or data. Screenshots show
