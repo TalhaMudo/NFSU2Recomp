@@ -180,6 +180,61 @@ struct ControllerCard: View {
     }
 }
 
+struct SwitchRow: View {
+    let title: String
+    let text: String
+    @Binding var isOn: Bool
+    var body: some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 12.5)).foregroundColor(Theme.text)
+                Text(text).font(.system(size: 11)).foregroundColor(Theme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: $isOn).labelsHidden().toggleStyle(SwitchToggleStyle())
+        }
+    }
+}
+
+struct ReflectionsCard: View {
+    @ObservedObject var model: LauncherModel
+    private var hdEngine: Bool { model.engine == .hd }
+    var body: some View {
+        Card("Reflections") {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .center) {
+                    Text("Sharpness").font(.system(size: 12.5)).foregroundColor(Theme.text)
+                    Spacer(minLength: 8)
+                    Picker("", selection: $model.reflections) {
+                        Text("Normal (original)").tag(LauncherModel.Reflections.original)
+                        Text("Sharp").tag(LauncherModel.Reflections.sharp)
+                        Text("Sharpest").tag(LauncherModel.Reflections.sharpest)
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+                    .labelsHidden()
+                    .fixedSize()
+                    .disabled(hdEngine)
+                }
+                Text(hdEngine
+                     ? "The HD engine always draws them at least as sharp as Sharpest."
+                     : "The wet road, the mirror and the car paint. Sharper ones cost a little GPU time.")
+                    .font(.system(size: 11)).foregroundColor(Theme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            SwitchRow(title: "Sky in reflections",
+                      text: "The sky shows in the wet road and in the mirror of the bumper and hood views. Off: as in the original game.",
+                      isOn: $model.reflectSky)
+            SwitchRow(title: "Car lights in reflections",
+                      text: "The cars' lights glow brightly in the wet road. Off: as in the original game.",
+                      isOn: $model.reflectLights)
+            SwitchRow(title: "More detail in reflections",
+                      text: "Buildings and cars keep their full detail, and the car paint reflects the far city. Off: as in the original game.",
+                      isOn: $model.reflectDetail)
+        }
+    }
+}
+
 struct MoreCard: View {
     @ObservedObject var model: LauncherModel
     var body: some View {
@@ -280,6 +335,7 @@ struct LauncherView: View {
                 GameCard(model: model)
                 GraphicsCard(model: model)
                 ControllerCard(model: model)
+                ReflectionsCard(model: model)
                 MoreCard(model: model)
 
                 Spacer(minLength: 0)
@@ -301,6 +357,6 @@ struct LauncherView: View {
             .padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 18)
             if let j = model.job { JobOverlay(model: model, job: j) }
         }
-        .frame(width: 560, height: 724)
+        .frame(width: 560, height: 976)
     }
 }

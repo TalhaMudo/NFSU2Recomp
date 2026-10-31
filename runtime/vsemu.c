@@ -901,13 +901,18 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
              " float d = (TSEL(%d)>>4)==2 ? q.w : (TSEL(%d)>>4)==1 ? q.z : 1.0;"
              " tc%d = q.xy / d; }\n", k, k, k, k, k);
     }
-#if NFS_ENHANCED
     /* HD blur mode (see enhance.c): while P.pad0 > 0, in a multi-tap 2D shader the
      * tap offsets are scaled about the center by P.pad0 and the textures are read
      * from mip level P.pad1.  Only enabled for road reflection blur draws; for
      * every other draw pad0 = 0 (the branch comes from the constant buffer, so it
-     * is the same for the whole wave). */
+     * is the same for the whole wave).  The original build has it only while its
+     * road reflection may be larger than the game's (reflect.c). */
+#if NFS_ENHANCED
     int hdblur = __builtin_popcount(tcuse) >= 2 && !(cubemask & tcuse);
+#else
+    int refl_road_grows(void);
+    int hdblur = refl_road_grows() && __builtin_popcount(tcuse) >= 2 && !(cubemask & tcuse);
+#endif
     if (hdblur){
         int n = __builtin_popcount(tcuse);
         EMIT("  if (P.pad0 > 0.0) { float2 m = float2(0.0)");
@@ -916,9 +921,6 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
         for (int k = 0; k < 4; k++) if (tcuse & (1u << k)) EMIT(" tc%d = m + (tc%d - m) * P.pad0;", k, k);
         EMIT(" }\n");
     }
-#else
-    int hdblur = 0;
-#endif
     /* Sampling per stage: uv2 is used for 2D, uv3 for cubes. */
     for (int k = 0; k < 4; k++){
         if (g_fb_in >= 0 && k == 0)

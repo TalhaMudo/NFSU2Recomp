@@ -71,6 +71,10 @@ enum Prefs {
     static let engine = "LauncherEngine"           // "original" | "hd"
     static let showAtStartup = "LauncherShowAtStartup"
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
+    static let reflections = "LauncherReflections" // NFSU2_REFLECTIONS: "original" | "sharp" | "sharpest"
+    static let reflectSky = "LauncherReflectSky"   // NFSU2_REFLECT_SKY=1
+    static let reflectLights = "LauncherReflectLights"   // NFSU2_REFLECT_LIGHTS=1
+    static let reflectDetail = "LauncherReflectDetail"   // NFSU2_REFLECT_DETAIL=1
 }
 
 enum Locator {

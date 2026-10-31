@@ -4,6 +4,7 @@ import Darwin
 
 final class LauncherModel: ObservableObject {
     enum Engine: String { case original, hd }
+    enum Reflections: String { case original, sharp, sharpest }
 
     struct Job {
         var phase: String
@@ -24,6 +25,10 @@ final class LauncherModel: ObservableObject {
     @Published var controller: Bool { didSet { defaults.set(controller, forKey: Prefs.controller) } }
     @Published var stickDeadzone: Double { didSet { defaults.set(stickDeadzone, forKey: Prefs.stickDeadzone) } }
     private var setPad = false           // NFSU2_PAD / NFSU2_PAD_DEADZONE were set by us
+    @Published var reflections: Reflections { didSet { defaults.set(reflections.rawValue, forKey: Prefs.reflections) } }
+    @Published var reflectSky: Bool { didSet { defaults.set(reflectSky, forKey: Prefs.reflectSky) } }
+    @Published var reflectLights: Bool { didSet { defaults.set(reflectLights, forKey: Prefs.reflectLights) } }
+    @Published var reflectDetail: Bool { didSet { defaults.set(reflectDetail, forKey: Prefs.reflectDetail) } }
     @Published var job: Job? = nil
     @Published var notice: String? = nil
 
@@ -56,6 +61,10 @@ final class LauncherModel: ObservableObject {
         wideHUD = defaults.bool(forKey: Prefs.wideHUD)
         controller = defaults.bool(forKey: Prefs.controller)
         stickDeadzone = min(0.5, max(0, defaults.double(forKey: Prefs.stickDeadzone)))
+        reflections = Reflections(rawValue: defaults.string(forKey: Prefs.reflections) ?? "") ?? .original
+        reflectSky = defaults.bool(forKey: Prefs.reflectSky)
+        reflectLights = defaults.bool(forKey: Prefs.reflectLights)
+        reflectDetail = defaults.bool(forKey: Prefs.reflectDetail)
     }
 
     var location: GameLocation? {
@@ -130,6 +139,11 @@ final class LauncherModel: ObservableObject {
             setenv("NFSU2_PAD_DEADZONE", String(format: "%.2f", stickDeadzone), 1)
             setPad = true
         }
+        // Reflections (engine: reflect.c).  A variable given by the caller wins.
+        if reflections != .original { setenv("NFSU2_REFLECTIONS", reflections.rawValue, 0) }
+        if reflectSky { setenv("NFSU2_REFLECT_SKY", "1", 0) }
+        if reflectLights { setenv("NFSU2_REFLECT_LIGHTS", "1", 0) }
+        if reflectDetail { setenv("NFSU2_REFLECT_DETAIL", "1", 0) }
         var e = engine
         if !hasEngine(e) { e = (e == .hd) ? .original : .hd }
         let path = Paths.engine(loc.build, hd: e == .hd).path
