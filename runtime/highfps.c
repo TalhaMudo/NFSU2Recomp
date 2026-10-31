@@ -47,7 +47,7 @@
 #include <string.h>
 #include <strings.h>
 
-#if defined(NFS_EXE_NA) || !defined(XP_HF_TICK)
+#if !defined(XP_HF_TICK)
 void highfps_install(void){}
 int  highfps_hook(CPU *c, uint32_t ip){ (void)c; (void)ip; return 0; }
 void highfps_report(void){}
@@ -55,14 +55,14 @@ void highfps_report(void){}
 
 extern unsigned char g_xpatch[];
 
-/* ---- European v1.2 addresses ---- */
-#define A_REAL_STEP    0x00865194u   /* the frame's real time step, seconds          */
-#define A_FRAME        0x00870818u   /* frame counter                                */
-#define A_NOS_LAST     0x008a44ecu   /* frame UpdateCarStreakingFlares last ran      */
-#define HOOK_PARTICLE  0x005d2c27u   /* call 0x492e10, [esp] = 1/60 step             */
-#define HOOK_NOS       0x0061ad90u   /* UpdateCarStreakingFlares: mov eax, [0x870818] */
-#define HOOK_BARS      0x005cbe54u   /* fld [esp+0xc]: letterbox bar height          */
-#define HOOK_PROJ      0x005c804eu   /* fld [esp+0x38]: view scales ready            */
+/* ---- European v1.2 addresses (GA(): the North American build's through runtime/build_na.h) ---- */
+#define A_REAL_STEP    GA(0x00865194u)   /* the frame's real time step, seconds          */
+#define A_FRAME        GA(0x00870818u)   /* frame counter                                */
+#define A_NOS_LAST     GA(0x008a44ecu)   /* frame UpdateCarStreakingFlares last ran      */
+#define HOOK_PARTICLE  GA(0x005d2c27u)   /* call 0x492e10, [esp] = 1/60 step             */
+#define HOOK_NOS       GA(0x0061ad90u)   /* UpdateCarStreakingFlares: mov eax, [0x870818] */
+#define HOOK_BARS      GA(0x005cbe54u)   /* fld [esp+0xc]: letterbox bar height          */
+#define HOOK_PROJ      GA(0x005c804eu)   /* fld [esp+0x38]: view scales ready            */
 #define BAR_FULL       0.125f        /* bar height when the letterbox is in          */
 
 static struct { char sec[16], key[32], val[32]; } g_ini[48];
@@ -148,8 +148,8 @@ void highfps_install(void){
     const char *offl = getenv("NFSU2_HIGHFPS_OFF");
 
     /* the code at the sites must be the expected one */
-    if (MR8(0x0057a094u) != 0x75 || MR32(0x00435fa4u) != 0x41f00000u ||
-        MR32(HOOK_PARTICLE - 4u) != 0x835860u || MR32(HOOK_PARTICLE - 9u) != 0x3c888889u ||
+    if (MR8(GA(0x0057a094u)) != 0x75 || MR32(GA(0x00435fa4u)) != 0x41f00000u ||
+        MR32(HOOK_PARTICLE - 4u) != GA(0x00835860u) || MR32(HOOK_PARTICLE - 9u) != 0x3c888889u ||
         MR8(HOOK_NOS) != 0xa1 || MR32(HOOK_NOS + 1u) != A_FRAME || MR32(HOOK_NOS + 7u) != A_NOS_LAST ||
         MR32(HOOK_BARS) != 0x0c2444d9u || MR32(HOOK_PROJ) != 0x382444d9u){
         fprintf(stderr, "  [highfps] unexpected code at the patch sites: off\n");

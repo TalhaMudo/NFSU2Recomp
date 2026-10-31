@@ -30,7 +30,8 @@ case "$SHA" in
     export XPATCH="${XPATCH:-tools/xpatch_eu.txt}" ;;   # tools/xpatch.py
   f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7)
     BUILD=na; DEF=gen/na; WORK=out/na; OVR=$OVR_NA; export LIFT_MISSING=1
-    export HOOKS="${HOOKS:-0x5c7fee,0x4ec35c,0x726336}" ;;   # runtime/wsfov.c, sndlead.c (same sites, NA addresses)
+    export HOOKS="${HOOKS:-0x5c7fee,0x4ec35c,0x726336,0x5d2c17,0x61ad80,0x5cbe44,0x5c803e}"   # runtime/wsfov.c, sndlead.c, highfps.c (NA addresses)
+    export XPATCH="${XPATCH:-tools/xpatch_na.txt}" ;;   # tools/xpatch.py
   *) echo "unsupported SPEED2.EXE (sha256 $SHA); see README, \"Game versions\""; exit 1 ;;
 esac
 OUT="${GENOUT:-$DEF}"
