@@ -128,6 +128,7 @@
 #define GA_0x669fa6u 0x00669f96u   /* function 00669f40 + 0x66 */
 #define GA_0x669fe5u 0x00669fd5u   /* function 00669fc3 + 0x22 */
 #define GA_0x66d8afu 0x0066d89fu   /* function 0066d7e9 + 0xc6 */
+#define GA_0x7a66bcu 0x007a66b4u   /* operand pair */
 #define GA_0x7b6fe8u 0x007b6fe0u   /* operand pair */
 #define GA_0x7d7d3cu 0x007d7d3cu   /* operand pair */
 #define GA_0x7fa73cu 0x00864f24u   /* operand pair */

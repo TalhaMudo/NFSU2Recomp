@@ -347,10 +347,67 @@ static void region_install(void){
             want == GAME_REGION_NA ? "North American" : "European", cur, want, why);
 }
 
+/* --- Car shadow height ------------------------------------------------------
+ * The cars' shadow is laid 4 cm above the road (float [0x7a66bc] = 0.04, added to
+ * the ground height at 0x6171cb / 0x622645).  That puts the shadow's edge into the
+ * bottom of each tyre: the lower rim is darkened.  1.5 cm keeps it off the road
+ * surface and out of the tyres.  The lifted code reads the float each time, so
+ * one write at start is enough.  SHADOWZ=<cm> picks another height (4 = the
+ * original game). */
+static void shadow_install(void){
+    uint32_t a = GA(0x7a66bcu);
+    if (!mem_is_committed(a + 3u) || MR32(a) != 0x3d23d70au){          /* 0.04f */
+        fprintf(stderr, "shadow: unexpected value at the shadow height, left unchanged\n");
+        return;
+    }
+    float cm = 1.5f;
+    const char *e = getenv("SHADOWZ");
+    if (e && *e){ cm = (float)atof(e); if (!(cm >= 0.f && cm <= 20.f)) cm = 4.f; }
+    if (cm == 4.f) return;
+    MRF32(a) = cm / 100.f;
+    fprintf(stderr, "shadow: cars' shadows %.1f cm above the road (game: 4)\n", (double)cm);
+}
+
+/* --- Sponsor screens: a Continue button for the mouse ---------------------------
+ * The front end's screen table has a row per screen: package name, constructor,
+ * 0, the help bar's buttons, ...  After a career race the reward screen offers
+ * Continue + Back (0x404), but "Select a sponsor!" (UI_SponsorPopup.fng) and the
+ * sponsor list (UI_Sponsorship_new.fng) offer only Back (0x400).  With the mouse
+ * there was no way forward: Back led to the reward screen and its Continue back
+ * here.  Both get Continue too.  The rows are found by their package name, so the
+ * same code serves both executables. */
+static uint32_t image_find_bytes(const void *pat, uint32_t n, uint32_t from, uint32_t align){
+    extern uint32_t g_image_base, g_image_end;
+    uint32_t a = from ? from : g_image_base;
+    for (; a + n <= g_image_end; a += align)
+        if (!memcmp(g_mem + a, pat, n)) return a;
+    return 0;
+}
+static void sponsor_continue_install(void){
+    extern uint32_t g_image_base, g_image_end;
+    static const char *const pkg[] = { "UI_SponsorPopup.fng", "UI_Sponsorship_new.fng" };
+    int done = 0;
+    for (int k = 0; k < 2; k++){
+        uint32_t s = image_find_bytes(pkg[k], (uint32_t)strlen(pkg[k]) + 1u, 0, 1);
+        if (!s) continue;
+        /* the row: the name's address, then a constructor inside the image */
+        for (uint32_t r = image_find_bytes(&s, 4, 0, 4); r; r = image_find_bytes(&s, 4, r + 4u, 4)){
+            uint32_t ctor = MR32(r + 4u), mask = MR32(r + 12u);
+            if (ctor > g_image_base && ctor < g_image_end && MR32(r + 8u) == 0u && MR32(r + 20u) == 0x80u){
+                if (mask == 0x400u){ MR32(r + 12u) = 0x404u; done++; }
+                break; }
+        }
+    }
+    if (done) fprintf(stderr, "sponsor screens: Continue added to %d of 2\n", done);
+    else fprintf(stderr, "sponsor screens: rows not found, left unchanged\n");
+}
+
 void overrides_install(void){
     void dispatch_patch(uint32_t, void(*)(CPU*));
     dispatch_patch(GA(0x006e2be0u), wrap_6e2be0);
     region_install();
+    shadow_install();
+    sponsor_continue_install();
 }
 
 void overrides_report(void){
