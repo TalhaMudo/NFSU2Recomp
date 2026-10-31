@@ -2202,6 +2202,23 @@ static void rbtest_run(const char *where){
     free(px);
 }
 static int g_rbtest_done = 0;
+
+/* TUNING GRAPH DRAG: while the ECU / turbo graph is up (overrides.c), moving the
+ * mouse up or down with the left button held turns the wheel for the game, one
+ * notch per 8 units of the 640x480 menu: the dot of the picked column follows the
+ * pointer.  TUNEDRAG=0 turns it off.  ms: DIMOUSESTATE(2), wheel at +8, button 0 at +12. */
+static void tunedrag(unsigned char *ms){
+    int tuning_graph_active(void); void metal_get_cursor(int *, int *);
+    static int on = -1, held = 0, acc = 0, lasty = 0;
+    if (on < 0){ const char *e = ENVC("TUNEDRAG"); on = !(e && *e == '0'); }
+    if (!on || !tuning_graph_active() || !(ms[12] & 0x80)){ held = 0; return; }
+    int x, y; metal_get_cursor(&x, &y); (void)x;
+    int y480 = g_bb_h ? (int)((long)y * 480 / (long)g_bb_h) : y;
+    if (!held){ held = 1; lasty = y480; acc = 0; return; }
+    acc += lasty - y480; lasty = y480;               /* up is positive, like the wheel */
+    int notches = acc / 8; acc -= notches * 8;
+    if (notches){ int32_t dz; memcpy(&dz, ms + 8, 4); dz += notches * 120; memcpy(ms + 8, &dz, 4); }
+}
 int com_call(CPU *c, uint32_t magic){
     uint32_t iface=(magic>>16)&0x1FFFu, m=magic&0xFFFFu;
     g_com_calls++;
@@ -4450,6 +4467,7 @@ int com_call(CPU *c, uint32_t magic){
                 }
                 else if (cb == 20u && metal_available()){        /* DIMOUSESTATE2 */
                     metal_fill_mouse(g_mem+p, cb);
+                    tunedrag(g_mem+p);
                     g_dikey_calls++;
                     for (uint32_t q=12;q<20;q++)
                         if (MR8(p+q)){ g_dikey_hits++; break; }
@@ -4457,6 +4475,7 @@ int com_call(CPU *c, uint32_t magic){
                 else if (cb == 16u && metal_available()){   /* DIMOUSESTATE */
                     unsigned char tmpm[20];
                     metal_fill_mouse(tmpm, 20);
+                    tunedrag(tmpm);
                     memcpy(g_mem+p, tmpm, 16);
                     g_dikey_calls++;
                 }

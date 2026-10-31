@@ -13,6 +13,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include "enhance.h"
 
 void guest_backtrace(CPU*,int);
@@ -450,8 +451,27 @@ static void wrap_logo_screen(CPU *c){    boot_movie_message(c, 0); sub_004c53a0(
 static void wrap_psa_screen(CPU *c){     boot_movie_message(c, 0); sub_004c53d0(c); }
 static void wrap_opening_screen(CPU *c){ boot_movie_message(c, 1); sub_004c5330(c); }
 
+/* --- Tuning graphs: drag a dot with the mouse ------------------------------------
+ * On the ECU and turbo graphs (UI_PerformanceTuning_Graph.fng, message handler
+ * 0x5654e0) the mouse picks a column, but only the wheel or the keys move its dot.
+ * The handler is only watched here: its per-frame message says the screen is up,
+ * and com.c then gives an up/down drag with the left button as wheel turns
+ * (TUNING GRAPH DRAG). */
+static _Atomic long g_graph_tick = -100;
+int tuning_graph_active(void){
+    long metal_frames(void);
+    return metal_frames() - atomic_load(&g_graph_tick) <= 3;
+}
+void sub_005654e0(CPU *c);
+static void wrap_tuning_graph(CPU *c){
+    long metal_frames(void);
+    if (MR32(c->esp + 4u) == MSG_TICK) atomic_store(&g_graph_tick, metal_frames());
+    sub_005654e0(c);
+}
+
 void overrides_install(void){
     void dispatch_patch(uint32_t, void(*)(CPU*));
+    dispatch_patch(GA(0x005654e0u), wrap_tuning_graph);
     dispatch_patch(GA(0x006e2be0u), wrap_6e2be0);
     dispatch_patch(GA(0x004c53a0u), wrap_logo_screen);
     dispatch_patch(GA(0x004c53d0u), wrap_psa_screen);
