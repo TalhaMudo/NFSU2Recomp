@@ -70,6 +70,29 @@ enum Prefs {
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
 }
 
+/// The "Picture" card: optional settings, each passed to the engine as an environment
+/// variable (runtime/visual.c, runtime/picture.m).  The first choice of every option
+/// is the original game and sets nothing.
+struct PictureOption {
+    let key: String                  // launcher default: the chosen index
+    let title: String
+    let env: String
+    let choices: [(label: String, value: String)]
+}
+
+enum PictureOptions {
+    static let all: [PictureOption] = [
+        PictureOption(key: "LauncherColourTint", title: "Colour", env: "TINT",
+                      choices: [("As on PC (original)", ""), ("Less tint", "less"), ("No tint", "none"), ("Cool", "cool")]),
+        PictureOption(key: "LauncherGamma", title: "Gamma", env: "CONSOLEGAMMA",
+                      choices: [("As on PC (original)", ""), ("Console", "1")]),
+        PictureOption(key: "LauncherEdgeSmoothing", title: "Edge smoothing", env: "EDGEAA",
+                      choices: [("Off, as on PC (original)", ""), ("On", "1")]),
+        PictureOption(key: "LauncherSharpening", title: "Sharpening", env: "SHARPEN",
+                      choices: [("Off, as on PC (original)", ""), ("Low", "50"), ("High", "100")]),
+    ]
+}
+
 enum Locator {
     static func exeIn(_ dir: URL) -> URL? {
         for n in SupportedExe.names {
