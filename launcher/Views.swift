@@ -1,4 +1,5 @@
-// The launcher window.  SwiftUI as available on macOS 11 (the app's minimum).
+// The launcher's main window and the look it shares with Settings (Settings.swift).
+// SwiftUI as available on macOS 11 (the app's minimum).
 import SwiftUI
 
 enum Theme {
@@ -48,12 +49,14 @@ struct SecondaryButtonStyle: ButtonStyle {
 struct Card<Content: View>: View {
     let title: String
     let content: Content
-    init(_ title: String, @ViewBuilder content: () -> Content) { self.title = title; self.content = content() }
+    init(_ title: String = "", @ViewBuilder content: () -> Content) { self.title = title; self.content = content() }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title.uppercased())
-                .font(.system(size: 10.5, weight: .semibold)).foregroundColor(Theme.dim)
-                .tracking(0.8)
+            if !title.isEmpty {
+                Text(title.uppercased())
+                    .font(.system(size: 10.5, weight: .semibold)).foregroundColor(Theme.dim)
+                    .tracking(0.8)
+            }
             content
         }
         .padding(14)
@@ -113,103 +116,6 @@ struct GameCard: View {
     }
 }
 
-struct GraphicsCard: View {
-    @ObservedObject var model: LauncherModel
-    var body: some View {
-        Card("Graphics") {
-            if model.canChooseEngine {
-                Picker("", selection: $model.engine) {
-                    Text("Original").tag(LauncherModel.Engine.original)
-                    Text("HD").tag(LauncherModel.Engine.hd)
-                }
-                .pickerStyle(SegmentedPickerStyle())
-                .labelsHidden()
-                .fixedSize()
-                Text(model.engine == .hd
-                     ? "Anti-aliasing and ray-traced reflections on top of the game's own look. The Mac works harder and gets warmer."
-                     : "The game exactly as it looked on PC. Uses the least power.")
-                    .font(.system(size: 11)).foregroundColor(Theme.dim)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Start in full screen").font(.system(size: 12.5)).foregroundColor(Theme.text)
-                    Text("Cmd-F switches while playing. Resolution: in the game, Options › Display.")
-                        .font(.system(size: 11)).foregroundColor(Theme.dim)
-                }
-                Spacer(minLength: 8)
-                Toggle("", isOn: $model.fullscreen).labelsHidden().toggleStyle(SwitchToggleStyle())
-            }
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("HUD at the screen edges").font(.system(size: 12.5)).foregroundColor(Theme.text)
-                    Text("On wide screens the minimap moves to the left and the gauges to the right. Off: the HUD stays in the 4:3 middle.")
-                        .font(.system(size: 11)).foregroundColor(Theme.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 8)
-                Toggle("", isOn: $model.wideHUD).labelsHidden().toggleStyle(SwitchToggleStyle())
-            }
-        }
-    }
-}
-
-struct ControllerCard: View {
-    @ObservedObject var model: LauncherModel
-    var body: some View {
-        Card("Controller") {
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Use a game controller").font(.system(size: 12.5)).foregroundColor(Theme.text)
-                    Text("Xbox, PlayStation or MFi. Connect it before Play; buttons are set in the game's Controls menu.")
-                        .font(.system(size: 11)).foregroundColor(Theme.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 8)
-                Toggle("", isOn: $model.controller).labelsHidden().toggleStyle(SwitchToggleStyle())
-            }
-            HStack(alignment: .center, spacing: 10) {
-                Text("Stick dead zone").font(.system(size: 12.5)).foregroundColor(Theme.text)
-                Slider(value: $model.stickDeadzone, in: 0...0.5, step: 0.01)
-                Text("\(Int((model.stickDeadzone * 100).rounded())) %")
-                    .font(.system(size: 11.5).monospacedDigit()).foregroundColor(Theme.dim)
-                    .frame(width: 40, alignment: .trailing)
-            }
-            .disabled(!model.controller).opacity(model.controller ? 1 : 0.5)
-        }
-    }
-}
-
-struct MoreCard: View {
-    @ObservedObject var model: LauncherModel
-    var body: some View {
-        Card("More") {
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Portable copy").font(.system(size: 12.5, weight: .medium)).foregroundColor(Theme.text)
-                    Text("One app with the game inside, for another Mac or a USB drive. Movies and language packs can be left out to make it smaller.")
-                        .font(.system(size: 11)).foregroundColor(Theme.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 6)
-                Button("Make Copy…") { model.makePortable() }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .disabled(!model.isReady)
-            }
-            HStack(spacing: 8) {
-                Button("Saves…") { model.manageSaves() }.buttonStyle(SecondaryButtonStyle())
-                Button("Logs") { model.openLogs() }.buttonStyle(SecondaryButtonStyle())
-                Button("Reset Graphics Settings…") { model.resetGraphics() }.buttonStyle(SecondaryButtonStyle())
-                Spacer(minLength: 0)
-                Button("Report a Problem") { model.reportProblem() }.buttonStyle(SecondaryButtonStyle())
-            }
-            if let n = model.notice {
-                Text(n).font(.system(size: 11)).foregroundColor(Theme.accent)
-            }
-        }
-    }
-}
-
 struct JobOverlay: View {
     @ObservedObject var model: LauncherModel
     let job: LauncherModel.Job
@@ -252,8 +158,12 @@ struct JobOverlay: View {
     }
 }
 
+/// The main window: kept small and of a fixed size; options live in Settings
+/// (Settings.swift).  Only what a player needs before Play stays here.
 struct LauncherView: View {
+    static let size = CGSize(width: 560, height: 430)
     @ObservedObject var model: LauncherModel
+    let openSettings: () -> Void
 
     private var versionText: String {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -272,15 +182,29 @@ struct LauncherView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Need for Speed Underground 2")
                             .font(.system(size: 21, weight: .bold)).foregroundColor(Theme.text)
-                        Text(versionText).font(.system(size: 11.5)).foregroundColor(Theme.dim)
+                        HStack(alignment: .lastTextBaseline) {
+                            Text(versionText).font(.system(size: 11.5)).foregroundColor(Theme.dim)
+                            Spacer(minLength: 8)
+                            Button("Report a Problem") { model.reportProblem() }.buttonStyle(SecondaryButtonStyle())
+                        }
                     }
                 }
                 .padding(.bottom, 4)
 
                 GameCard(model: model)
-                GraphicsCard(model: model)
-                ControllerCard(model: model)
-                MoreCard(model: model)
+                Card {
+                    SettingRow(title: "Start in full screen",
+                               description: "Cmd-F switches while playing. Resolution: in the game, Options › Display.",
+                               isOn: $model.fullscreen)
+                }
+                // Windows on the left (a new one, e.g. Texture Packs…, gets a button
+                // after Saves…), folders on the right.
+                HStack(spacing: 8) {
+                    Button("Settings…") { openSettings() }.buttonStyle(SecondaryButtonStyle())
+                    Button("Saves…") { model.manageSaves() }.buttonStyle(SecondaryButtonStyle())
+                    Spacer(minLength: 0)
+                    Button("Logs") { model.openLogs() }.buttonStyle(SecondaryButtonStyle())
+                }
 
                 Spacer(minLength: 0)
                 HStack(alignment: .center) {
@@ -301,6 +225,6 @@ struct LauncherView: View {
             .padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 18)
             if let j = model.job { JobOverlay(model: model, job: j) }
         }
-        .frame(width: 560, height: 724)
+        .frame(width: LauncherView.size.width, height: LauncherView.size.height)
     }
 }

@@ -187,6 +187,25 @@ final class LauncherModel: ObservableObject {
         catch { alert("Could not reset the settings", error.localizedDescription) }
     }
 
+    /// Every option as in the original game (Prefs.originalGame)?
+    var isOriginalGame: Bool { Prefs.originalGame.allSatisfy { $0.isSet(self) } }
+
+    /// Settings › Restore Original Game.  Each option saves itself as it is set.
+    func restoreOriginalGame() {
+        for o in Prefs.originalGame { o.restore(self) }
+    }
+
+    func confirmRestoreOriginalGame() {
+        let a = NSAlert()
+        a.messageText = "Restore the original game?"
+        a.informativeText = "Every option in Settings goes back to the value that gives the original, unmodified game. Full screen, the game folder, the game's own settings and career saves are not changed."
+        a.addButton(withTitle: "Restore")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        restoreOriginalGame()
+        notice = "Every option is back as in the original game."
+    }
+
     // MARK: portable copy
 
     func makePortable() {

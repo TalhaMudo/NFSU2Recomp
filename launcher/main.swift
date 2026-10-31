@@ -14,6 +14,7 @@
 //   NFSU2_SKIP_LAUNCHER=1        start the engine without showing the window
 //   NFSU2_ENGINE=original|hd     engine choice for this start
 //   NFSU2_LAUNCHER_SNAPSHOT=x.png  draw the window into a PNG and quit (never shown)
+//   NFSU2_LAUNCHER_SNAPSHOT_SETTINGS=graphics|more|...  with the above: the Settings window on that tab
 //   NFSU2_LAUNCHER_STATE=ready|notfound|unsupported|embedded|copying|done   fake state for the snapshot
 //   NFSU2_LAUNCHER_TEST=portable:<game folder>:<destination.app>   build a portable copy, quit
 //                                (NFSU2_LAUNCHER_TEST_LEAVE_OUT=MOVIES,LANGPACKS: without those)
@@ -25,6 +26,7 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = LauncherModel()
     var window: NSWindow?
+    var settingsWindow: NSWindow?
     let env = ProcessInfo.processInfo.environment
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -49,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         if let s = env["NFSU2_LAUNCHER_STATE"] { fakeState(s) }
         buildMenu()
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 724),
+        let w = NSWindow(contentRect: NSRect(origin: .zero, size: LauncherView.size),
                          styleMask: [.titled, .closable, .miniaturizable],
                          backing: .buffered, defer: false)
         w.titlebarAppearsTransparent = true
@@ -58,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         w.isMovableByWindowBackground = true
         w.appearance = NSAppearance(named: .darkAqua)
         w.backgroundColor = NSColor(calibratedRed: 0.067, green: 0.071, blue: 0.082, alpha: 1)
-        w.contentView = NSHostingView(rootView: LauncherView(model: model))
+        w.contentView = NSHostingView(rootView: LauncherView(model: model) { [weak self] in self?.showSettings(nil) })
         w.center()
         w.delegate = self
         window = w
@@ -70,10 +72,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         if let path = snapshot {
-            w.setFrameOrigin(NSPoint(x: -10000, y: -10000))
-            w.orderBack(nil)
+            var shot = w
+            if let name = env["NFSU2_LAUNCHER_SNAPSHOT_SETTINGS"] {
+                guard let t = SettingsTab(rawValue: name), SettingsTab.shown.contains(t) else {
+                    print("NFSU2_LAUNCHER_SNAPSHOT_SETTINGS: one of " + SettingsTab.shown.map(\.rawValue).joined(separator: ", "))
+                    exit(2)
+                }
+                shot = makeSettingsWindow(model: model, tab: t)
+            }
+            shot.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+            shot.orderBack(nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                guard let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { exit(1) }
+                guard let v = shot.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { exit(1) }
                 v.cacheDisplay(in: v.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
                 exit(0)
@@ -84,6 +94,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Settings… in the window and the app menu (Cmd-,).
+    @objc func showSettings(_ sender: Any?) {
+        guard !model.isPlaying else { return }
+        if settingsWindow == nil { settingsWindow = makeSettingsWindow(model: model, tab: SettingsTab.shown[0]) }
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
     // Not while the engine runs: hiding the window on Play would otherwise quit us,
     // and open -W / session.sh would stop waiting for the game.
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { !model.isPlaying }
@@ -92,6 +109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if model.isCopying { NSApp.terminate(nil); return false }
         return true
     }
+    // Settings goes with the main window (and the app with them).
+    func windowWillClose(_ note: Notification) { settingsWindow?.close() }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         model.shouldTerminate()
@@ -120,6 +139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         main.addItem(appItem)
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About NFSU2", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: ",").target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide NFSU2", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(withTitle: "Quit NFSU2", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
