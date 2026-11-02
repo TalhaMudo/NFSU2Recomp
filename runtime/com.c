@@ -4843,7 +4843,8 @@ void com_report(void){
     { const char *cp = ENVC("COVREPORT");
       if (cp){ void cov_report(const char*); cov_report(cp); } }
     { extern uint64_t g_timer_ticks;
-      fprintf(stderr,"  timer ticks       : %llu\n", (unsigned long long)g_timer_ticks); }
+      fprintf(stderr,"  timer ticks       : %llu\n", (unsigned long long)g_timer_ticks);
+      void timer_report(void); timer_report(); }
     fprintf(stderr,"  draw matrix       : %llu valid, %llu broken\n",
             (unsigned long long)g_mat_ok,(unsigned long long)g_mat_bad);
     fprintf(stderr,"  DI action map     : %d keys bound, %llu events produced\n",
