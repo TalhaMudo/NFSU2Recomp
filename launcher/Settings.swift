@@ -136,6 +136,13 @@ struct ControlsSettings: View {
                     }
                 }
                 .disabled(!model.controller).opacity(model.controller ? 1 : 0.5)
+                SettingRow(title: "XtendedInput layout",
+                           description: model.canUseXtendedInput
+                               ? "RT accelerates, LT brakes, every button as in the NFSU-XtendedInput mod, set in scripts/NFSU_XtendedInput.ini in the game folder if there is one. Off: buttons are set in the game's Controls menu."
+                               : "Needs the North American v1.2 SPEED2.EXE.",
+                           isOn: $model.xtendedInput)
+                .disabled(!model.controller || !model.canUseXtendedInput)
+                .opacity(model.controller && model.canUseXtendedInput ? 1 : 0.5)
             }
         }
     }

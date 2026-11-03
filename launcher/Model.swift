@@ -28,6 +28,8 @@ final class LauncherModel: ObservableObject {
     @Published var controller: Bool { didSet { defaults.set(controller, forKey: Prefs.controller) } }
     @Published var stickDeadzone: Double { didSet { defaults.set(stickDeadzone, forKey: Prefs.stickDeadzone) } }
     private var setPad = false           // NFSU2_PAD / NFSU2_PAD_DEADZONE were set by us
+    @Published var xtendedInput: Bool { didSet { defaults.set(xtendedInput, forKey: Prefs.xtendedInput) } }
+    private let xtendedInputFromEnv = ProcessInfo.processInfo.environment["NFSU2_XTINPUT"] != nil
     @Published var job: Job? = nil
     @Published var notice: String? = nil
 
@@ -63,7 +65,11 @@ final class LauncherModel: ObservableObject {
         fpsCounter = defaults.bool(forKey: Prefs.fpsCounter)
         controller = defaults.bool(forKey: Prefs.controller)
         stickDeadzone = min(0.5, max(0, defaults.double(forKey: Prefs.stickDeadzone)))
+        xtendedInput = defaults.bool(forKey: Prefs.xtendedInput)
     }
+
+    /// runtime/xtinput.c has the North American v1.2 executable's addresses only.
+    var canUseXtendedInput: Bool { location?.build?.engineSuffix == "-na" }
 
     var location: GameLocation? {
         switch game {
@@ -142,6 +148,11 @@ final class LauncherModel: ObservableObject {
             setenv("NFSU2_PAD", controller ? "1" : "0", 1)
             setenv("NFSU2_PAD_DEADZONE", String(format: "%.2f", stickDeadzone), 1)
             setPad = true
+        }
+        // XtendedInput layout (runtime/xtinput.c); only with the controller on.
+        if !xtendedInputFromEnv {
+            let padOn = getenv("NFSU2_PAD").map { String(cString: $0) != "0" } ?? true
+            setenv("NFSU2_XTINPUT", padOn && xtendedInput && canUseXtendedInput ? "1" : "0", 1)
         }
         var e = engine
         if !hasEngine(e) { e = (e == .hd) ? .original : .hd }
