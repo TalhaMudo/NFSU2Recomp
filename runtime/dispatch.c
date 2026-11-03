@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 /* Indirect call dispatch: guest address -> lifted native function.
  * O(1) direct index table (a uint32 array the size of .text).           */
 #include "cpu.h"
@@ -77,6 +78,11 @@ void dispatch_indirect(CPU *c, uint32_t addr){
     { extern int g_efx_stat; extern void efx_stat_note(CPU *c, uint32_t addr);
       if (g_efx_stat && addr - 0x650000u < 0x40000u) efx_stat_note(c, addr); }
     uint32_t off = addr - TEXT_BASE;
+    /* win32_ext.c LOCK PRIORITY: a waiting sound thread also gets the big lock here, so a
+     * long stretch of game code without Win32 or COM calls (a load) doesn't keep it out */
+    { extern _Atomic int g_gil_prio_wait;
+      if (__builtin_expect(atomic_load_explicit(&g_gil_prio_wait, memory_order_relaxed) != 0, 0)){
+          void guest_gil_check(void); guest_gil_check(); } }
     if (off < TEXT_SIZE){
         uint32_t k = g_idx[off];
         if (k){

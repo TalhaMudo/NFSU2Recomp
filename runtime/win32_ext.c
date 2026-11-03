@@ -8,6 +8,7 @@
 #include <time.h>
 #include <sys/event.h>
 #include <pthread/qos.h>
+#include <stdatomic.h>
 #include <sched.h>
 
 void dispatch_indirect(CPU*,uint32_t);
@@ -22,6 +23,8 @@ uint32_t res_size(uint32_t);
 typedef enum { OB_NONE=0, OB_EVENT, OB_MUTEX, OB_THREAD, OB_FILE, OB_KEY, OB_SEM } ObKind;
 typedef struct {
     ObKind kind; int signaled; int manual;
+    int counting;                     /* EVENT: set by the timer thread, counts ticks (see CATCH-UP) */
+    int prio;                         /* THREAD: SetThreadPriority (see LOCK PRIORITY) */
     pthread_mutex_t mtx; pthread_cond_t cv;
     uint32_t guest_arg, guest_entry, tid;
     uint32_t owner_tid; int rec;      /* MUTEX: ownership + recursion */
@@ -35,7 +38,7 @@ static int g_obj_n = 1;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t waits, sets; uint32_t waiter_tid, setter_tid; } WStat;
 static WStat g_wstat[64];
-uint64_t g_set_merged = 0;      /* SetEvent on an auto-reset event that was still set */
+uint64_t g_set_merged = 0;      /* timer SetEvents lost: TICK_CAP wake-ups already pending (see CATCH-UP) */
 
 /* ---- BIG GUEST LOCK ----------------------------------------------------
  * Guest code runs on only one thread at a time. This keeps the guest
@@ -45,6 +48,8 @@ static pthread_mutex_t g_guest = PTHREAD_MUTEX_INITIALIZER;
 extern CPU *g_cur_cpu;
 static _Thread_local CPU *tl_cpu = 0;
 static _Thread_local void *tl_obj = 0;   /* this thread's object */
+static _Thread_local int tl_timer_thread = 0;   /* the timeSetEvent thread (see CATCH-UP) */
+static _Thread_local int tl_cs_depth = 0;       /* critical sections held (see REAL critical sections) */
 /* Wait semantics.  Waits used to give up early: events after 2 s even for INFINITE, multi-object
  * waits after 200 ms.  A game thread that waits for an event during a long load (the NIS
  * audio stream thread, for instance) then saw a bogus WAIT_TIMEOUT.  NFSU2_WAIT_LEGACY=1 cuts
@@ -72,7 +77,7 @@ static int wait_ready(Obj *o, uint32_t tid){
 static void wait_take(Obj *o, uint32_t tid){
     if (o->kind == OB_MUTEX){ o->signaled = 0; o->owner_tid = tid; o->rec++; }
     else if (o->kind == OB_SEM) o->signaled--;
-    else if (o->kind == OB_EVENT && !o->manual) o->signaled = 0;
+    else if (o->kind == OB_EVENT && !o->manual) o->signaled = o->counting && o->signaled > 1 ? o->signaled - 1 : 0;
 }
 /* THREADLOG=1: log thread creation, termination and stack recycling */
 static int thread_log(void){ static int v=-1; if (v<0){ const char *e=getenv("THREADLOG"); v = (e && *e && *e!='0'); } return v; }
@@ -125,16 +130,66 @@ static void gil_gave(void){
         }
     }
 }
-void guest_lock(CPU *c){ pthread_mutex_lock(&g_guest); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took(); }
+/* ---- LOCK PRIORITY ----------------------------------------------------------
+ * The sound threads -- the ones the game itself raises to THREAD_PRIORITY_HIGHEST or
+ * above (the sound service thread 2, the DirectSound mixer threads 15) -- and the
+ * timeSetEvent thread take the big lock before the others.  On Windows they run in
+ * parallel with the game; here they wait for the lock, and the macOS mutex is not
+ * fair: the game thread gives it up and takes it straight back thousands of times a
+ * second (every WaitForSingleObject), and a woken waiter can lose that race again and
+ * again -- how long depends on the machine.  Measured here: a 656 ms hold while a race
+ * loaded, 950 ms of the music muted.  Now (a) a thread re-taking the lock steps back
+ * while a sound thread waits for it, and (b) the thread holding it hands it over at its
+ * next Win32, COM or indirect guest call (outside critical sections).  A sound thread's
+ * turn is short (it mixes, then sleeps or waits): the sound threads' longest wait during
+ * a load went to 10-24 ms, frame times unchanged.  NFSU2_GILPRIO=0 turns it off. */
+_Atomic int             g_gil_prio_wait  = 0;   /* sound threads waiting for the lock (dispatch.c reads it) */
+static _Atomic uint64_t g_gil_prio_taken = 0;   /* times one of them got it */
+uint64_t g_gil_handoffs = 0, g_gil_deferred = 0;
+uint64_t g_pw_n = 0, g_pw_us = 0, g_pw_max = 0;  /* sound threads' lock wait (written under the lock) */
+static int sleep_old(void);
+static int gil_prio_off(void){ static int v=-1; if (v<0){ const char *e=getenv("NFSU2_GILPRIO"); v = (e && *e=='0') || sleep_old(); } return v; }
+static int gil_is_prio(void){ return tl_timer_thread || (tl_obj && ((Obj*)tl_obj)->prio >= 2); }
+static void gil_acquire(void){
+    if (!gil_prio_off()){
+        if (gil_is_prio()){
+            uint64_t t0 = gil_now_us();
+            atomic_fetch_add(&g_gil_prio_wait, 1);
+            pthread_mutex_lock(&g_guest);
+            atomic_fetch_sub(&g_gil_prio_wait, 1);
+            atomic_fetch_add(&g_gil_prio_taken, 1);
+            uint64_t w = gil_now_us() - t0;
+            g_pw_n++; g_pw_us += w; if (w > g_pw_max) g_pw_max = w;
+            return;
+        }
+        if (atomic_load_explicit(&g_gil_prio_wait, memory_order_relaxed)){
+            uint64_t t0 = gil_now_us(), g = atomic_load(&g_gil_prio_taken);
+            g_gil_deferred++;
+            while (atomic_load(&g_gil_prio_wait) && atomic_load(&g_gil_prio_taken) == g &&
+                   gil_now_us() - t0 < 2000u)
+                sched_yield();
+        }
+    }
+    pthread_mutex_lock(&g_guest);
+}
+void guest_lock(CPU *c){ gil_acquire(); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took(); }
 void guest_unlock(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_thread_die(void);
-static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took();
+static void guest_yield_end(void){ gil_acquire(); g_cur_cpu = tl_cpu; gil_took();
     if (tl_obj && ((Obj*)tl_obj)->terminate) guest_thread_die(); }
 /* For runtime code that blocks on a guest thread outside Sleep/Wait* (metal_present
  * waiting for the screen): give the big lock up for the wait.  Returns 0, and does
  * nothing, on a thread that isn't a guest thread. */
 int  guest_blocking_begin(void){ if (!tl_cpu) return 0; guest_yield_begin(); return 1; }
+/* LOCK PRIORITY (b): called at every Win32, COM and indirect guest call by the thread holding the lock */
+void guest_gil_check(void){
+    if (!atomic_load_explicit(&g_gil_prio_wait, memory_order_relaxed)) return;
+    if (gil_prio_off() || !tl_cpu || gil_is_prio() || tl_cs_depth) return;
+    g_gil_handoffs++;
+    guest_yield_begin();
+    guest_yield_end();
+}
 void guest_blocking_end(void){ guest_yield_end(); }
 /* Sleep while releasing the big lock (win32.c: the game's frame wait loop). */
 uint64_t g_sleep_late_ns, g_sleep_gil_ns, g_sleep_n;    /* diagnostics: sleep latency / lock wait */
@@ -166,15 +221,40 @@ static void sleep_precise_ns(long ns){
  * timeBeginPeriod(1); a NOTE_CRITICAL kevent timer is not coalesced either (measured
  * here under full CPU load: nanosleep 0.9 ms late on average, max 25 ms; kevent
  * 0.03 ms, max 2 ms).  NFSU2_SLEEP_OLD=1 brings back nanosleep;
- * SLEEPSLACK=<us> (measurement) adds that much to every old-style sleep, to reproduce
- * a coalescing system. */
+ * SLEEPSLACK=<us> (measurement) adds that much to every one of these sleeps, to
+ * reproduce a system that wakes threads late. */
 static int sleep_old(void){ static int v=-1; if (v<0){ const char *e=getenv("NFSU2_SLEEP_OLD"); v = (e && *e && *e!='0'); } return v; }
+/* CATCH-UP (timer thread): a timer re-armed for <= 1 ms fires again at once, and a
+ * SetEvent from a timer callback counts (an auto-reset event keeps up to TICK_CAP
+ * pending wake-ups) -- a late wake-up or a wait for the big lock then delays the
+ * game's sound ticks instead of dropping them.  Windows gets this for free: its timer
+ * and the sound service thread run in parallel.  NFSU2_CATCHUP=0 turns it off. */
+#define TICK_CAP 16
+static int timer_catchup_off(void){ static int v=-1; if (v<0){ const char *e=getenv("NFSU2_CATCHUP"); v = (e && *e=='0') || sleep_old(); } return v; }
 static long sleep_slack_ns(void){ static long v=-1; if (v<0){ const char *e=getenv("SLEEPSLACK"); v = e ? atol(e)*1000L : 0; } return v; }
 static void game_sleep_ns(long ns){
-    if (!sleep_old()){ sleep_precise_ns(ns); return; }
     ns += sleep_slack_ns();
+    if (!sleep_old()){ sleep_precise_ns(ns); return; }
     struct timespec ts = { (time_t)(ns / 1000000000L), ns % 1000000000L };
     nanosleep(&ts, 0);
+}
+/* SLEEP DEBT (Sleep/SleepEx): a thread that woke up late gets its next sleeps shortened
+ * by the lateness -- skipped while the debt is larger than the request -- so its sleeps
+ * average what it asked for.  The game's 100 Hz mixer loop catches up after a late
+ * wake-up by asking for Sleep(1) until it is back on schedule; on a system that wakes
+ * threads late every one of those 1 ms sleeps was late again and the loop never caught
+ * up.  With precise sleeps the debt stays at tens of microseconds.  NFSU2_CATCHUP=0
+ * turns it off. */
+static _Thread_local int64_t tl_sleep_debt_ns = 0;
+uint64_t g_sleep_skipped = 0;
+static void game_sleep_debt_ns(long ns){
+    if (timer_catchup_off()){ game_sleep_ns(ns); return; }
+    if (tl_sleep_debt_ns >= ns){ tl_sleep_debt_ns -= ns; g_sleep_skipped++; sched_yield(); return; }
+    long eff = ns - (long)tl_sleep_debt_ns;
+    uint64_t t0 = wait_now_us();
+    game_sleep_ns(eff);
+    int64_t late = (int64_t)(wait_now_us() - t0) * 1000 - eff;
+    tl_sleep_debt_ns = late < 0 ? 0 : late > 200000000LL ? 200000000LL : late;
 }
 void guest_sleep_ns(long ns){
     struct timespec a, b, d;
@@ -255,7 +335,6 @@ void frame_pace(void){
 #define MAXCS 512
 static struct { uint32_t key; pthread_mutex_t m; int used; } g_cs[MAXCS];
 static pthread_mutex_t g_cs_tab = PTHREAD_MUTEX_INITIALIZER;
-static _Thread_local int tl_cs_depth = 0;
 uint64_t g_cs_enter = 0, g_cs_contended = 0;
 
 static int cs_disabled(void){
@@ -314,7 +393,26 @@ static uint32_t cur_tid(CPU *c){
            ? MR32(c->fs_base+0x24u) : 0u;
 }
 
+/* GILHOG=<hold ms>:<every ms> (measurement): every <every> ms the game thread keeps the
+ * lock for <hold> ms, giving it up and taking it straight back every 50 us -- the
+ * unfair re-take race of LOCK PRIORITY, made reproducible. */
+static void gil_hog(void){
+    static int h = -1, per = 0; static uint64_t next = 0;
+    if (h < 0){ const char *e = getenv("GILHOG"); h = 0;
+                if (e && *e){ h = atoi(e); const char *q = strchr(e, ':'); per = q ? atoi(q+1) : 100; } }
+    if (!h || tl_obj || tl_timer_thread || !tl_cpu) return;
+    uint64_t now = gil_now_us();
+    if (now < next) return;
+    next = now + (uint64_t)per * 1000u;
+    uint64_t end = now + (uint64_t)h * 1000u;
+    while (gil_now_us() < end){
+        uint64_t t = gil_now_us(); while (gil_now_us() - t < 50u) ;
+        guest_yield_begin(); guest_yield_end();
+    }
+}
 void guest_fair_yield(void){
+    gil_hog();
+    guest_gil_check();
     if (tl_cs_depth) return;          /* yielding inside a critical section */
     static _Thread_local uint32_t n = 0;
     if ((++n & 0x3FFu) != 0) return;          /* once every 1024 calls */
@@ -474,6 +572,7 @@ typedef struct {
     uint32_t proc, user, id;
     uint64_t due_us;          /* 0 = empty */
     uint32_t period_us;       /* 0 = one-shot */
+    uint32_t delay_ms;        /* the delay the game asked for */
 } Timer;
 
 static Timer    g_tm[MAXTIMER];
@@ -481,33 +580,43 @@ static uint32_t g_timer_next_id = 1;
 static int      g_timer_running = 0;
 uint64_t        g_timer_ticks = 0;
 
-/* Timers must also use GAME time; otherwise when the emulator is slow the
- * callbacks run far too often relative to the game's own time. */
+/* Timers used GAME time (from when the virtual clock was 16.67 ms a frame).  The only
+ * timer is the sound service (0x6f5b4d), which now reads real time (win32.c SOUND
+ * PACE CLOCK), so the timers are due in real time too -- otherwise they would wait
+ * for the virtual clock, which stands still in a long frame.  NFSU2_PACE=0: game time. */
 uint64_t host_us(void);
-static uint64_t now_us(void){ return host_us(); }
+int pace_on(void);
+static uint64_t now_us(void){ return pace_on() ? wait_now_us() : host_us(); }
 
 /* ---- TIMER STATS -----------------------------------------------------------
  * The game's sound service is clocked by a one-shot timeSetEvent that re-arms itself
  * (0x6f5b4d, 100 Hz): every tick SetEvents the sound service thread, which runs the
  * sound services once and waits again.  Ticks that come while the service thread hasn't
- * run yet merge (auto-reset event).  Issue #12 log: 32 ticks a second, the game wrote
- * 130 KB/s for 176 KB/s played, 28% of the output silent.  Logged every 30 s and at
- * the end: tick rate, how late the timer thread woke, how long it waited for the big
- * lock, merged SetEvents. */
+ * run yet merge (auto-reset event; see CATCH-UP).  Issue #12 log: 32 ticks a second,
+ * the game wrote 130 KB/s for 176 KB/s played, 28% of the output silent.  Logged every
+ * 30 s and at the end: tick rate, how late the timer thread woke, how long it and the
+ * sound threads waited for the big lock (LOCK PRIORITY), catch-up and lost ticks. */
 static uint64_t g_ts_n, g_ts_gil_us, g_ts_gil_max, g_ts_cb_us, g_ts_cb_max;
 static uint64_t g_ts_late_us, g_ts_late_max, g_ts_late_n, g_ts_t0, g_ts_tlast;
-static uint64_t g_ts_last_ticks, g_ts_last_merged;
+static uint64_t g_ts_last_ticks, g_ts_last_merged, g_ts_catchup, g_ts_last_catchup;
 static void timer_stat_print(const char *tag, uint64_t now){
     double el = (double)(now - g_ts_tlast) / 1e6;
     if (el <= 0) el = 1e-6;
     fprintf(stderr, "  [timer] %s %.0f s: %.1f ticks/s, wake late %.2f ms avg (max %.1f), lock wait %.2f ms avg (max %.1f), "
-                    "callback %.3f ms avg (max %.1f), %.1f merged SetEvents/s\n",
+                    "callback %.3f ms avg (max %.1f), %.1f catch-up ticks/s, %.1f lost SetEvents/s\n",
             tag, (double)(now - g_ts_t0) / 1e6,
             (double)(g_timer_ticks - g_ts_last_ticks) / el,
             g_ts_late_n ? (double)g_ts_late_us / g_ts_late_n / 1000.0 : 0.0, g_ts_late_max / 1000.0,
             g_ts_n ? (double)g_ts_gil_us / g_ts_n / 1000.0 : 0.0, g_ts_gil_max / 1000.0,
             g_ts_n ? (double)g_ts_cb_us / g_ts_n / 1000.0 : 0.0, g_ts_cb_max / 1000.0,
+            (double)(g_ts_catchup - g_ts_last_catchup) / el,
             (double)(g_set_merged - g_ts_last_merged) / el);
+    g_ts_last_catchup = g_ts_catchup;
+    if (!gil_prio_off()){ static uint64_t lh, ld;
+      fprintf(stderr, "  [timer] %s %.0f s: sound threads' lock wait %.2f ms avg (max %.1f), %.1f hand-overs/s, %.1f step-backs/s\n",
+              tag, (double)(now - g_ts_t0) / 1e6, g_pw_n ? (double)g_pw_us / g_pw_n / 1000.0 : 0.0, g_pw_max / 1000.0,
+              (double)(g_gil_handoffs - lh) / el, (double)(g_gil_deferred - ld) / el);
+      lh = g_gil_handoffs; ld = g_gil_deferred; g_pw_n = g_pw_us = g_pw_max = 0; }
     g_ts_n = g_ts_gil_us = g_ts_gil_max = g_ts_cb_us = g_ts_cb_max = 0;
     g_ts_late_us = g_ts_late_max = g_ts_late_n = 0;
     g_ts_last_ticks = g_timer_ticks; g_ts_last_merged = g_set_merged; g_ts_tlast = now;
@@ -523,11 +632,16 @@ static void timer_stat_wake(uint64_t late){
     if (!g_ts_t0){ g_ts_t0 = g_ts_tlast = now; return; }
     if (now - g_ts_tlast >= 30000000ull) timer_stat_print("at", now);
 }
-void timer_report(void){ if (g_ts_t0) timer_stat_print("end,", wait_now_us()); }
+void timer_report(void){
+    if (g_ts_t0) timer_stat_print("end,", wait_now_us());
+    extern uint64_t g_sleep_skipped;
+    fprintf(stderr, "  [timer] game sleeps skipped to repay late wake-ups (SLEEP DEBT): %llu\n", (unsigned long long)g_sleep_skipped);
+}
 
 static void *timer_thread_main(void *p){
     (void)p;
     mem_altstack_install();
+    tl_timer_thread = 1;
     CPU cpu; memset(&cpu,0,sizeof cpu);
     uint32_t stack_lo, stack_hi, teb;
     stack_lo = tstack_get();
@@ -577,9 +691,30 @@ static void *timer_thread_main(void *p){
             uint64_t tl0 = wait_now_us();
             guest_lock(&cpu);
             uint64_t tl1 = wait_now_us();
-            dispatch_indirect(&cpu, proc);
+            for (int burst = 0;; burst++){
+                uint32_t id0 = g_timer_next_id;
+                dispatch_indirect(&cpu, proc);
+                g_timer_ticks++;
+                /* CATCH-UP: the callback re-armed itself for <= 1 ms, i.e. it is behind its
+                 * own schedule (0x6f5b4d: delay = due - now - 1, at least 1).  Fire it again
+                 * right away, still holding the lock, instead of sleeping and waiting for the
+                 * lock once per missed tick. */
+                if (burst + 1 >= TICK_CAP || timer_catchup_off()) break;
+                int again = -1;
+                pthread_mutex_lock(&g_lock);
+                for (int k = 0; k < MAXTIMER; k++)
+                    if (g_tm[k].due_us && !g_tm[k].period_us && g_tm[k].proc == proc &&
+                        g_tm[k].id >= id0 && g_tm[k].delay_ms <= 1u){ again = k; break; }
+                if (again >= 0){ user = g_tm[again].user; id = g_tm[again].id; g_tm[again].due_us = 0; }
+                pthread_mutex_unlock(&g_lock);
+                if (again < 0) break;
+                g_ts_catchup++;
+                cpu.esp = stack_hi - 0x1000u;
+                { CPU *c=&cpu;
+                  PUSH32(0u); PUSH32(0u); PUSH32(user); PUSH32(0u); PUSH32(id);
+                  PUSH32(0xDEAD7EADu); }
+            }
             guest_unlock();
-            g_timer_ticks++;
             timer_stat_fire(tl1 - tl0, wait_now_us() - tl1);
         }
     }
@@ -884,10 +1019,14 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                 (c->fs_base && mem_is_committed(c->fs_base+0x24u))
                 ? MR32(c->fs_base+0x24u) : 0u; } }
         if(o){ pthread_mutex_lock(&o->mtx);
-               /* an auto-reset event that is still set: the waiter hasn't run since the last
-                * SetEvent, this wake-up merges into the previous one (lost tick, see TIMER STATS) */
-               if (o->kind == OB_EVENT && !o->manual && o->signaled > 0) g_set_merged++;
-               o->signaled=1; pthread_cond_broadcast(&o->cv); pthread_mutex_unlock(&o->mtx);} r=1; }
+               if (o->kind == OB_EVENT && !o->manual && tl_timer_thread && !timer_catchup_off()){
+                   /* see CATCH-UP: a timer tick is not lost when its waiter hasn't run yet */
+                   o->counting = 1;
+                   if (o->signaled < TICK_CAP) o->signaled++; else g_set_merged++;
+               } else {
+                   if (o->signaled < 1) o->signaled = 1;
+               }
+               pthread_cond_broadcast(&o->cv); pthread_mutex_unlock(&o->mtx);} r=1; }
     else if (!strcmp(n,"ResetEvent")){ Obj*o=obj_get(A(c,0));
         if(o){ pthread_mutex_lock(&o->mtx); o->signaled=0; pthread_mutex_unlock(&o->mtx);} r=1; }
     else if (!strcmp(n,"CreateMutexA")){
@@ -1000,6 +1139,15 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         }
         r=1; }
     else if (!strcmp(n,"GetExitCodeThread")){ uint32_t p=A(c,1); if(p) MR32(p)=0; r=1; }
+    else if (!strcmp(n,"SetThreadPriority")){
+        /* recorded for LOCK PRIORITY; 0xFFFFFFFE = GetCurrentThread() */
+        uint32_t h = A(c,0); int p = (int)A(c,1);
+        Obj *to = h == 0xFFFFFFFEu ? (Obj*)tl_obj : obj_get(h);
+        if (to && to->kind == OB_THREAD) to->prio = p;
+        { static int sh = 0; if (sh++ < 16)
+            fprintf(stderr, "  [thread] SetThreadPriority tid=%u priority=%d (from tid=%u, caller 0x%08x)\n",
+                    to ? to->tid : 0u, p, cur_tid(c), MR32(c->esp - 4u)); }
+        r=1; }
     else if (!strcmp(n,"SetThreadAffinityMask")||!strcmp(n,"SetProcessAffinityMask")) r=1;
     else if (!strcmp(n,"GetProcessAffinityMask")){
         uint32_t a=A(c,1),b=A(c,2); if(a) MR32(a)=0xFF; if(b) MR32(b)=0xFF; r=1; }
@@ -1010,7 +1158,8 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         /* see THE GAME'S OWN SLEEPS; Sleep(0): just yield (200 us) */
         uint32_t ms=A(c,0);
         guest_yield_begin();
-        game_sleep_ns(ms ? (long)ms * 1000000L : 200000L);
+        if (ms) game_sleep_debt_ns((long)ms * 1000000L);   /* see SLEEP DEBT */
+        else    game_sleep_ns(200000L);
         guest_yield_end();
         r=0; }
     else if (!strcmp(n,"WaitForMultipleObjects")){
@@ -1195,7 +1344,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"OutputDebugStringA")){ uint32_t p=A(c,0);
         if(p) fprintf(stderr,"[dbg] %s", (char*)(g_mem+p)); r=0; }
     else if (!strcmp(n,"timeBeginPeriod")||!strcmp(n,"timeEndPeriod")) r=0;
-    else if (!strcmp(n,"timeGetTime")){ uint32_t host_ms(void); r = host_ms(); }
+    else if (!strcmp(n,"timeGetTime")){ uint32_t game_ms_at(uint32_t); r = game_ms_at(c->eip); }   /* see win32.c SOUND PACE CLOCK */
     else if (!strcmp(n,"timeSetEvent")){
         /* (uDelay, uResolution, lpTimeProc, dwUser, fuEvent) */
         uint32_t delay=A(c,0), proc=A(c,2), user=A(c,3), flags=A(c,4);
@@ -1217,6 +1366,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                 g_tm[i].proc=proc; g_tm[i].user=user;
                 g_tm[i].id = id = g_timer_next_id++;
                 g_tm[i].period_us = (flags & 1u) ? us : 0u;
+                g_tm[i].delay_ms = delay;
                 g_tm[i].due_us = now_us() + us;
                 break;
             }

@@ -141,6 +141,13 @@
 #define GA_0x669fa6u 0x00669f96u   /* function 00669f40 + 0x66 */
 #define GA_0x669fe5u 0x00669fd5u   /* function 00669fc3 + 0x22 */
 #define GA_0x66d8afu 0x0066d89fu   /* function 0066d7e9 + 0xc6 */
+#define GA_0x6f5b94u 0x006f5b94u   /* function 006f5b4d + 0x47 */
+#define GA_0x6f5bacu 0x006f5bacu   /* function 006f5b4d + 0x5f */
+#define GA_0x6f5da8u 0x006f5da8u   /* function 006f5c91 + 0x117 */
+#define GA_0x7262b7u 0x007262b7u   /* function 007260f7 + 0x1c0 */
+#define GA_0x7263d9u 0x007263d9u   /* function 007263c7 + 0x12 */
+#define GA_0x726402u 0x00726402u   /* function 007263c7 + 0x3b */
+#define GA_0x726411u 0x00726411u   /* function 007263c7 + 0x4a */
 #define GA_0x7a66bcu 0x007a66b4u   /* operand pair */
 #define GA_0x7b6fe8u 0x007b6fe0u   /* operand pair */
 #define GA_0x7d7d3cu 0x007d7d3cu   /* operand pair */

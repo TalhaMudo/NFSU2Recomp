@@ -332,9 +332,26 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
         else { if(len) mem_commit(buf,len);
                ssize_t got;
                uint64_t _rd0 = now_ns_io();
+               /* READ WITHOUT THE BIG LOCK: a large read gives the big lock up while the disk
+                * works.  The game reads a race's data in multi-megabyte pieces on its main
+                * thread; on a slow disk (external drive, files iCloud has to fetch back) the
+                * sound threads couldn't run for the whole load and the music stopped (issue
+                * #12 log: 8 s).  On Windows the sound runs alongside.  The buffer is the
+                * game's own, as on Windows.  NFSU2_IOYIELD=0 keeps the lock; READSLOW=<us>
+                * (measurement) makes every large read that much slower, like a slow disk. */
+               int io_y = 0;
+               { static int yoff = -1; if (yoff < 0){ const char *e = getenv("NFSU2_IOYIELD"); yoff = e && *e == '0'; }
+                 static long slow = -1; if (slow < 0){ const char *e = getenv("READSLOW"); slow = e ? atol(e) : 0; }
+                 if (len >= 16384u){
+                     int guest_blocking_begin(void);
+                     if (!yoff) io_y = guest_blocking_begin();
+                     if (slow > 0) usleep((useconds_t)slow);
+                 } }
+               int fd = f->fd;
                if (ov && mem_is_committed(ov+19)){
                    uint64_t off = (uint64_t)MR32(ov+8) | ((uint64_t)MR32(ov+12) << 32);
-                   got = pread(f->fd, g_mem+buf, len, (off_t)off);
+                   got = pread(fd, g_mem+buf, len, (off_t)off);
+                   if (io_y){ void guest_blocking_end(void); guest_blocking_end(); io_y = 0; }
                    if(got<0) got=0;
                    MR32(ov+0) = 0;                      /* Internal = STATUS_SUCCESS */
                    MR32(ov+4) = (uint32_t)got;          /* InternalHigh = bytes read */
@@ -351,9 +368,10 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
                } else if (f->empty){
                    got = 0;                       /* immediate end of file */
                } else {
-                   got = read(f->fd, g_mem+buf, len);
+                   got = read(fd, g_mem+buf, len);
                    if(got<0) got=0;
                }
+               if (io_y){ void guest_blocking_end(void); guest_blocking_end(); io_y = 0; }
                /* MUTEFILE=<substring>: fill the reads of the matching file with ZEROS.
                 * To measure objectively whether sound effects remain once the
                 * music stream (sdat.viv) is silenced.  We don't return end of

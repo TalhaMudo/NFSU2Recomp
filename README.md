@@ -352,6 +352,13 @@ Yes, without Windows: `tools/install_from_discs.py` unpacks the disc images
 into a game folder. See [Installing from the PC discs on a
 Mac](#installing-from-the-pc-discs-on-a-mac).
 
+**The sound cuts out for a moment every few seconds.**
+Fixed after v2.2: the game's two sound loops depend on waking up every 10 ms, and
+macOS woke them late or let the game's main thread keep them waiting (see
+`PROJECT.md`, "audio dropouts"). If it still happens, please attach
+`~/Library/Logs/NFSU2/nfsu2.log` (`nfsu2-hd.log` for HD) to an issue: its
+`[timer]` lines show which part is late.
+
 **Does it work on Intel Macs?**
 No. Only Apple Silicon is targeted and tested.
 

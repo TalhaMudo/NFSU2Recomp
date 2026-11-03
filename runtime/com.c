@@ -2222,6 +2222,8 @@ static void tunedrag(unsigned char *ms){
 int com_call(CPU *c, uint32_t magic){
     uint32_t iface=(magic>>16)&0x1FFFu, m=magic&0xFFFFu;
     g_com_calls++;
+    /* see win32_ext.c LOCK PRIORITY: a sound thread waiting for the big lock gets it here */
+    if (!g_sb_replay){ void guest_gil_check(void); guest_gil_check(); }
     if (!g_sb_replay) POP32(c->eip);
     if (iface==0 || iface>=NEL(g_if) || m>=g_if[iface].n){
         fprintf(stderr,"  [COM] invalid interface/method %u:%u\n", iface, m);

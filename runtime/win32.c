@@ -176,6 +176,41 @@ uint64_t host_us(void){
     return base + d + atomic_load(&g_vclock_creep);
 }
 uint32_t host_ms(void){ return (uint32_t)(host_us() / 1000ull) + 1000u; }
+
+/* ---- SOUND PACE CLOCK ---------------------------------------------------------
+ * The game's two 100 Hz sound loops time themselves with GetTickCount/timeGetTime:
+ * the sound service timer (0x6f5b4d: due += 10 ms, re-arm for due - now - 1, seeded at
+ * 0x6f5da6) and the DirectSound mixer thread (0x7263c7: next += 10 ms, Sleep(next -
+ * now); its mixer measures the time since the last pass at 0x7262b1).  The virtual
+ * clock stops at 50 ms inside a frame, so in a long frame -- a load -- both loops saw
+ * time stand still: the timer re-armed itself further and further out (10, 20, 30 ms
+ * ...) and the mixer slept up to 200 ms per pass; the music stopped for the whole load
+ * (issue #12 log: 8 s of silence while a race loaded).  On Windows these loops run on
+ * real time.  Only these call sites (their return addresses) read real time, aligned
+ * with the virtual clock at the first read; their values never meet the rest of the
+ * game's time.  NFSU2_PACE=0 turns it off. */
+int pace_on(void){
+    static int on = -1;
+    if (on < 0){ const char *e = getenv("NFSU2_PACE"), *o = getenv("NFSU2_SLEEP_OLD");
+                 on = !((e && *e == '0') || (o && *o == '1')); }
+    return on;
+}
+static int pace_site(uint32_t ra){
+    if (!pace_on()) return 0;
+    return ra == GA(0x6f5b94u) || ra == GA(0x6f5bacu) || ra == GA(0x6f5da8u) ||          /* GetTickCount */
+           ra == GA(0x7263d9u) || ra == GA(0x726402u) || ra == GA(0x726411u) || ra == GA(0x7262b7u);  /* timeGetTime */
+}
+static uint32_t pace_ms(void){
+    static _Atomic int64_t offset_us = INT64_MIN;
+    int64_t o = atomic_load(&offset_us);
+    if (o == INT64_MIN){
+        int64_t want = (int64_t)host_us() - (int64_t)real_us();
+        if (!atomic_compare_exchange_strong(&offset_us, &o, want)) o = atomic_load(&offset_us); else o = want;
+    }
+    return (uint32_t)((uint64_t)((int64_t)real_us() + o) / 1000ull) + 1000u;
+}
+uint64_t g_pace_reads = 0;
+uint32_t game_ms_at(uint32_t ra){ if (pace_site(ra)){ g_pace_reads++; return pace_ms(); } return host_ms(); }
 uint64_t host_qpc(void){ return host_us(); }
 
 /* the guest heap itself lives in gheap.c (free lists + quarantine) */
@@ -424,7 +459,7 @@ int win32_call(CPU *c, uint32_t idx){
     else if (!strcmp(n,"GetCurrentProcess"))     r = 0xffffffffu;
     else if (!strcmp(n,"GetLastError"))          r = 0;
     else if (!strcmp(n,"SetLastError"))          r = 0;
-    else if (!strcmp(n,"GetTickCount")) r = host_ms();
+    else if (!strcmp(n,"GetTickCount")) r = game_ms_at(c->eip);   /* see SOUND PACE CLOCK */
     else if (!strcmp(n,"QueryPerformanceFrequency")){ uint32_t p=ARG(c,0); if(p){MR32(p)=1000000;MR32(p+4)=0;} r=1; }
     else if (!strcmp(n,"SetUnhandledExceptionFilter")) r = 0;
     else if (!strcmp(n,"UnhandledExceptionFilter"))    r = 0;

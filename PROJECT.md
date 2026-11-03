@@ -1216,6 +1216,14 @@ chatty renderer (~1250 draws, ~62 thousand COM calls per frame).
 | `MOUSEAT=x,y[@frame,x,y]` | pin the cursor position the game sees (cursor mapping test) |
 | `NOFOCUS=1` | open the window in the background, don't steal focus (testing while the user works) |
 | `NOSOUND=1` | no sound output |
+| `NFSU2_SLEEP_OLD=1` | the game's `Sleep`/timer back on `nanosleep` at default QoS, and every sound fix below off (issue #12 A/B) |
+| `NFSU2_CATCHUP=0` | no timer catch-up / counted timer wake-ups / sleep debt |
+| `NFSU2_PACE=0` | the sound loops read the virtual clock again (they stand still in long frames) |
+| `NFSU2_GILPRIO=0` | no big-lock priority for the sound threads |
+| `NFSU2_IOYIELD=0` | large file reads keep the big lock |
+| `SLEEPSLACK=<us>` | measurement: every game `Sleep` / timer sleep wakes this much later |
+| `GILHOG=<ms>:<ms>` | measurement: the game thread keeps the lock for the first value every second value, re-taking it every 50 us |
+| `READSLOW=<us>` | measurement: every file read of 16 KB or more takes this much longer |
 | `NORTFREE=1` | turn off releasing old render targets on Reset (diagnostic) |
 | `NORTRESET=1` | don't return the target/Z to the back buffer on Reset (old behavior; the car breaks) |
 | `NORSRESET=1` | don't reset render/sampler/stage states to defaults on Reset (old behavior) |
@@ -2204,3 +2212,39 @@ frame 1650); the headlight lenses are draws 213-222 (light atlas texture 813,
 64x64, complete with 4 mips; 807 = tail lights); the highlight itself is the
 scene's reflection on the body panels, not a missing texture and not post
 processing. Not decided whether anything is wrong without a reference image.
+
+## 2026-11-02 – 11-03: audio dropouts (issue #12)
+
+Reports: the sound "is gone for a second" every few seconds, on several Macs, not
+reproducible here. The reporter's log (M6, 60 Hz, NA HD): the sound service timer
+ran at 32 ticks a second instead of 100, the music buffer got 130 KB/s for 176 KB/s
+played, 28% of the output was silence, 99 cursor overruns, 8 s of silence while a
+race loaded. The game's sound hangs on two 100 Hz loops: the DirectSound mixer thread
+(`0x7263c7`, `THREAD_PRIORITY_TIME_CRITICAL`: `next += 10`, `Sleep(next - now)`) and
+the sound service timer (`0x6f5b4d`, a one-shot `timeSetEvent` that re-arms itself
+and `SetEvent`s the service thread, `THREAD_PRIORITY_HIGHEST`). Four causes, all in
+`runtime/win32_ext.c` (+ `win32.c`, `fileio.c`, `dispatch.c`, `com.c`):
+
+1. **Sleeps.** `Sleep` and the timer thread used `nanosleep`, which macOS coalesces,
+   and the game's threads ran at `QOS_CLASS_DEFAULT` (`pthread_create` does not
+   inherit QoS). Now `kevent NOTE_CRITICAL` and `USER_INTERACTIVE`. Under full CPU
+   load: late wake-ups 0.9 ms average / 25 ms max -> 0.03 / 2 ms.
+2. **Late wake-ups lost ticks.** A timer re-armed for <= 1 ms (behind schedule)
+   fires again at once; a `SetEvent` from the timer thread counts (up to 16);
+   `Sleep` repays lateness (sleep debt). `SLEEPSLACK=55000`: 17 -> 100 ticks a
+   second, silence 9.7% -> 2.9% (2.7% without the slack).
+3. **The virtual clock stood still in long frames** (50 ms cap), and so did both
+   loops. Their 7 clock reads (return addresses) now see real time and the timers
+   are due in real time (SOUND PACE CLOCK, `win32.c`). Large file reads also give
+   the big lock up.
+4. **The big lock.** The macOS mutex is unfair; the game thread re-takes it thousands
+   of times a second. The sound threads (game priority >= 2) and the timer thread now
+   come first: others step back, the holder hands over at its next Win32, COM or
+   indirect call. Reproduced here: a 656 ms hold while a race loaded, 950 ms muted,
+   20 overruns (2 of ~12 runs); with priority the sound threads waited at most
+   10-24 ms, no dropouts in 5 runs, frame times unchanged.
+
+The log now carries `[timer]` lines every 30 s (tick rate, late wake-ups, lock waits,
+catch-up and lost ticks). Note for measurements: "sound data gaps" also counts the
+silence of loading screens; use the stale guard and cursor overrun lines. Left: a
+230-330 ms hold at start-up, before any sound plays (inaudible).
