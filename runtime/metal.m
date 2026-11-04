@@ -4569,6 +4569,8 @@ int metal_vs_ready(int vsid){
  * loading a fully covered tile with hidden surface removal, and doesn't move an
  * untouched Z either. */
 static uint8_t g_ps_kill[MAXPS];             /* ps contains texkill (discard) */
+static uint8_t g_ps_copy[MAXPS];             /* ps is a plain copy of stage 0 [x c0] (vsemu.c ps_plain_copy) */
+void metal_set_ps_copy(int id, int v){ if (id > 0 && id < MAXPS) g_ps_copy[id] = (uint8_t)v; }   /* 1 copy, 2 copy x c0 */
 static uint8_t g_ps_fbok[MAXPS];             /* stage 0 in a single place with TCRD(0) (see POST-PROCESS CHAIN) */
 /* com.c: per-vertex oT0..oT3 of the next quad (BEFORE metal_set_next_cov_clip) */
 void metal_set_next_cov_uv(const float (*uv)[16], unsigned n){
@@ -4765,6 +4767,33 @@ static long scr_redirect_plan(int rb, id<MTLTexture> scr, unsigned *outT){
 #if NFS_ENHANCED   /* HD engine only */
 int pic_pre_on(void);
 id<MTLTexture> pic_pre(id<MTLDevice>, id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTexture>);
+/* Can the scene filter be drawn IN PLACE of draw k (see picture.m IN-PASS DRAWS)?
+ * Its shader must be a plain copy of stage 0 (or a copy times c0) and its UVs must
+ * map the source 1:1 onto the screen: the full-screen quad with the game's
+ * half-texel pattern that UV SCALE corrects (uvbm stage 0), or an exact 1:1. */
+static int pic_fold_ok(int rb, long k, id<MTLTexture> scr){
+    int pic_fold_on(void);
+    if (k < 0 || !pic_fold_on()) return 0;
+    const MDraw *x = &g_dbuf[rb][k];
+    if (ENVC("PICFOLDLOG")){ static int n; if (n++ < 6)
+        fprintf(stderr, "[picfold] draw %ld ps %d copy %d covok %u cov %.4f %.4f %.4f %.4f cuvok %u cuv %.5f %.5f %.5f %.5f uvbm %u\n",
+                k, x->ps, (x->ps > 0 && x->ps < MAXPS) ? g_ps_copy[x->ps] : -1, x->covok, x->cov[0], x->cov[1], x->cov[2], x->cov[3],
+                x->cuvok, x->cuv[0], x->cuv[1], x->cuv[2], x->cuv[3], x->uvbm); }
+    if (x->ps <= 0 || x->ps >= MAXPS || !g_ps_copy[x->ps] || !x->covok) return 0;
+    if (x->cov[0] > -1.f + 1e-4f || x->cov[1] < 1.f - 1e-4f || x->cov[2] > -1.f + 1e-4f || x->cov[3] < 1.f - 1e-4f) return 0;
+    if (x->uvbm & 1u) return 1;                  /* UV SCALE: the game's full-screen pattern */
+    /* UVs from a vertex shader are not known here (cuvok 0): the copy that pic_plan
+     * picked is the scene copy, as the separate pass assumed too; verified by frame
+     * comparison (race start grid: the difference to the separate pass is inside
+     * run-to-run noise, 2026-11-04).  Known UVs must be 1:1. */
+    if (!x->cuvok) return 1;
+    float dx = x->cov[1] - x->cov[0], dy = x->cov[3] - x->cov[2];
+    if (fabsf(dx) < 1e-3f || fabsf(dy) < 1e-3f) return 0;
+    float su = (x->cuv[1] - x->cuv[0]) / dx, sv = (x->cuv[3] - x->cuv[2]) / dy;
+    float u0 = x->cuv[0] + su * (-1.f - x->cov[0]), v0 = x->cuv[2] + sv * (1.f - x->cov[2]);
+    float tu = 1.5f / (float)scr.width, tv = 1.5f / (float)scr.height;
+    return fabsf(su - 0.5f) < 1e-3f && fabsf(sv + 0.5f) < 1e-3f && fabsf(u0) <= tu && fabsf(v0) <= tv;
+}
 static long pic_plan(int rb, id<MTLTexture> scr){
     if (rb < 0 || !scr || !pic_pre_on() || abt_off("PICTURE")) return -1;
     const MDraw *D = g_dbuf[rb];
@@ -6932,6 +6961,12 @@ void metal_run_main_loop(void){
                         unsigned c_depth = ~0u;
                         int c_zon = 0;                  /* the pass has a real Z surface */
                         int c_ms = 0;                   /* (HD) the pass is multisampled */
+#if NFS_ENHANCED
+                        /* the open pass's attachments (picture.m IN-PASS DRAWS) */
+                        MTLPixelFormat enc_cf = MTLPixelFormatInvalid, enc_df = MTLPixelFormatInvalid;
+                        NSUInteger enc_ns = 1; int enc_extra = 0, enc_screen = 0;
+                        id<MTLTexture> enc_z = nil, enc_zres = nil;
+#endif
                         int c_gb = 0;                   /* (HD) the pass carries the G-buffer */
                         int c_gbx = 0;                  /* (HD) scene pass, G deferred to a separate pass (see SEPARATE G PASS) */
                         int hd_post = 0;                /* (HD) the first copy from the screen is past: post-process stage */
@@ -6948,6 +6983,7 @@ void metal_run_main_loop(void){
 #if NFS_ENHANCED
                         long pic_at = pic_plan(rb, dtex);   /* see PICTURE OPTIONS */
                         id<MTLTexture> pic_tex = nil;
+                        int pic_fold = pic_at >= 0 && pic_fold_ok(rb, pic_at, dtex);   /* picture.m IN-PASS DRAWS */
 #endif
                         int fbv_pend = 0; unsigned fbv_s = 0, fbv_e = 0;   /* FBZINCIR=2: verification pending */
 #if NFS_ENHANCED
@@ -7310,7 +7346,7 @@ void metal_run_main_loop(void){
                                     continue;
                                 }
 #if NFS_ENHANCED
-                                if ((long)i == pic_at){
+                                if ((long)i == pic_at && !pic_fold){
                                     /* PICTURE OPTIONS: the scene is complete, the copy to the screen follows */
                                     if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
                                               [enc endEncoding]; enc = nil;
@@ -7856,6 +7892,14 @@ void metal_run_main_loop(void){
                                               fprintf(stderr, "  [content] draw#%u %s: zid %u, %u draws, Z writing %u, Z testing %u, alpha tested %u, first ps %d tex %u\n",
                                                       i, pn, zz, nd, nz, nzt, na, dr->ps, dr->tex); } } }
                                     enc = [cb renderCommandEncoderWithDescriptor:rp];
+#if NFS_ENHANCED
+                                    enc_cf = rp.colorAttachments[0].texture.pixelFormat;
+                                    enc_ns = rp.colorAttachments[0].texture.sampleCount;
+                                    enc_df = rp.depthAttachment.texture ? rp.depthAttachment.texture.pixelFormat : MTLPixelFormatInvalid;
+                                    enc_z = rp.depthAttachment.texture; enc_zres = rp.depthAttachment.resolveTexture;
+                                    enc_extra = rp.colorAttachments[1].texture != nil;
+                                    enc_screen = !dr->target && tgt == dtex;
+#endif
                                     atomic_fetch_add(&g_pass_n, 1ull);
                                     if (g_atdbg) [enc setFragmentBuffer:g_atdbg offset:0 atIndex:6];   /* ALFAVAR diagnostic */
                                     /* The D3D9 pixel center is at an INTEGER, in Metal at +0.5.
@@ -7891,6 +7935,29 @@ void metal_run_main_loop(void){
                                     cur_t = dr->target;
                                 }
                                 if (dr->is_clear || !dr->count) continue;
+#if NFS_ENHANCED
+                                /* picture.m IN-PASS DRAWS: the scene filter instead of the game's copy */
+                                if (pic_fold && (long)i == pic_at && ENVC("PICFOLDLOG")){ static int n2; if (n2++ < 4)
+                                    fprintf(stderr, "[picfold] at draw %u: enc %d tex %u cf %d df %d ns %lu screen %d\n", i, enc != nil, dr->tex,
+                                            (int)enc_cf, (int)enc_df, (unsigned long)enc_ns, enc_screen); }
+                                if (pic_fold && (long)i == pic_at && enc){
+                                    int pic_pre_draw(id<MTLDevice>, id<MTLRenderCommandEncoder>, id<MTLTexture>, id<MTLTexture>,
+                                                     MTLPixelFormat, MTLPixelFormat, NSUInteger, const float *);
+                                    static const float one4[4] = { 1.f, 1.f, 1.f, 1.f };
+                                    id<MTLTexture> zt = g_ztex[1];
+                                    if (zt && (zt == enc_z || zt == enc_zres)) zt = nil;   /* attached: not readable here */
+                                    unsigned st = dr->tex;
+                                    if (st && st < MAXTEX && g_tex[st] &&
+                                        pic_pre_draw(g_dev, enc, g_tex[st], zt, enc_cf, enc_df, enc_ns,
+                                                     g_ps_copy[dr->ps] == 2 ? dr->c0 : one4)){
+                                        freed_use(st, 0);
+                                        c_pso = nil; c_depth = ~0u; c_fp_valid = 0; c_cull = ~0u;
+                                        c_tex[0] = c_tex[1] = ~0u; c_smp[0] = ~0u;
+                                        atomic_fetch_add(&g_draw_n, 1ull);
+                                        continue;
+                                    }
+                                }
+#endif
                                 /* PSINFO=<n>: print the target/texture/blend of the first draws
                                  * using this ps. */
                                 { static int pi = -2; static int shown = 0;
@@ -8050,6 +8117,16 @@ void metal_run_main_loop(void){
                               atomic_fetch_add(&g_tris_drawn, tt); }
                         }
 #if NFS_ENHANCED
+                        int gamma_done = 0;   /* picture.m IN-PASS DRAWS: gamma as the last draw of the screen pass */
+                        { int pic_fold_on(void);
+                          int pic_gamma_draw(id<MTLDevice>, id<MTLRenderCommandEncoder>, MTLPixelFormat, MTLPixelFormat, NSUInteger);
+                          if (enc && enc_screen && !enc_extra && pic_fold_on() && !abt_off("PICTURE"))
+                              gamma_done = pic_gamma_draw(g_dev, enc, enc_cf, enc_df, enc_ns);
+                          if (ENVC("PICFOLDLOG")){ static unsigned long r[6]; static long last;
+                              r[!enc ? 0 : !enc_screen ? 1 : enc_ns > 1 ? 2 : enc_extra ? 3 : c_ms ? 4 : 5]++;
+                              if (fno_pre - last >= 1000){ last = fno_pre;
+                                  fprintf(stderr, "[picfold] gamma last pass: no enc %lu, not screen %lu, ms %lu, extra %lu, c_ms %lu, ok %lu\n",
+                                          r[0], r[1], r[2], r[3], r[4], r[5]); } } }
                         if (enc){ int pe = rb >= 0 ? hd_ms_end(enc, rb, g_dn[rb], c_ms, c_gb, c_att) : 0;
                                   [enc endEncoding]; enc = nil;
                                   if (pe) hd_ms_fallback(cb, dtex, pe); }
@@ -8073,7 +8150,7 @@ void metal_run_main_loop(void){
                          * ABTEST=PICTURE measures the picture passes' cost */
 #if NFS_ENHANCED
                         { void pic_gamma(id<MTLDevice>, id<MTLCommandBuffer>, id<MTLTexture>);
-                          if (!abt_off("PICTURE")) pic_gamma(g_dev, cb, dtex); }
+                          if (!abt_off("PICTURE") && !gamma_done) pic_gamma(g_dev, cb, dtex); }
 #endif
                         /* PERFLOG counters must be taken BEFORE the buffer is GIVEN BACK to the game:
                          * afterwards the game thread zeroes and refills the same buffer.

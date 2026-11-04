@@ -273,6 +273,58 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
 void vs_free(VSProg *p){ if (p){ free(p->ins); free(p); } }
 unsigned vs_version(const VSProg *p){ return p ? p->version : 0; }
 unsigned vs_ninstr(const VSProg *p){ return p ? p->n : 0; }
+/* Is the pixel shader a plain copy of stage 0 -- out = tex0(t0), nothing else, no
+ * modifier anywhere?  ps_1_0..1_3: tex t0 + mov r0, t0;  ps_1_4: texld r0, t0;
+ * ps_2_0: texld rN, t0, s0 + mov oC0, rN.  Returns 1 for a copy, 2 for a copy times
+ * c0 (mul instead of mov, e.g. the race's ps 22: tex t0; mul r0, t0, c0), else 0.
+ * picture.m can then draw its filter in place of such a draw (metal.m PICTURE OPTIONS). */
+static int plain_src(unsigned t, int type, int num){
+    return RT(t) == type && RN(t) == num && SWIZ(t) == 0xE4u && SMOD(t) == 0 && !RELADDR(t);
+}
+static int plain_dst(unsigned t, int type, int num){
+    return RT(t) == type && RN(t) == num && WMASK(t) == 0xFu && !SATUR(t) && DSHIFT(t) == 0 && !RELADDR(t);
+}
+int ps_plain_copy(const VSProg *p){
+    if (!p || !p->is_ps) return 0;
+    unsigned major = (p->version >> 8) & 0xFFu, minor = p->version & 0xFFu;
+    int ntex = 0, nmov = 0, treg = -1, mul = 0;
+    for (unsigned k = 0; k < p->n; k++){
+        const VSIns *I = &p->ins[k];
+        if (I->op == O_DCL || I->op == O_NOP || I->op == O_END) continue;
+        if (I->op == O_TEX){
+            if (ntex++ || !I->has_dst) return 0;
+            if (major < 2 && minor < 4){                      /* tex t0 */
+                if (!plain_dst(I->dst, R_ADDR, 0) || I->nsrc) return 0;
+            } else if (major < 2){                            /* texld r0, t0 */
+                if (!plain_dst(I->dst, R_TEMP, 0) || I->nsrc < 1 || !plain_src(I->src[0], R_ADDR, 0)) return 0;
+                treg = 0;
+            } else {                                          /* texld rN, t0, s0 */
+                if (RT(I->dst) != R_TEMP || !plain_dst(I->dst, R_TEMP, RN(I->dst)) || I->nsrc < 2 ||
+                    !plain_src(I->src[0], R_ADDR, 0) || RT(I->src[1]) != R_SAMPLER || RN(I->src[1]) != 0) return 0;
+                treg = RN(I->dst);
+            }
+            continue;
+        }
+        if (I->op == O_MOV || I->op == O_MUL){
+            int ns = I->op == O_MUL ? 2 : 1;
+            if (nmov++ || !ntex || !I->has_dst || I->nsrc < (unsigned)ns) return 0;
+            int st = major < 2 ? R_ADDR : R_TEMP, sn = major < 2 ? 0 : treg, okt = 0, okc = ns == 1;
+            for (int q = 0; q < ns; q++){
+                if (plain_src(I->src[q], st, sn)) okt++;
+                else if (ns == 2 && plain_src(I->src[q], R_CONST, 0) && !(p->defmask[0] & 1u)) okc = 1;
+            }
+            if (okt != 1 || !okc) return 0;
+            if (major < 2){ if (!(minor < 4 && plain_dst(I->dst, R_TEMP, 0))) return 0; }
+            else if (!plain_dst(I->dst, R_COLOROUT, 0)) return 0;
+            mul = ns == 2;
+            continue;
+        }
+        return 0;                                             /* anything else */
+    }
+    if (ntex != 1) return 0;
+    if (major < 2 && minor >= 4) return nmov == 0;
+    return nmov == 1 ? 1 + mul : 0;
+}
 unsigned vs_unknown(const VSProg *p){ return p ? p->unknown : 0; }
 
 int vs_input_reg(const VSProg *p, int usage, int usage_index){

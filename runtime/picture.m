@@ -81,7 +81,7 @@ static NSString *kPicSrc = @
     "fragment half4 pic_gamma(V in [[stage_in]], half4 d [[color(0)]]) {\n"
     "  float3 c = float3(d.rgb);\n"
     "  return half4(half3(float3(x360(c.r), x360(c.g), x360(c.b))), d.a); }\n"
-    "struct PP { float2 px; float aa; float sharp; float hasz; float pad[3]; };\n"
+    "struct PP { float2 px; float aa; float sharp; float hasz; float pad[3]; float4 mul; };\n"
     "static float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
     "static float q1(depth2d<float> z, int2 p) {\n"
     "  int2 m = int2(z.get_width(), z.get_height()) - 1;\n"
@@ -113,7 +113,7 @@ static NSString *kPicSrc = @
     "      float3 a = 0.5 * (t.sample(s, uv - d * (1.0 / 6.0)).rgb + t.sample(s, uv + d * (1.0 / 6.0)).rgb);\n"
     "      float3 b = 0.5 * a + 0.25 * (t.sample(s, uv - d * 0.5).rgb + t.sample(s, uv + d * 0.5).rgb);\n"
     "      float lb = luma(b);\n"
-    "      return float4((lb < lo || lb > hi) ? a : b, c0.a);\n"
+    "      return float4((lb < lo || lb > hi) ? a : b, c0.a) * P.mul;\n"
     "    }\n"
     "  }\n"
     "  if (P.sharp > 0.0) {\n"
@@ -124,7 +124,7 @@ static NSString *kPicSrc = @
     "    float3 wt = -amp * (0.2 * P.sharp);\n"
     "    c = saturate((c + wt * (n + so + e + w)) / (1.0 + 4.0 * wt));\n"
     "  }\n"
-    "  return float4(c, c0.a); }\n";
+    "  return float4(c, c0.a) * P.mul; }\n";
 
 static int g_gamma = -1;
 static id<MTLLibrary> g_lib;
@@ -229,8 +229,8 @@ id<MTLTexture> pic_pre(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture
     if (hasz) [en setFragmentTexture:zt atIndex:1];
     if (g_aa){ if (hasz) g_pre_z++; else g_pre_noz++; }
     [en setFragmentSamplerState:g_pre_smp atIndex:0];
-    struct { float px[2]; float aa, sharp, hasz, pad[3]; } P = { { 1.f / (float)src.width, 1.f / (float)src.height },
-        g_aa ? 1.f : 0.f, (float)g_sharp / 100.f, hasz ? 1.f : 0.f, { 0.f, 0.f, 0.f } };
+    struct { float px[2]; float aa, sharp, hasz, pad[3]; float mul[4]; } P = { { 1.f / (float)src.width, 1.f / (float)src.height },
+        g_aa ? 1.f : 0.f, (float)g_sharp / 100.f, hasz ? 1.f : 0.f, { 0.f, 0.f, 0.f }, { 1.f, 1.f, 1.f, 1.f } };
     [en setFragmentBytes:&P length:sizeof P atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [en endEncoding];
@@ -238,10 +238,105 @@ id<MTLTexture> pic_pre(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture
     return g_pre_out;
 }
 
+/* ---- IN-PASS DRAWS (metal.m PICTURE OPTIONS, "folded") -----------------------
+ * Measured at 3024x1898 (ABTEST=PICTURE, 2026-11-04): the scene pass cost 0.58 ms and
+ * the gamma pass 0.30 ms a frame, mostly writing and reading whole frames.  Both now
+ * run INSIDE a pass metal.m has open anyway:
+ *  - the scene filter replaces the game's copy of the scene to the screen when that
+ *    draw is a plain copy (vsemu.c ps_plain_copy, UVs 1:1): no scratch texture, no
+ *    extra pass;
+ *  - the gamma curve is the last draw of the last screen pass, reading its pixel
+ *    from tile memory: no extra load and store of the frame.
+ * The output is the same as before.  The pipelines follow the open pass's
+ * attachments; the encoder's depth, cull and buffer state is changed, metal.m drops
+ * its cached copies.  PICFOLD=0: the separate passes as before. */
+int pic_fold_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = getenv("PICFOLD"); v = !(e && *e == '0'); }
+    return v;
+}
+typedef struct { const char *frag; MTLPixelFormat cf, df; NSUInteger ns; id<MTLRenderPipelineState> pso; } PicPso;
+static PicPso g_ip[16]; static int g_nip;
+static id<MTLDepthStencilState> g_ds_off;
+static unsigned long g_fold_pre, g_fold_gamma;
+static id<MTLRenderPipelineState> pic_pso_in(id<MTLDevice> dev, const char *frag, MTLPixelFormat cf,
+                                             MTLPixelFormat df, NSUInteger ns){
+    for (int i = 0; i < g_nip; i++)
+        if (g_ip[i].frag == frag && g_ip[i].cf == cf && g_ip[i].df == df && g_ip[i].ns == ns) return g_ip[i].pso;
+    id<MTLFunction> v = pic_fn(dev, @"pic_v"), f = pic_fn(dev, [NSString stringWithUTF8String:frag]);
+    id<MTLRenderPipelineState> p = nil;
+    if (v && f){
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = v; pd.fragmentFunction = f;
+        pd.colorAttachments[0].pixelFormat = cf;
+        pd.depthAttachmentPixelFormat = df;
+        if (df == MTLPixelFormatDepth32Float_Stencil8 || df == MTLPixelFormatDepth24Unorm_Stencil8)
+            pd.stencilAttachmentPixelFormat = df;
+        pd.rasterSampleCount = ns ? ns : 1;
+        NSError *e = nil;
+        p = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!p) fprintf(stderr, "picture: in-pass pipeline %s failed: %s\n", frag,
+                        e ? [[e localizedDescription] UTF8String] : "?");
+    }
+    if (g_nip < 16){ g_ip[g_nip].frag = frag; g_ip[g_nip].cf = cf; g_ip[g_nip].df = df;
+                     g_ip[g_nip].ns = ns; g_ip[g_nip].pso = p; g_nip++; }
+    return p;
+}
+static void pic_in_state(id<MTLDevice> dev, id<MTLRenderCommandEncoder> en, id<MTLRenderPipelineState> p){
+    if (!g_ds_off){ MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = NO;
+        g_ds_off = [dev newDepthStencilStateWithDescriptor:dd]; }
+    [en setRenderPipelineState:p];
+    [en setDepthStencilState:g_ds_off];
+    [en setCullMode:MTLCullModeNone];
+}
+/* The scene filter as the draw that copies src to the screen, times mul (the copy's
+ * c0, or 1).  zt: the scene's depth (nil if it can't be read in this pass).
+ * 1 = drawn (skip the game's draw). */
+int pic_pre_draw(id<MTLDevice> dev, id<MTLRenderCommandEncoder> en, id<MTLTexture> src, id<MTLTexture> zt,
+                 MTLPixelFormat cf, MTLPixelFormat df, NSUInteger ns, const float mul[4]){
+    if (!pic_pre_on() || !en || !src || src.textureType != MTLTextureType2D) return 0;
+    const char *fn = "pic_pre";
+    id<MTLRenderPipelineState> p = pic_pso_in(dev, fn, cf, df, ns);
+    if (!p) return 0;
+    if (!g_pre_smp){ MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        g_pre_smp = [dev newSamplerStateWithDescriptor:sd]; }
+    pic_in_state(dev, en, p);
+    [en setFragmentTexture:src atIndex:0];
+    int hasz = zt && zt.pixelFormat == MTLPixelFormatDepth32Float && (zt.usage & MTLTextureUsageShaderRead) &&
+               zt.width == src.width && zt.height == src.height && zt.sampleCount == 1;
+    [en setFragmentTexture:hasz ? zt : nil atIndex:1];
+    if (g_aa){ if (hasz) g_pre_z++; else g_pre_noz++; }
+    [en setFragmentSamplerState:g_pre_smp atIndex:0];
+    struct { float px[2]; float aa, sharp, hasz, pad[3]; float mul[4]; } P = { { 1.f / (float)src.width, 1.f / (float)src.height },
+        g_aa ? 1.f : 0.f, (float)g_sharp / 100.f, hasz ? 1.f : 0.f, { 0.f, 0.f, 0.f }, { mul[0], mul[1], mul[2], mul[3] } };
+    [en setFragmentBytes:&P length:sizeof P atIndex:0];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    g_pre_n++; g_fold_pre++;
+    return 1;
+}
+/* The gamma curve as the last draw of the open screen pass.  In a multisampled pass
+ * it runs per sample before the resolve (edges differ by rounding only). */
+int pic_gamma_draw(id<MTLDevice> dev, id<MTLRenderCommandEncoder> en, MTLPixelFormat cf, MTLPixelFormat df, NSUInteger ns){
+    if (!pic_gamma_on() || !en) return 0;
+    static const char *fn = "pic_gamma";
+    id<MTLRenderPipelineState> p = pic_pso_in(dev, fn, cf, df, ns);
+    if (!p) return 0;
+    pic_in_state(dev, en, p);
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    g_gamma_n++; g_fold_gamma++;
+    return 1;
+}
+
 void pic_report(void){
     if (pic_gamma_on()) fprintf(stderr, "  console gamma    : %lu frames\n", g_gamma_n);
     if (pic_pre_on()) fprintf(stderr, "  scene pass       : edge smoothing %s (depth edges %lu frames, luma only %lu), sharpening %d%%, %lu frames\n",
                               g_aa ? "on" : "off", g_pre_z, g_pre_noz, g_sharp, g_pre_n);
+    if (pic_gamma_on() || pic_pre_on())
+        fprintf(stderr, "  picture folding  : %s, scene filter in the copy draw %lu frames, gamma in the last pass %lu frames\n",
+                pic_fold_on() ? "on" : "off (PICFOLD=0)", g_fold_pre, g_fold_gamma);
 }
 
 #else   /* original engine: no picture options */
@@ -250,4 +345,10 @@ id<MTLTexture> pic_pre(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture
     (void)dev; (void)cb; (void)src; (void)zt; return nil; }
 void pic_gamma(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> scr){ (void)dev; (void)cb; (void)scr; }
 void pic_report(void){}
+int pic_fold_on(void){ return 0; }
+int pic_pre_draw(id<MTLDevice> dev, id<MTLRenderCommandEncoder> en, id<MTLTexture> src, id<MTLTexture> zt,
+                 MTLPixelFormat cf, MTLPixelFormat df, NSUInteger ns, const float mul[4]){
+    (void)mul; (void)dev; (void)en; (void)src; (void)zt; (void)cf; (void)df; (void)ns; return 0; }
+int pic_gamma_draw(id<MTLDevice> dev, id<MTLRenderCommandEncoder> en, MTLPixelFormat cf, MTLPixelFormat df, NSUInteger ns){
+    (void)dev; (void)en; (void)cf; (void)df; (void)ns; return 0; }
 #endif

@@ -3869,6 +3869,7 @@ int com_call(CPU *c, uint32_t magic){
                                                   fprintf(stderr, "%s\n", msl); break; }
                               while (*q && *q != ',') q++; } }
                         metal_register_ps(id, msl);
+                        { void metal_set_ps_copy(int, int); metal_set_ps_copy(id, ps_plain_copy(pp3)); }
                         MR32(h+12) = (uint32_t)id;
                     }
                     /* CUBE VARIANT (id + PSCUBE): in D3D9 ps_1_x doesn't declare the texture TYPE, the
