@@ -25,6 +25,9 @@ typedef struct {
     ObKind kind; int signaled; int manual;
     int counting;                     /* EVENT: set by the timer thread, counts ticks (see CATCH-UP) */
     int prio;                         /* THREAD: SetThreadPriority (see LOCK PRIORITY) */
+    int closed; uint64_t closed_us;   /* CloseHandle / RegCloseKey (see FREEING HANDLES) */
+    int dups;                         /* DuplicateHandle copies (same value) still open */
+    _Atomic int busy;                 /* threads inside a Wait on it right now */
     pthread_mutex_t mtx; pthread_cond_t cv;
     uint32_t guest_arg, guest_entry, tid;
     uint32_t owner_tid; int rec;      /* MUTEX: ownership + recursion */
@@ -342,24 +345,32 @@ static int cs_disabled(void){
     if (v < 0){ const char *e = getenv("NOCS"); v = (e && *e && *e != '0') ? 1 : 0; }
     return v;
 }
+/* used: 0 empty, 1 live, 2 deleted (DeleteCriticalSection; the probe chain goes on
+ * past it and a new section can take it).  Deleted sections used to stay: +2 per race
+ * round trip, and a full table means no locking at all.  NFSU2_HANDLEFREE=0: old. */
+static uint64_t g_cs_deleted = 0;
 static pthread_mutex_t *cs_for(uint32_t key){
     if (cs_disabled()) return 0;          /* old behavior: no-op stub */
     pthread_mutex_lock(&g_cs_tab);
     unsigned h = (key >> 2) % MAXCS;
+    int tomb = -1;
     for (unsigned i = 0; i < MAXCS; i++){
         unsigned j = (h + i) % MAXCS;
-        if (g_cs[j].used && g_cs[j].key == key){
+        if (g_cs[j].used == 1 && g_cs[j].key == key){
             pthread_mutex_unlock(&g_cs_tab); return &g_cs[j].m;
         }
-        if (!g_cs[j].used){
-            pthread_mutexattr_t a;
-            pthread_mutexattr_init(&a);
-            pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-            pthread_mutex_init(&g_cs[j].m, &a);
-            pthread_mutexattr_destroy(&a);
-            g_cs[j].key = key; g_cs[j].used = 1;
-            pthread_mutex_unlock(&g_cs_tab); return &g_cs[j].m;
-        }
+        if (g_cs[j].used == 2){ if (tomb < 0) tomb = (int)j; continue; }
+        if (!g_cs[j].used){ if (tomb < 0) tomb = (int)j; break; }
+    }
+    if (tomb >= 0){                /* a new section: the first deleted or empty slot */
+        unsigned j = (unsigned)tomb;
+        pthread_mutexattr_t a;
+        pthread_mutexattr_init(&a);
+        pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&g_cs[j].m, &a);
+        pthread_mutexattr_destroy(&a);
+        g_cs[j].key = key; g_cs[j].used = 1;
+        pthread_mutex_unlock(&g_cs_tab); return &g_cs[j].m;
     }
     pthread_mutex_unlock(&g_cs_tab);
     return 0;                      /* table full: fall back to the old behavior */
@@ -432,9 +443,29 @@ void guest_fair_yield(void){
     guest_yield_end();
 }
 
+/* ---- FREEING HANDLES ------------------------------------------------------------
+ * CloseHandle did nothing for events, mutexes, semaphores and threads (RegCloseKey for
+ * registry keys), and a slot of the 511 was never reused: +4 per race round trip.
+ * Now a closed object's slot is reused once nobody waits on it, a thread has ended
+ * and 2 s have passed (a late SetEvent on a stale handle then finds nothing to break).
+ * NFSU2_HANDLEFREE=0: the old behaviour. */
+static int handlefree_off(void){ static int v=-1; if (v<0){ const char *e=getenv("NFSU2_HANDLEFREE"); v = e && *e=='0'; } return v; }
+static uint64_t g_obj_reused = 0;
 static uint32_t obj_new(ObKind k){
     pthread_mutex_lock(&g_lock);
-    int i = g_obj_n < OBJ_MAX ? g_obj_n++ : 0;
+    int i = 0;
+    if (!handlefree_off()){
+        uint64_t now = wait_now_us();
+        for (int q = 1; q < g_obj_n; q++){
+            Obj *c2 = &g_obj[q];
+            if (!c2->kind || !c2->closed || atomic_load(&c2->busy) || now - c2->closed_us < 2000000u) continue;
+            if (c2->kind == OB_THREAD && (!c2->started || c2->signaled <= 0)) continue;   /* still running */
+            pthread_mutex_destroy(&c2->mtx); pthread_cond_destroy(&c2->cv);
+            if (q < 64) memset(&g_wstat[q], 0, sizeof g_wstat[q]);
+            i = q; g_obj_reused++; break;
+        }
+    }
+    if (!i) i = g_obj_n < OBJ_MAX ? g_obj_n++ : 0;
     pthread_mutex_unlock(&g_lock);
     if (!i) return 0;
     Obj *o=&g_obj[i]; memset(o,0,sizeof *o); o->kind=k;
@@ -448,6 +479,14 @@ static Obj *obj_get(uint32_t h){
     if (h < H_BASE || h >= H_BASE+OBJ_MAX) return 0;
     uint32_t i = h - H_BASE;
     return g_obj[i].kind ? &g_obj[i] : 0;
+}
+static void obj_close(uint32_t h){                /* see FREEING HANDLES */
+    Obj *o = obj_get(h);
+    if (!o || handlefree_off()) return;
+    pthread_mutex_lock(&g_lock);
+    if (o->dups > 0) o->dups--;
+    else if (!o->closed){ o->closed = 1; o->closed_us = wait_now_us(); }
+    pthread_mutex_unlock(&g_lock);
 }
 
 /* ---- guest thread ---- */
@@ -636,6 +675,13 @@ void timer_report(void){
     if (g_ts_t0) timer_stat_print("end,", wait_now_us());
     extern uint64_t g_sleep_skipped;
     fprintf(stderr, "  [timer] game sleeps skipped to repay late wake-ups (SLEEP DEBT): %llu\n", (unsigned long long)g_sleep_skipped);
+    /* fixed-size tables that only grow (long-session check) */
+    { int ncs = 0, nlive = 0;
+      for (int i = 0; i < MAXCS; i++) if (g_cs[i].used == 1) ncs++;
+      for (int i = 1; i < g_obj_n; i++) if (g_obj[i].kind && !g_obj[i].closed) nlive++;
+      fprintf(stderr, "  win32 tables      : objects %d open, %d slots of %d used (%llu reused); critical sections %d of %d (%llu deleted)%s\n",
+              nlive, g_obj_n - 1, OBJ_MAX - 1, (unsigned long long)g_obj_reused, ncs, MAXCS,
+              (unsigned long long)g_cs_deleted, handlefree_off() ? "  [NFSU2_HANDLEFREE=0]" : ""); }
 }
 
 static void *timer_thread_main(void *p){
@@ -914,7 +960,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                 fprintf(stderr,"  [registry] SetValue(\"%s\") type=%u size=%u\n", vn, type, cb);
         }
         r=ERROR_SUCCESS; }
-    else if (!strcmp(n,"RegCloseKey")) r=ERROR_SUCCESS;
+    else if (!strcmp(n,"RegCloseKey")){ obj_close(A(c,0)); r=ERROR_SUCCESS; }
     else if (!strcmp(n,"RegDeleteKeyA")||!strcmp(n,"RegDeleteValueA")) r=ERROR_SUCCESS;
     else if (!strcmp(n,"RegEnumKeyExA")||!strcmp(n,"RegEnumValueA")) r=259u; /* ERROR_NO_MORE_ITEMS */
     /* --- window / USER32 --- */
@@ -1057,8 +1103,9 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                          ? MR32(c->fs_base+0x24u) : 0u;
           if (h>=H_BASE && h<H_BASE+64){ g_wstat[h-H_BASE].waits++;
                                          g_wstat[h-H_BASE].waiter_tid = tid; }
-          static int sh=0;
-          if (++sh % 400 == 0){
+          static int sh=0, evlog=-1;
+          if (evlog < 0){ const char *e=getenv("EVENTLOG"); evlog = e && *e && *e!='0'; }
+          if (evlog && ++sh % 400 == 0){        /* EVENTLOG=1: it filled 18 MB of a 2-hour log */
             fprintf(stderr,"  [event] handle  type  signal  wait  SetEvent  waiting-tid\n");
             for (int i=0;i<64;i++) if (g_wstat[i].waits || g_wstat[i].sets)
                 fprintf(stderr, "         h%-4d %3d %6d %8llu %9llu  tid=%u\n", i,
@@ -1074,6 +1121,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
              * deadlocks itself (this is how the video player froze). */
             uint32_t me = cur_tid(c);
             uint64_t deadline = wait_deadline(ms, o->kind == OB_MUTEX && ms == 0xFFFFFFFFu ? ms : 2000u), us;
+            atomic_fetch_add(&o->busy, 1);            /* see FREEING HANDLES */
             guest_yield_begin();
             pthread_mutex_lock(&o->mtx);
             while (!wait_ready(o, me) && !wait_thread_killed() && (us = wait_slice(deadline, 50000u))){
@@ -1083,6 +1131,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
             r = wait_ready(o, me) ? 0u : 0x102u;        /* WAIT_OBJECT_0 / WAIT_TIMEOUT */
             if (!r) wait_take(o, me);
             pthread_mutex_unlock(&o->mtx);
+            atomic_fetch_sub(&o->busy, 1);
             guest_yield_end();
         } }
     /* --- thread --- */
@@ -1183,6 +1232,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                 locks[j] = o; nl++;
             }
             uint64_t deadline = wait_deadline(ms, 200u), us;
+            for (uint32_t i = 0; i < nl; i++) atomic_fetch_add(&locks[i]->busy, 1);   /* see FREEING HANDLES */
             guest_yield_begin();
             for (;;){
                 uint32_t got = 0x102u;
@@ -1201,13 +1251,16 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                 }
                 r = got;
                 if (got != 0x102u || wait_thread_killed() || !(us = wait_slice(deadline, 1000u))) break;
-                struct timespec ts = { 0, (long)us * 1000L }; nanosleep(&ts, 0);
+                sleep_precise_ns((long)us * 1000L);       /* see THE GAME'S OWN SLEEPS */
             }
+            for (uint32_t i = 0; i < nl; i++) atomic_fetch_sub(&locks[i]->busy, 1);
             guest_yield_end();
         } }
     else if (!strcmp(n,"SwitchToThread")){ guest_yield_begin(); sched_yield(); guest_yield_end(); r=1; }
-    else if (!strcmp(n,"CloseHandle")) r=1;
-    else if (!strcmp(n,"DuplicateHandle")){ uint32_t p=A(c,3); if(p) MR32(p)=A(c,1); r=1; }
+    else if (!strcmp(n,"CloseHandle")){ obj_close(A(c,0)); r=1; }
+    else if (!strcmp(n,"DuplicateHandle")){ uint32_t p=A(c,3); if(p) MR32(p)=A(c,1);
+        { Obj *o = obj_get(A(c,1)); if (o){ pthread_mutex_lock(&g_lock); o->dups++; pthread_mutex_unlock(&g_lock); } }
+        r=1; }
     else if (!strcmp(n,"SetErrorMode")) r=0;
     else if (!strcmp(n,"GetLogicalDrives")) r=0x0000000Cu;             /* C: and D: */
     else if (!strcmp(n,"GetDriveTypeA")){
@@ -1417,7 +1470,23 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         pthread_mutex_t *m = cs_for(A(c,0));
         if (m && tl_cs_depth > 0){ tl_cs_depth--; pthread_mutex_unlock(m); }
         r=1; }
-    else if (!strcmp(n,"DeleteCriticalSection")) r=1;
+    else if (!strcmp(n,"DeleteCriticalSection")){
+        if (!cs_disabled() && !handlefree_off()){
+            uint32_t key = A(c,0);
+            pthread_mutex_lock(&g_cs_tab);
+            unsigned h = (key >> 2) % MAXCS;
+            for (unsigned i = 0; i < MAXCS; i++){
+                unsigned j = (h + i) % MAXCS;
+                if (!g_cs[j].used) break;
+                if (g_cs[j].used == 1 && g_cs[j].key == key){
+                    /* only if nobody holds it (destroy says EBUSY otherwise) */
+                    if (pthread_mutex_destroy(&g_cs[j].m) == 0){ g_cs[j].used = 2; g_cs_deleted++; }
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_cs_tab);
+        }
+        r=1; }
     else return 0;                       /* this layer isn't interested */
     *out = r;
     return 1;

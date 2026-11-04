@@ -101,6 +101,7 @@ static FILE *g_dump = NULL;      /* SNDDUMP=<path> : raw s16le stereo */
 static FILE *g_csv  = NULL;      /* SNDCSV=<path>  : state per callback */
 static uint64_t g_cb_no = 0;
 
+static int snd_reuse_off(void);
 int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
                    uint32_t chans, uint32_t bits){
     if (!data || !bytes) return 0;
@@ -109,8 +110,9 @@ int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
     if (bits != 8u && bits != 16u) bits = 16u;
     pthread_mutex_lock(&g_slock);
     int id = 0;
-    if (g_sndn < MAXSND){
-        id = g_sndn++;
+    for (int i = 1; i < g_sndn && !snd_reuse_off(); i++) if (!g_snd[i].used){ id = i; break; }   /* see audio_unregister */
+    if (!id && g_sndn < MAXSND) id = g_sndn++;
+    if (id){
         SndBuf *b = &g_snd[id];
         b->data = data; b->bytes = bytes; b->rate = rate;
         b->chans = chans; b->bits = bits;
@@ -215,9 +217,13 @@ int audio_duplicate(int src){
     if (src <= 0 || src >= MAXSND) return 0;
     int id = 0;
     pthread_mutex_lock(&g_slock);
-    if (g_snd[src].used && g_sndn < MAXSND){
-        id = g_sndn++;
+    for (int i = 1; i < g_sndn && !snd_reuse_off(); i++) if (!g_snd[i].used){ id = i; break; }
+    if (!id && g_sndn < MAXSND) id = g_sndn++;
+    if (g_snd[src].used && id){
         g_snd[id] = g_snd[src];
+        /* its own stale-data map (the copy used to share the source's) */
+        g_snd[id].fresh = calloc((g_snd[id].bytes >> FRESH_SH) + 1u, 1);
+        g_snd[id].wr_play = 0; g_snd[id].muted = 0; g_snd[id].lastblk = 0xFFFFFFFFu;
         g_snd[id].playing = 0; g_snd[id].cursor = 0.0; g_snd[id].trim = 1.0;
         g_snd[id].target = 0.0; g_snd[id].over = 0;
         g_snd[id].plays = g_snd[id].stops = 0;
@@ -225,6 +231,22 @@ int audio_duplicate(int src){
     }
     pthread_mutex_unlock(&g_slock);
     return id;
+}
+/* The game's last Release of a sound buffer gives the slot back.  Slots were never
+ * reused: one or two new streaming buffers per race load (24 in the issue #49 2-hour
+ * log), and after MAXSND every new buffer got id 0 -- the music of later races silent
+ * after ~10 hours.  SNDREUSE=0: the old behaviour. */
+static int snd_reuse_off(void){ static int v = -1; if (v < 0){ const char *e = getenv("SNDREUSE"); v = e && *e == '0'; } return v; }
+static uint64_t g_snd_unreg = 0;
+void audio_unregister(int id){
+    if (id <= 0 || id >= MAXSND || snd_reuse_off()) return;
+    pthread_mutex_lock(&g_slock);
+    if (g_snd[id].used){
+        free(g_snd[id].fresh);
+        memset(&g_snd[id], 0, sizeof g_snd[id]);
+        g_snd_unreg++;
+    }
+    pthread_mutex_unlock(&g_slock);
 }
 void audio_stop(int id){
     if (id <= 0 || id >= MAXSND) return;
@@ -605,10 +627,10 @@ void audio_report(void){
     if (g_dump){ fflush(g_dump); fclose(g_dump); g_dump = NULL; }
     if (g_csv){  fflush(g_csv);  fclose(g_csv);  g_csv  = NULL; }
     fprintf(stderr, "  sound output      : %s, %llu frames mixed, "
-            "at most %llu simultaneous buffers, %d registered\n",
+            "at most %llu simultaneous buffers, %d slots of %d used (%llu given back)\n",
             g_audio_on ? "on" : "OFF",
             (unsigned long long)g_mixed_frames,
-            (unsigned long long)g_active_peak, g_sndn - 1);
+            (unsigned long long)g_active_peak, g_sndn - 1, MAXSND - 1, (unsigned long long)g_snd_unreg);
     fprintf(stderr, "  sound Play calls  : %llu started from the beginning, %llu were already playing\n",
             (unsigned long long)g_replay, (unsigned long long)g_reissue);
     fprintf(stderr, "  sound rate ratio  : %.3f (game virtual time / real time)%s\n",

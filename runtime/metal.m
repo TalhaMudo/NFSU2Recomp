@@ -428,6 +428,12 @@ static id<MTLBuffer> g_mtlrvb, g_mtlkb;
  * TEXORD=0 is the old behavior. */
 #define MAXUP (8u*1024u*1024u)
 static uint8_t *g_upbuf[2]; static unsigned g_upn[2];
+/* The guest's half grows on demand up to UPLIM (it was a fixed MAXUP: the issue #49
+ * 2-hour log had 97 overflows, those uploads went in immediately and could race the
+ * frame on the GPU).  Only the guest's own half (g_cur) is grown, under g_qlock; the
+ * main thread reads the other one. */
+#define UPLIM (64u*1024u*1024u)
+static unsigned g_upcap[2] = { MAXUP, MAXUP };
 static _Atomic unsigned long long g_up_ord = 0, g_up_ovf = 0;
 static int texord_on(void){
     static int on = -1; if (on < 0){ const char *e = ENVC("TEXORD"); on = (e && *e == '0') ? 0 : 1; }
@@ -956,7 +962,17 @@ static unsigned char  g_zpend[MAXZ];        /* clear in the next pass */
 static float          g_zpend_v[MAXZ];
 static _Atomic unsigned long long g_z_mismatch = 0, g_z_null = 0;
 static _Atomic unsigned char g_zforget[MAXZ];  /* the guest recreated it: drop the texture */
-void metal_z_forget(unsigned zid){ if (zid < MAXZ) atomic_store(&g_zforget[zid], 1); }
+/* Z textures of created depth surfaces used to stay until the surface id came round
+ * again (ids 2..63 in a ring): up to ~62 full-screen depth textures (28 MB each at
+ * 3360x2100, more with the HD multisampled twins) kept after resolution and full-screen
+ * changes.  D3D9 makes the game release every depth surface before Reset and it makes
+ * new ones (new ids) afterwards, so at Reset the live ones (not the implicit one, 1)
+ * are dropped on the main thread 3 frames later -- unless their id is handed out again
+ * first.  NFSU2_TEXFREE=0 keeps them. */
+static _Atomic unsigned char g_zlive[MAXZ], g_zdead[MAXZ];
+static _Atomic long g_zdead_at;
+static unsigned long g_z_freed;
+void metal_z_forget(unsigned zid){ if (zid < MAXZ){ atomic_store(&g_zforget[zid], 1); atomic_store(&g_zdead[zid], 0); } }
 static id<MTLDepthStencilState> g_dss[64];
 static float    g_cur_aref   = 0.f;
 /* D3DRS_FOGENABLE(28) + D3DRS_FOGCOLOR(34).  Fog was NEVER applied: the vertex
@@ -1086,8 +1102,13 @@ static id<MTLBuffer> g_pool;        /* current pool (changed under g_qlock) */
 static id<MTLBuffer> g_pool_fr[2];  /* the pool as of the frame's submission */
 static uint32_t g_pool_top = 0;
 static struct { uint32_t key, gen, off, size, imax, used; } g_mir[MIR_N];
-static struct { uint32_t off, size, at; } g_pf[PF_N];
-static int g_pfn = 0;
+/* Free blocks, sorted by offset; neighbours merge and a free block at the top lowers
+ * it again.  It used to be an unsorted list of at most PF_N blocks, first fit, never
+ * merged (frees past PF_N were lost): the top climbed ~58 MB an hour of play (issue
+ * #49 log: 115.8 MB after 2 hours, live data a few MB) towards POOL_MAX. */
+typedef struct { uint32_t off, size, at; } PoolFree;
+static PoolFree *g_pf; static int g_pfn = 0, g_pfcap = 0;
+static int pool_old(void){ static int v = -1; if (v < 0){ const char *e = ENVC("NFSU2_POOLMERGE"); v = e && *e == '0'; } return v; }
 static uint32_t g_gframe = 0;       /* guest frame counter (metal_present) */
 static unsigned long g_mir_build = 0, g_mir_drop = 0, g_mir_live = 0, g_mir_full = 0;
 static unsigned long long g_mir_bytes = 0;
@@ -1105,11 +1126,16 @@ static int pool_reserve(uint32_t top){
 }
 static int pool_alloc(uint32_t want, uint32_t *off, uint32_t *size){
     want = (want + 255u) & ~255u;
+    /* a ready free block at the top gives the top back */
+    while (!pool_old() && g_pfn && g_pf[g_pfn-1].off + g_pf[g_pfn-1].size == g_pool_top &&
+           g_gframe - g_pf[g_pfn-1].at >= PF_DELAY){ g_pool_top = g_pf[g_pfn-1].off; g_pfn--; }
     for (int i = 0; i < g_pfn; i++){
         if (g_pf[i].size < want || g_gframe - g_pf[i].at < PF_DELAY) continue;
         *off = g_pf[i].off;
         if (g_pf[i].size - want >= 4096u){ *size = want; g_pf[i].off += want; g_pf[i].size -= want; }
-        else { *size = g_pf[i].size; g_pf[i] = g_pf[--g_pfn]; }
+        else { *size = g_pf[i].size;
+               if (pool_old()) g_pf[i] = g_pf[--g_pfn];
+               else { memmove(&g_pf[i], &g_pf[i+1], (size_t)(g_pfn - i - 1) * sizeof *g_pf); g_pfn--; } }
         return 1;
     }
     if (!pool_reserve(g_pool_top + want)) return 0;
@@ -1118,7 +1144,23 @@ static int pool_alloc(uint32_t want, uint32_t *off, uint32_t *size){
 }
 static void pool_free(uint32_t off, uint32_t size){
     if (!size) return;
-    if (g_pfn < PF_N){ g_pf[g_pfn].off = off; g_pf[g_pfn].size = size; g_pf[g_pfn].at = g_gframe; g_pfn++; }
+    if (g_pfn == g_pfcap){
+        if (pool_old() && g_pfcap >= PF_N) return;           /* the old behaviour: lost */
+        int nc = g_pfcap ? g_pfcap * 2 : PF_N;
+        PoolFree *nf = realloc(g_pf, (size_t)nc * sizeof *nf); if (!nf) return;
+        g_pf = nf; g_pfcap = nc; }
+    if (pool_old()){ g_pf[g_pfn].off = off; g_pf[g_pfn].size = size; g_pf[g_pfn].at = g_gframe; g_pfn++; return; }
+    int lo = 0, hi = g_pfn;                                  /* first block above off */
+    while (lo < hi){ int m = (lo + hi) / 2; if (g_pf[m].off < off) lo = m + 1; else hi = m; }
+    int prev = lo - 1, next = lo;
+    int mp = prev >= 0 && g_pf[prev].off + g_pf[prev].size == off;
+    int mn = next < g_pfn && off + size == g_pf[next].off;
+    if (mp && mn){ g_pf[prev].size += size + g_pf[next].size; g_pf[prev].at = g_gframe;
+                   memmove(&g_pf[next], &g_pf[next+1], (size_t)(g_pfn - next - 1) * sizeof *g_pf); g_pfn--; }
+    else if (mp){ g_pf[prev].size += size; g_pf[prev].at = g_gframe; }
+    else if (mn){ g_pf[next].off = off; g_pf[next].size += size; g_pf[next].at = g_gframe; }
+    else { memmove(&g_pf[lo+1], &g_pf[lo], (size_t)(g_pfn - lo) * sizeof *g_pf);
+           g_pf[lo].off = off; g_pf[lo].size = size; g_pf[lo].at = g_gframe; g_pfn++; }
 }
 static void mir_sweep(void){                 /* drop mirrors not drawn for a long time */
     for (unsigned i = 0; i < MIR_N; i++){
@@ -1162,6 +1204,17 @@ int metal_mirror(uint32_t key, uint32_t gen, const void *src, uint32_t size, uns
     *off = o; if (imax) *imax = mx;
     return 1;
 }
+/* Guest: the game released the buffer object (key); drop its mirror so a new object
+ * reusing the address can't match it (com.c COM OBJECT RECYCLING). */
+void metal_mirror_forget(uint32_t key){
+    if (!g_dev || key <= MIR_TOMB) return;
+    unsigned h = (key * 2654435761u) & (MIR_N - 1u);
+    for (unsigned q = 0; q < 64u; q++){
+        unsigned i = (h + q) & (MIR_N - 1u);
+        if (g_mir[i].key == key){ pool_free(g_mir[i].off, g_mir[i].size); g_mir[i].key = MIR_TOMB; g_mir_live--; g_mir_drop++; return; }
+        if (!g_mir[i].key) return;
+    }
+}
 /* Guest: the CPU view of the mirror in the pool (for scanning the index range). */
 const uint8_t *metal_pool_cpu(void){ return g_pool ? (const uint8_t *)[g_pool contents] : NULL; }
 /* Main thread: the raw bytes of the draw's j-th vertex (HD ray tracing CPU reads). */
@@ -1176,8 +1229,8 @@ static id<MTLBuffer>              g_blitvb;   /* fullscreen quad for StretchRect
 static id<MTLSamplerState>        g_samp;
 
 /* --- texture table --- */
-#define MAXTEX 65536   /* ids are 16 bits (TGT_ID).  Ids are never reused and a race creates ~3000
-                        * textures: 16384 ran out after ~30 min and every later texture was white. */
+#define MAXTEX 65536   /* ids are 16 bits (TGT_ID).  Released ids are reused (RELEASING TEXTURES);
+                        * before that a race used ~3000 new ids and 16384 ran out after ~30 min. */
 static uint8_t g_tex_cube[MAXTEX];          /* 1 = MTLTextureTypeCube */
 static unsigned g_tex_lvlmask[MAXTEX];
 static id<MTLTexture> g_tex[MAXTEX];
@@ -1202,11 +1255,71 @@ static void freed_use(unsigned id_, int as_tgt){
     if (as_tgt) g_freed_use_tgt++; else g_freed_use_smp++;
     static int shown = 0;
     if (shown < 12){ shown++;
-        fprintf(stderr, "metal: WARNING released RT used as %s: id=%u %ux%u%s\n",
+        fprintf(stderr, "metal: WARNING released texture used as %s: id=%u %ux%u%s\n",
                 as_tgt ? "TARGET" : "texture", id_, g_freed_w[id_], g_freed_h[id_],
                 g_tex_cube[id_] ? " (cube)" : ""); }
 }
 static id<MTLTexture> g_white;
+
+static unsigned tex_limit(void);
+/* ---- RELEASING TEXTURES ------------------------------------------------------
+ * A texture's Metal copy used to live until the game quit: the game releases every
+ * texture of a track or a menu when it leaves it, we kept them all and never reused
+ * an id (issue #49 log, MacBook Air M1 8 GB, 2 hours: 34,111 textures made, 34,089
+ * still alive, 1.9 GB -- memory pressure, swapping, long loads; at that rate the
+ * 65,536-id table fills after ~4 hours and every later texture is white).  Now the
+ * game's last Release (com.c obj_release) queues the id; after 3 more frames have
+ * been drawn -- every frame recorded before the Release is then encoded, and Metal
+ * keeps what an encoded command buffer uses -- the main thread drops the texture,
+ * clears what is kept per id and puts the id on a free list.  A texture still bound
+ * to a stage waits (in D3D9 the device holds a reference to a bound texture).  Each
+ * id remembers its owner object, so a late Release of an id that a Reset already
+ * freed and that now belongs to another texture can't drop the new one.  Render
+ * targets still go at Reset as well.  NFSU2_TEXFREE=0: the old behaviour. */
+static uint32_t g_tex_owner[MAXTEX];          /* the game's texture object (com.c), 0 = none */
+static uint8_t  g_tex_pending[MAXTEX];        /* queued for release */
+static uint8_t  g_tex_live[MAXTEX];           /* has a texture (readable off the main thread) */
+static pthread_mutex_t g_texq_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { unsigned id; long at; } TexRel;
+static TexRel   *g_texq;    static unsigned g_texq_n, g_texq_cap;
+static unsigned *g_texfree; static unsigned g_texfree_n, g_texfree_cap;
+static unsigned long g_tex_released, g_tex_reused, g_tex_postponed, g_tex_relskip;
+static int tex_release_off(void){
+    static int v = -1; if (v < 0){ const char *e = ENVC("NFSU2_TEXFREE"); v = e && *e == '0'; } return v; }
+/* with g_texq_lock held */
+static void tex_queue(unsigned id_){
+    if (!id_ || id_ >= MAXTEX || g_tex_pending[id_] || !g_tex_live[id_]) return;
+    if (g_texq_n == g_texq_cap){
+        unsigned nc = g_texq_cap ? g_texq_cap * 2u : 1024u;
+        TexRel *nq = realloc(g_texq, nc * sizeof *nq); if (!nq) return;
+        g_texq = nq; g_texq_cap = nc; }
+    g_tex_pending[id_] = 1; g_tex_owner[id_] = 0;
+    g_texq[g_texq_n].id = id_; g_texq[g_texq_n].at = atomic_load(&g_frames_drawn) + 3; g_texq_n++;
+}
+void metal_tex_set_owner(unsigned id_, uint32_t obj){
+    if (!id_ || id_ >= MAXTEX) return;
+    pthread_mutex_lock(&g_texq_lock); g_tex_owner[id_] = obj; pthread_mutex_unlock(&g_texq_lock);
+}
+/* Guest thread, the game's last Release of texture object obj.  1 = queued. */
+int metal_release_texture(unsigned id_, uint32_t obj){
+    if (tex_release_off() || !id_ || id_ >= MAXTEX || !obj) return 0;
+    int ok = 0;
+    pthread_mutex_lock(&g_texq_lock);
+    if (g_tex_owner[id_] == obj && !g_tex_pending[id_]){ tex_queue(id_); ok = 1; }
+    else g_tex_relskip++;
+    pthread_mutex_unlock(&g_texq_lock);
+    return ok;
+}
+/* A new id: a released one if there is one, else the next one; 0 = table full. */
+static unsigned tex_new_id(void){
+    unsigned id_ = 0;
+    pthread_mutex_lock(&g_texq_lock);
+    if (g_texfree_n){ id_ = g_texfree[--g_texfree_n]; g_tex_reused++; }
+    else if (g_texn < tex_limit()) id_ = g_texn++;
+    if (id_){ g_tex_freed[id_] = 0; g_tex_owner[id_] = 0; g_tex_pending[id_] = 0; g_tex_live[id_] = 1; }
+    pthread_mutex_unlock(&g_texq_lock);
+    return id_;
+}
 
 /* D3DFMT -> MTLPixelFormat; returns the block size and bytes per block */
 static MTLPixelFormat d3dfmt_to_mtl(unsigned f, unsigned *blk, unsigned *bpb){
@@ -1221,8 +1334,9 @@ static MTLPixelFormat d3dfmt_to_mtl(unsigned f, unsigned *blk, unsigned *bpb){
     }
 }
 
-/* Ids are never reused (the COM objects have no refcount): when the table is full every
- * later texture is "no texture" = white.  Say so once instead of failing silently. */
+/* When the table is full (more than MAXTEX textures alive at once; released ids are
+ * reused) every later texture is "no texture" = white.  Say so once instead of failing
+ * silently. */
 static unsigned long g_tex_full_hits;
 static unsigned g_texmax = MAXTEX;       /* NFSU2_TEXMAX=<n>: test the table-full path with a small table */
 static unsigned tex_limit(void){
@@ -1266,7 +1380,7 @@ unsigned metal_create_texture(unsigned w, unsigned h, unsigned levels, unsigned 
 unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
                                  unsigned d3dfmt, unsigned is_rt){
     if (!g_dev) return 0;
-    if (g_texn >= tex_limit()){ tex_table_full(); return 0; }
+    if (g_texn >= tex_limit() && !g_texfree_n){ tex_table_full(); return 0; }
     unsigned blk, bpb;
     MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
     if (pf == MTLPixelFormatInvalid) return 0;
@@ -1282,8 +1396,10 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     /* New texture content is undefined; clear to transparent black so textures that
      * weren't uploaded don't show up as garbage on screen (example: render targets). */
     tex_zero_all(t, w, h, levels, 1, blk, bpb);
-    unsigned id_ = g_texn++;
+    unsigned id_ = tex_new_id();                 /* see RELEASING TEXTURES */
+    if (!id_){ tex_table_full(); return 0; }
     g_tex[id_] = t;
+    g_tex_cube[id_] = 0;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
@@ -1291,6 +1407,15 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
 /* Guest (Reset): the render targets so far are dead. */
 void metal_reset_rts(void){
     if (ENVC("NORTFREE")) return;        /* diagnostic: turn off releasing */
+    if (!tex_release_off()){             /* see RELEASING TEXTURES: through the same queue */
+        for (unsigned z = 2; z < MAXZ; z++) if (atomic_load(&g_zlive[z])) atomic_store(&g_zdead[z], 1);
+        atomic_store(&g_zdead_at, atomic_load(&g_frames_drawn) + 3);
+        pthread_mutex_lock(&g_texq_lock);
+        for (unsigned i = 1; i < g_texn && i < MAXTEX; i++)
+            if (g_tex_isrt[i] && g_tex_live[i]) tex_queue(i);
+        pthread_mutex_unlock(&g_texq_lock);
+        return;
+    }
     atomic_store(&g_rtfree_upto, g_texn);
     atomic_store(&g_rtfree_at, atomic_load(&g_frames_drawn) + 3);
 }
@@ -3760,7 +3885,7 @@ static int pass_clear_only(int rb, unsigned i){
 unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
                                    unsigned d3dfmt, unsigned is_rt){
     if (!g_dev) return 0;
-    if (g_texn >= tex_limit()){ tex_table_full(); return 0; }
+    if (g_texn >= tex_limit() && !g_texfree_n){ tex_table_full(); return 0; }
     unsigned blk, bpb;
     MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
     if (pf == MTLPixelFormatInvalid) return 0;
@@ -3777,7 +3902,8 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
     id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
     if (!t) return 0;
     tex_zero_all(t, edge, edge, levels, 6, blk, bpb);
-    unsigned id_ = g_texn++;
+    unsigned id_ = tex_new_id();                 /* see RELEASING TEXTURES */
+    if (!id_){ tex_table_full(); return 0; }
     g_tex[id_] = t;
     g_tex_cube[id_] = 1;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
@@ -3789,6 +3915,61 @@ int metal_tex_is_cube(unsigned id_){
 }
 
 static unsigned g_texup_n[MAXTEX];            /* TEXUPSAY=1 (diagnostic): upload count per texture */
+/* RELEASING TEXTURES: main thread, between frames. */
+int com_tex_bound(unsigned id_);
+static void tex_log_periodic(long now);
+static void tex_release_pending(void){
+    long now = atomic_load(&g_frames_drawn);
+    if (tex_release_off()){ rt_free_pending(); tex_log_periodic(now); return; }
+    pthread_mutex_lock(&g_texq_lock);
+    unsigned keep = 0;
+    for (unsigned q = 0; q < g_texq_n; q++){
+        TexRel e = g_texq[q];
+        if (now < e.at){ g_texq[keep++] = e; continue; }
+        if (com_tex_bound(e.id)){ g_tex_postponed++; e.at = now + 1; g_texq[keep++] = e; continue; }
+        unsigned i = e.id;
+        if (g_tex[i]){ g_freed_w[i] = (unsigned short)g_tex[i].width; g_freed_h[i] = (unsigned short)g_tex[i].height; }
+        g_tex[i] = nil; g_tex_live[i] = 0; g_tex_pending[i] = 0; g_tex_owner[i] = 0;
+        if (g_tex_isrt[i]) g_rt_freed++;
+        g_tex_isrt[i] = 0; g_tex_cube[i] = 0; g_tex_lvlmask[i] = 0; g_tex_freed[i] = 1; g_texup_n[i] = 0;
+#if NFS_ENHANCED
+        g_hd_road[i] = 0; g_hd_dirty[i] = 0; g_hd_ow[i] = 0; g_hd_oh[i] = 0; g_rt_tstamp[i] = 0;
+        for (unsigned m = 0; m < g_rt_smn && m < RT_SMAXE; m++){   /* static reflection materials */
+            if (g_rt_smatc[m].tex0 == i) g_rt_smatc[m].tex0 = 0;
+            if (g_rt_smatc[m].tex1 == i) g_rt_smatc[m].tex1 = 0;
+            if (g_rt_smatc[m].tex2 == i) g_rt_smatc[m].tex2 = 0; }
+#endif
+        if (g_texfree_n == g_texfree_cap){
+            unsigned nc = g_texfree_cap ? g_texfree_cap * 2u : 1024u;
+            unsigned *nf = realloc(g_texfree, nc * sizeof *nf);
+            if (nf){ g_texfree = nf; g_texfree_cap = nc; } }
+        if (g_texfree_n < g_texfree_cap) g_texfree[g_texfree_n++] = i;
+        g_tex_released++;
+    }
+    g_texq_n = keep;
+    pthread_mutex_unlock(&g_texq_lock);
+    if (now >= atomic_load(&g_zdead_at))              /* Z textures of the surfaces a Reset ended */
+        for (unsigned z = 2; z < MAXZ; z++){
+            if (!atomic_exchange(&g_zdead[z], 0)) continue;
+            g_ztex[z] = nil; atomic_store(&g_zlive[z], 0); g_zpend[z] = 0; g_z_freed++;
+#if NFS_ENHANCED
+            if (z < 64u){ g_hd_msz[z] = nil; g_hd_msz_seen[z] = 0; g_hd_msz_kept[z] = 0; }
+#endif
+        }
+    tex_log_periodic(now);
+}
+/* every 2 minutes: textures alive, so a user's log shows whether they pile up */
+static void tex_log_periodic(long now){
+    { static long last_f; static struct timespec t0, tl; struct timespec tn;
+      clock_gettime(CLOCK_MONOTONIC, &tn);
+      if (!t0.tv_sec){ t0 = tl = tn; last_f = now; }
+      else if (tn.tv_sec - tl.tv_sec >= 120){
+          unsigned live = 0; unsigned long long tb = 0;
+          for (unsigned i = 1; i < g_texn && i < MAXTEX; i++) if (g_tex[i]){ live++; tb += g_tex[i].allocatedSize; }
+          fprintf(stderr, "  [tex] t=%lds: %u textures alive (%.0f MB), %lu released, %u ids used, %ld frames\n",
+                  (long)(tn.tv_sec - t0.tv_sec), live, tb / 1048576.0, g_tex_released, g_texn, now - last_f);
+          tl = tn; last_f = now; } }
+}
 void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
                                const void *data, unsigned pitch,
                                unsigned w, unsigned h, unsigned d3dfmt){
@@ -3808,7 +3989,11 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
         pthread_mutex_lock(&g_qlock);
         int b = g_cur;
         unsigned off = (g_upn[b] + 255u) & ~255u;
-        if (off + sz <= MAXUP && g_dn[b] < MAXD){
+        if (off + sz > g_upcap[b] && off + sz <= UPLIM){
+            unsigned nc = g_upcap[b] * 2u; if (nc < off + sz) nc = off + sz; if (nc > UPLIM) nc = UPLIM;
+            uint8_t *nb = realloc(g_upbuf[b], nc);
+            if (nb){ g_upbuf[b] = nb; g_upcap[b] = nc; } }
+        if (off + sz <= g_upcap[b] && g_dn[b] < MAXD){
             memcpy(g_upbuf[b] + off, data, sz); g_upn[b] = off + sz;
             MDraw *D = &g_dbuf[b][g_dn[b]];
             memset(D, 0, sizeof *D);
@@ -6361,7 +6546,7 @@ void metal_run_main_loop(void){
         while (!atomic_load(&g_should_quit)){
             if (quitat && atomic_load(&g_frames_drawn) >= quitat){
                 atomic_store(&g_should_quit, 1); break; }
-            rt_free_pending();
+            tex_release_pending();          /* see RELEASING TEXTURES */
             /* FSFAKE=<frame>[,...]: simulate the fullscreen transition from the GAME's point of
              * view without touching the window (view = screen size, device lost);
              * real fullscreen isn't reliable in the background (test). */
@@ -6662,7 +6847,7 @@ void metal_run_main_loop(void){
                             g_fb_vb[fbi]  = fb_fit(g_fb_vb[fbi],  sizeof(MVert)*(NSUInteger)g_vn[rb], sizeof(MVert)*MAXV);
                             g_fb_rvb[fbi] = fb_fit(g_fb_rvb[fbi], g_rvn[rb], MAXRV);
                             g_fb_kb[fbi]  = fb_fit(g_fb_kb[fbi],  g_kn[rb],  MAXKB);
-                            if (g_upn[rb]){ g_fb_up[fbi] = fb_fit(g_fb_up[fbi], g_upn[rb], MAXUP);
+                            if (g_upn[rb]){ g_fb_up[fbi] = fb_fit(g_fb_up[fbi], g_upn[rb], UPLIM);
                                             fb_put(g_fb_up[fbi], g_upbuf[rb], g_upn[rb]); }
                         }
                         g_mtlvb = g_fb_vb[fbi]; g_mtlrvb = g_fb_rvb[fbi]; g_mtlkb = g_fb_kb[fbi];
@@ -7473,6 +7658,7 @@ void metal_run_main_loop(void){
                                                          ;
                                                 zd.storageMode = MTLStorageModePrivate;
                                                 g_ztex[zid] = zt = [g_dev newTextureWithDescriptor:zd];
+                                                atomic_store(&g_zlive[zid], 1);
                                                 zclear = 1;
                                             } else { zt = nil; atomic_fetch_add(&g_z_mismatch, 1ull); }
                                         }
@@ -7994,7 +8180,12 @@ void metal_run_main_loop(void){
         { unsigned long long tb = 0; unsigned live = 0;
           for (unsigned i = 1; i < g_texn && i < MAXTEX; i++) if (g_tex[i]){ live++; tb += g_tex[i].allocatedSize; }
           fprintf(stderr, "metal: texture ids used %u of %u (%u still alive, %.0f MB), table full %lu times\n",
-                  g_texn, (unsigned)MAXTEX, live, tb / 1048576.0, g_tex_full_hits); }
+                  g_texn, (unsigned)MAXTEX, live, tb / 1048576.0, g_tex_full_hits);
+          { unsigned zl = 0; for (unsigned z = 1; z < MAXZ; z++) if (g_ztex[z]) zl++;
+            fprintf(stderr, "metal: depth textures alive %u, released after Reset %lu\n", zl, g_z_freed); }
+          fprintf(stderr, "metal: textures released %lu (ids reused %lu, waited while bound %lu, releases not matching the owner %lu, queued %u)%s\n",
+                  g_tex_released, g_tex_reused, g_tex_postponed, g_tex_relskip, g_texq_n,
+                  tex_release_off() ? "  [NFSU2_TEXFREE=0]" : ""); }
         fprintf(stderr, "metal: window closed (%ld frames drawn)\n",
                 atomic_load(&g_frames_drawn));
     }

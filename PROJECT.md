@@ -1224,6 +1224,13 @@ chatty renderer (~1250 draws, ~62 thousand COM calls per frame).
 | `SLEEPSLACK=<us>` | measurement: every game `Sleep` / timer sleep wakes this much later |
 | `GILHOG=<ms>:<ms>` | measurement: the game thread keeps the lock for the first value every second value, re-taking it every 50 us |
 | `READSLOW=<us>` | measurement: every file read of 16 KB or more takes this much longer |
+| `NFSU2_TEXFREE=0` | Metal textures are never released and ids never reused (before issue #49) |
+| `NFSU2_OBJREUSE=0` | COM objects get a vtable each and are never reused (before 2026-11-04) |
+| `NFSU2_POOLMERGE=0` | vertex/index pool free blocks are not merged, at most 4096 kept |
+| `SNDREUSE=0` | sound buffer slots are never given back |
+| `NFSU2_HANDLEFREE=0` | CloseHandle / RegCloseKey / DeleteCriticalSection free nothing |
+| `EVENTLOG=1` | the Win32 event table every 400 waits (was always on) |
+| `MATLOG=1` | the `[matrix]` totals every 20,000 draws (was always on) |
 | `NORTFREE=1` | turn off releasing old render targets on Reset (diagnostic) |
 | `NORTRESET=1` | don't return the target/Z to the back buffer on Reset (old behavior; the car breaks) |
 | `NORSRESET=1` | don't reset render/sampler/stage states to defaults on Reset (old behavior) |
@@ -2248,3 +2255,76 @@ The log now carries `[timer]` lines every 30 s (tick rate, late wake-ups, lock w
 catch-up and lost ticks). Note for measurements: "sound data gaps" also counts the
 silence of loading screens; use the stale guard and cursor overrun lines. Left: a
 230-330 ms hold at start-up, before any sound plays (inaudible).
+
+## 2026-11-04: textures were never released (issue #49)
+
+Report: long loads and stutter on a MacBook Air M1 with 8 GB. Its 2-hour log:
+34,111 textures created, **34,089 still alive at the end, 1,875 MB**, while the game
+itself held only 6,994 live objects (217,930 last releases). `obj_release` (com.c)
+gave the game's buffer back on the last Release but never the Metal texture, and
+texture ids were never reused (the table had been grown from 16384 to 65536 when it
+first ran out). Every track or menu change left its textures behind: memory grew
+~0.9 GB an hour, which on 8 GB means swapping and long loads, and the id table would
+fill after ~4 hours (every later texture white).
+
+Now (metal.m RELEASING TEXTURES): the last Release queues the id with its owner
+object; 3 drawn frames later the main thread drops the texture, clears what is kept
+per id (cube flag, uploaded-level mask, HD road-blur marks, ray-tracing slot stamp
+and static reflection materials pointing at it) and puts the id on a free list. A
+texture still bound to a stage waits (D3D9's device holds a reference). The object's
+id is zeroed, so a stale state block binds nothing rather than a reused id. Reset
+releases render targets through the same queue; the owner check stops a late
+Release from dropping a texture that got a Reset-freed id.
+
+Measured (HD, Quick Race, quit to the main menu and race again, 4 loads, 27,000
+frames): textures alive at the end 1,551 / 109 MB (before: 7,893 / 354 MB), process
+memory 491 MB flat (before: 378 -> 838 MB and climbing), 6,327 released / 5,778 ids
+reused, 0 draws of a released texture, frame times unchanged. Frames before and after
+are the same apart from run-to-run motion. EU and NA, original and HD. The log
+prints `[tex]` every 2 minutes (textures alive, MB) and a release summary at the end.
+
+Long-session audit done alongside (2-hour log + 4-load runs; what grows per load and
+what its limit does):
+
+| Table | Growth | Limit | When full |
+|---|---|---|---|
+| Guest COM heap (com_new: object + a new vtable each, never freed) | ~1.1 MB a load (32.8 MB in the 2-hour log) | 128 MB | `com_alloc` returns 0 -> crash, ~8 hours of play |
+| Vertex/index pool (free blocks never merged; `PF_N` 4096 entries, extra frees dropped) | 115.8 MB top after 2 hours (4 MB in a short run) | 768 MB | new mirrors fail -> slower fallback path, ~13 hours |
+| Sound buffers (`audio_register` slots never reused) | +1 a load (24 in 2 hours) | 128 | new streams silent, ~10 hours |
+| Z surface textures (kept until the id wraps at 62) | ~4 per Reset | 62 ids | bounded, up to ~62 full-screen depth textures kept |
+| Win32 objects (`CloseHandle` frees nothing) | +4 per menu -> race -> menu round trip (22 -> 26) | 511 | `Create*` returns 0, ~120 round trips |
+| Critical sections (`DeleteCriticalSection` frees nothing) | +2 per round trip (43 -> 45) | 512 | locking silently off, ~235 round trips |
+
+All six were then fixed (same day):
+
+- **COM objects** (com.c COM OBJECT RECYCLING): one vtable per interface; a texture /
+  vertex buffer / index buffer object whose last reference went is reused for a new
+  object of the same kind and size after the data's quarantine (1500 presents),
+  unless it is bound (texture stages, stream 0, indices) or a live state block names
+  it; its pool mirrors are dropped at the release and again at the reuse.
+- **Vertex/index pool** (metal.m): free blocks sorted by offset and merged, a free
+  block at the top lowers it, the list has no size limit.
+- **Sound buffers** (audio.m `audio_unregister`): the slot goes back at the game's
+  Release; a duplicated buffer gets its own stale-data map (it shared the source's).
+- **Depth textures**: created ones that are live at Reset are dropped 3 frames later.
+- **Win32 objects**: CloseHandle / RegCloseKey mark the object closed; its slot is
+  reused when nobody waits on it, a thread has ended and 2 s have passed;
+  DuplicateHandle counts copies. DeleteCriticalSection frees the section (tombstone
+  in the probe chain, only if nobody holds it).
+- **Small ones**: the ordered-upload area grows up to 64 MB instead of overflowing;
+  the multi-object wait polls with the precise sleep; the event table dump and the
+  `[matrix]` totals are behind `EVENTLOG=1` / `MATLOG=1`.
+
+Measured (HD, Quick Race, 3 round trips = 4 loads, 27,000 frames; all fixes vs all
+switched off): COM heap 645 KB with 22,839 objects reused vs 4,539 KB; pool top
+2.9 vs 5.0 MB; textures alive 1,552 vs 7,822; 8 sound slots given back; Win32 slots
+21 (4 reused) vs 25, 10 critical sections deleted; process memory flat at ~560 MB
+vs 376 -> 775 MB; no sound gaps in either; frame times the same (GPU 5.25 / CPU
+0.86 vs 0.88 ms). A Reset storm (`RESETAT` every 100 frames in a race, 42 Resets):
+231 render targets and 147 depth textures released, 8 depth textures alive at the
+end, the race frame after it the same as before, no draw of a released texture.
+
+Also seen: one 62 ms stretch of game code without any Win32/COM/indirect call at
+`0x5c587d` (11.6 s in), where the sound threads cannot get the big lock; once in ~12
+runs it lasted long enough for an 88 ms gap. Ordered texture uploads overflowed 97
+times in the 2-hour log (those uploads fall back to immediate).

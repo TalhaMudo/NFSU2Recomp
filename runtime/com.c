@@ -297,6 +297,31 @@ enum { IF_D3D9=1, IF_DEV, IF_TEX, IF_VB, IF_IB, IF_SURF, IF_SIMPLE,
  * com_alloc only grows).  Created = 1, AddRef +1, Release -1; the buffer heap
  * data is handed back when the count reaches 0.  All COM calls run under the
  * guest lock.  NFSU2_GBUF_FREE0=1: never free (the old behaviour). */
+/* ---- COM OBJECT RECYCLING -----------------------------------------------------
+ * com_alloc is a bump pointer over 128 MB and every object used to get a vtable of its
+ * own; nothing was ever given back.  The game creates a vertex buffer, index buffer
+ * and texture object for everything it loads (191,000 in a 2-hour session: 32.8 MB,
+ * ~1.1 MB per race load), so after ~8 hours com_alloc would return 0 and com_new would
+ * write to address 0.  Now every interface shares one vtable (they are identical), and
+ * a texture / vertex buffer / index buffer object whose last reference went is reused
+ * for a new object of the same kind and size after the same quarantine as its data
+ * (NFSU2_GBUF_QUAR presents) -- unless it is still bound (texture stage, stream 0,
+ * indices: D3D9's device keeps a reference) or a live state block still names it.
+ * Its pool mirrors (metal_mirror, keys obj and obj+2) are dropped at the release, so
+ * the next object at that address can't draw the old geometry.  NFSU2_OBJREUSE=0:
+ * the old behaviour. */
+static int objreuse_off(void){ static int v=-1; if (v<0){ const char *e=getenv("NFSU2_OBJREUSE"); v = e && *e=='0'; } return v; }
+enum { OC_TEX, OC_CUBE, OC_VB, OC_IB, OC_N };
+typedef struct { uint32_t obj, at; } ObjQ;
+static struct { ObjQ *q; unsigned qn, qcap; uint32_t *rd; unsigned rn, rcap; } g_opool[OC_N];
+static uint64_t g_obj_recycled, g_obj_queued, g_obj_held;
+static uint32_t g_vtab[64];                    /* one vtable per interface */
+static int obj_class(uint32_t iface, uint32_t extra){
+    if (iface == IF_TEX) return extra == 64u ? OC_TEX : extra == 160u ? OC_CUBE : -1;
+    if (iface == IF_VB && extra == 64u) return OC_VB;
+    if (iface == IF_IB && extra == 64u) return OC_IB;
+    return -1;
+}
 #define RC_CAP (1u << 20)                       /* live objects; linear probing */
 static uint32_t *g_rck; static int32_t *g_rcv; static uint32_t g_rc_n;
 static uint64_t g_rc_kept, g_rc_kept_data, g_rc_last, g_rc_unknown;
@@ -359,11 +384,29 @@ static void rc_addref(uint32_t o){
 }
 /* Release of a texture / vertex buffer / index buffer: hand the buffer heap data
  * back when the last reference goes.  from = caller (RCLOG). */
+static int is_cube_tex(uint32_t obj);
 static void obj_release(uint32_t o, uint32_t iface, uint32_t from){
     if (gbuf_free_off() || !o || !rc_release(o, iface, from)) return;
+    if (!objreuse_off()){                          /* see COM OBJECT RECYCLING */
+        int oc = iface == IF_TEX ? (is_cube_tex(o) ? OC_CUBE : OC_TEX) : iface == IF_VB ? OC_VB : OC_IB;
+        if (g_opool[oc].qn == g_opool[oc].qcap){
+            unsigned nc = g_opool[oc].qcap ? g_opool[oc].qcap * 2u : 1024u;
+            ObjQ *nq = realloc(g_opool[oc].q, nc * sizeof *nq);
+            if (nq){ g_opool[oc].q = nq; g_opool[oc].qcap = nc; } }
+        if (g_opool[oc].qn < g_opool[oc].qcap){
+            g_opool[oc].q[g_opool[oc].qn].obj = o; g_opool[oc].q[g_opool[oc].qn].at = (uint32_t)g_present;
+            g_opool[oc].qn++; g_obj_queued++; }
+        if (iface == IF_VB || iface == IF_IB){
+            void metal_mirror_forget(uint32_t); metal_mirror_forget(o); metal_mirror_forget(o + 2u); }
+    }
     if (iface == IF_VB || iface == IF_IB){
         if (mem_is_committed(o+11)){ gbuf_free(MR32(o+8)); MR32(o+8)=0; }
     } else if (iface == IF_TEX && mem_is_committed(o+67)){
+        /* metal.m RELEASING TEXTURES: the Metal copy goes too (a few frames later).  The
+         * object keeps no id, so a stale state block or a late SetTexture binds nothing
+         * instead of whatever texture gets the id next. */
+        { int metal_release_texture(unsigned, uint32_t);
+          if (MR32(o+28) && metal_release_texture(MR32(o+28), o)) MR32(o+28) = 0; }
         for (uint32_t q=32; q<64; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
         if (mem_is_committed(o+143) && MR32(o+140)==0xC0BEC0BEu)
             for (uint32_t q=104; q<136; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
@@ -377,9 +420,20 @@ void com_tex_ref_skipped(uint32_t o, int addref){
 
 static uint32_t com_new(uint32_t iface, uint32_t extra){
     unsigned n = g_if[iface].n;
-    uint32_t vt = com_alloc(n*4u);
-    for (unsigned i=0;i<n;i++) MR32(vt+4u*i) = COM_MAGIC | (iface<<16) | i;
-    uint32_t obj = com_alloc(4u+extra);
+    uint32_t vt = (!objreuse_off() && iface < NEL(g_vtab)) ? g_vtab[iface] : 0u;
+    if (!vt){
+        vt = com_alloc(n*4u);
+        for (unsigned i=0;i<n;i++) MR32(vt+4u*i) = COM_MAGIC | (iface<<16) | i;
+        if (!objreuse_off() && iface < NEL(g_vtab)) g_vtab[iface] = vt;
+    }
+    int oc = objreuse_off() ? -1 : obj_class(iface, extra);
+    uint32_t obj;
+    if (oc >= 0 && g_opool[oc].rn){
+        obj = g_opool[oc].rd[--g_opool[oc].rn]; g_obj_recycled++;
+        /* a released buffer may still have been drawn while bound (a new mirror) */
+        if (oc == OC_VB || oc == OC_IB){ void metal_mirror_forget(uint32_t); metal_mirror_forget(obj); metal_mirror_forget(obj + 2u); }
+    }
+    else obj = com_alloc(4u+extra);
     /* ZERO the extra area.  Object fields (size, format, texture id, cube face
      * index...) are always read assuming "0 = not set up"; if com_alloc doesn't
      * give fresh memory, garbage values are read. */
@@ -948,8 +1002,8 @@ static uint32_t g_bb_w = 1280, g_bb_h = 720;   /* back buffer size */
  * 64-entry table filled up at the 32nd change; the next cube was taken for "2D",
  * GetCubeMapSurface returned with the wrong argument count, the stack shifted by
  * 4 bytes and the game crashed (user log: sub_005b9920 after exactly 64 Resets,
- * address 0x80).  Since COM objects are never released (com_alloc is a bump
- * pointer), addresses aren't reused; a bitmap is safe. */
+ * address 0x80).  A cube object is only ever reused for another cube (COM OBJECT
+ * RECYCLING keeps one pool per kind and size), so a bitmap by address stays right. */
 static uint8_t g_cube_bits[(COM_MAX - COM_BASE) / 16u / 8u];
 static unsigned g_cube_n = 0;
 static void cube_mark(uint32_t obj){
@@ -962,8 +1016,59 @@ static int is_cube_tex(uint32_t obj){
     uint32_t k = (obj - COM_BASE) >> 4;
     return (g_cube_bits[k >> 3] >> (k & 7u)) & 1u;
 }
+/* COM OBJECT RECYCLING: at every Present, objects whose quarantine is over move to the
+ * ready lists, unless still bound or named by a live state block (checked again later). */
+static uint32_t gbuf_quar(void);
+static void com_recycle_tick(void){
+    if (objreuse_off()) return;
+    uint32_t now = (uint32_t)g_present, Q = gbuf_quar();
+    int any = 0;
+    for (int oc = 0; oc < OC_N && !any; oc++)
+        for (unsigned i = 0; i < g_opool[oc].qn; i++) if (now - g_opool[oc].q[i].at >= Q){ any = 1; break; }
+    if (!any) return;
+    /* every argument recorded in a live state block (a small hash set) */
+    static uint32_t hs[1u << 15];
+    memset(hs, 0, sizeof hs);
+    unsigned nhs = 0;
+    for (int b = 1; b < g_sbn && b < MAXSB; b++){
+        if (!g_sb[b].used) continue;
+        for (int k = 0; k < g_sb[b].n && k < MAXSBREC; k++)
+            for (int a = 0; a < g_sb[b].r[k].nargs && a < 8; a++){
+                uint32_t v = g_sb[b].r[k].a[a];
+                if (v < COM_BASE || v >= COM_MAX) continue;
+                if (nhs >= (3u << 13)) return;      /* the set is 3/4 full: reuse nothing this time */
+                uint32_t h = (v * 2654435761u) >> 17;
+                while (hs[h] && hs[h] != v) h = (h + 1u) & ((1u << 15) - 1u);
+                if (!hs[h]){ hs[h] = v; nhs++; }
+            }
+    }
+    for (int oc = 0; oc < OC_N; oc++){
+        unsigned keep = 0;
+        for (unsigned i = 0; i < g_opool[oc].qn; i++){
+            ObjQ e = g_opool[oc].q[i];
+            if (now - e.at < Q){ g_opool[oc].q[keep++] = e; continue; }
+            int held = e.obj == g_ss_vb || e.obj == g_ib_obj;
+            for (int t = 0; t < 8 && !held; t++) if (g_raw_tex[t] == e.obj) held = 1;
+            if (!held){ uint32_t h = (e.obj * 2654435761u) >> 17;
+                        for (; hs[h]; h = (h + 1u) & ((1u << 15) - 1u)) if (hs[h] == e.obj){ held = 1; break; } }
+            if (held){ g_obj_held++; e.at = now - Q + 60u; g_opool[oc].q[keep++] = e; continue; }
+            if (g_opool[oc].rn == g_opool[oc].rcap){
+                unsigned nc = g_opool[oc].rcap ? g_opool[oc].rcap * 2u : 1024u;
+                uint32_t *nr = realloc(g_opool[oc].rd, nc * sizeof *nr);
+                if (!nr){ g_opool[oc].q[keep++] = e; continue; }
+                g_opool[oc].rd = nr; g_opool[oc].rcap = nc; }
+            g_opool[oc].rd[g_opool[oc].rn++] = e.obj;
+        }
+        g_opool[oc].qn = keep;
+    }
+}
 static uint64_t g_st_ok=0, g_st_null=0, g_st_zero=0, g_st_other=0;
 static uint32_t g_tex_stage[4] = {0,0,0,0};
+/* metal.m RELEASING TEXTURES: is this Metal texture id bound to a stage right now? */
+int com_tex_bound(unsigned id){
+    return id && (g_cur_tex == id || g_tex_stage[0] == id || g_tex_stage[1] == id ||
+                  g_tex_stage[2] == id || g_tex_stage[3] == id);
+}
 static float    g_psc[32][4];                    /* ps constants c0..c31 */
 static uint32_t g_psc_max = 0;                   /* the highest index seen + 1 */
 static uint32_t g_psc_drop = 0;                  /* writes above 32 (dropped) */
@@ -2328,8 +2433,10 @@ int com_call(CPU *c, uint32_t magic){
         if (iface==IF_DSBUF){
             uint32_t self0=A(c,0);
             if (self0 && mem_is_committed(self0+31) && MR32(self0+28)){
-                void audio_stop(int);
+                void audio_stop(int); void audio_unregister(int);
                 audio_stop((int)MR32(self0+28));
+                audio_unregister((int)MR32(self0+28));   /* the slot goes back (audio.m) */
+                MR32(self0+28)=0;
                 MR32(self0+12)=0;
             }
         }
@@ -2943,7 +3050,7 @@ int com_call(CPU *c, uint32_t magic){
                            fprintf(stderr,"      %9.4f %9.4f %9.4f %9.4f\n",
                              MRF32(pd+rw*16),MRF32(pd+rw*16+4),
                              MRF32(pd+rw*16+8),MRF32(pd+rw*16+12)); } }
-                if (((mat_good+mat_bad+mat_zero) % 20000)==0)
+                if (((mat_good+mat_bad+mat_zero) % 20000)==0 && ENVC("MATLOG"))   /* totals are in the report */
                     fprintf(stderr,"  [matrix] good=%llu broken=%llu zero=%llu\n",
                             (unsigned long long)mat_good,(unsigned long long)mat_bad,
                             (unsigned long long)mat_zero);
@@ -3016,6 +3123,7 @@ int com_call(CPU *c, uint32_t magic){
         else if (MID(BeginScene)){ if (metal_available()) metal_begin_frame(); r=0; }
         else if (MID(EndScene)) r=0;
         else if (MID(Present)){ g_present_no++;
+            com_recycle_tick();                     /* see COM OBJECT RECYCLING */
             /* STALL=<present>:<ms> (test): freeze the game thread once, as a slow disk or a
              * long frame would -- e.g. to check the sound stale-data guard (audio.m). */
             { static long sa = -2; static unsigned sms = 0;
@@ -3550,6 +3658,7 @@ int com_call(CPU *c, uint32_t magic){
                 /* D3DUSAGE_RENDERTARGET = 1 */
                 uint32_t tid = metal_create_texture_ex(mw,mh,mlev,fmt,(usage & 1u)?1u:0u);
                 MR32(t+28)=tid;
+                { void metal_tex_set_owner(unsigned, uint32_t); metal_tex_set_owner(tid, t); }
                 if (ekind == ENH_ROAD && tid){ void metal_hd_mark_road(unsigned,unsigned,unsigned);
                                                metal_hd_mark_road(tid, w, h); }
                 if ((usage & 1u) && ENVC("RTIDLOG"))
@@ -3601,6 +3710,7 @@ int com_call(CPU *c, uint32_t magic){
                 MR32(t2+28)= getenv("NOCUBE")
                     ? metal_create_texture_ex(medge,medge,lev?lev:1u,fmt?fmt:22u,1u)
                     : metal_create_texture_cube(medge,lev?lev:1u,fmt?fmt:22u,1u);
+                { void metal_tex_set_owner(unsigned, uint32_t); metal_tex_set_owner(MR32(t2+28), t2); }
             }
             if (ENVC("CUBELOG")) fprintf(stderr,"  [cube] CreateCubeTexture edge=%u levels=%u usage=0x%x format=%u pool=%u -> metal %u\n",
                                           edge, lev, usage, fmt, A(c,5), MR32(t2+28));
@@ -4782,7 +4892,9 @@ void com_report(void){
     fprintf(stderr,"  Draw* calls        : %llu\n",(unsigned long long)g_draw);
     fprintf(stderr,"  ps constant file   : highest used c%u, %u writes above 32\n",
             g_psc_max ? g_psc_max-1u : 0u, g_psc_drop);
-    fprintf(stderr,"  guest COM heap     : %u KB\n",(com_ptr-COM_BASE)/1024u);
+    fprintf(stderr,"  guest COM heap     : %u KB of %u; objects reused %llu (released %llu, waited while bound or in a state block %llu)%s\n",
+            (com_ptr-COM_BASE)/1024u, (COM_MAX-COM_BASE)/1024u, (unsigned long long)g_obj_recycled,
+            (unsigned long long)g_obj_queued, (unsigned long long)g_obj_held, objreuse_off() ? "  [NFSU2_OBJREUSE=0]" : "");
     fprintf(stderr,"  guest buffer heap  : %u KB\n",(gbuf_ptr-GBUF_BASE)/1024u);
     if (g_ptype){
         static const char *PT[] = {"?","POINTLIST","LINELIST","LINESTRIP",
