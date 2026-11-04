@@ -29,6 +29,10 @@ fi
 #   EDGEAA=1               edge smoothing (post-process) of the 3D scene, not the HUD
 #   SHARPEN=1..100         contrast adaptive sharpening of the 3D scene, not the HUD
 #   Details: runtime/visual.c (TINT), runtime/picture.m (the others)
+# Reflections, HD engine only (launcher Settings > Picture; unset = the original game; runtime/reflect.c):
+#   NFSU2_REFLECT_SKY=1     the sky in the road reflection and the mirror
+#   NFSU2_REFLECT_LIGHTS=1  the cars' lights in the road reflection
+#   NFSU2_REFLECT_DETAIL=1  full-detail models in the reflections, car cube map far plane 10 km
 # In game, Cmd+Shift+D: a PNG of that frame + the draw list (~/Library/Logs/NFSU2/
 #   or the PERFLOG directory).  Measurement recording while playing: tools/session.sh [hd].
 MODE="${1:-window}"

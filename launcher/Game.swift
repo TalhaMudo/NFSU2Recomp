@@ -74,6 +74,10 @@ enum Prefs {
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
     static let frameRate = "LauncherFrameRate"      // 30 | 60 | 120 | 240 -> NFSU2_FPS
     static let fpsCounter = "LauncherFPSCounter"    // -> NFSU2_FPSCOUNTER
+    // HD engine only (Settings > Picture, Reflections; runtime/reflect.c).
+    static let reflectSky = "LauncherReflectSky"         // -> NFSU2_REFLECT_SKY
+    static let reflectLights = "LauncherReflectLights"   // -> NFSU2_REFLECT_LIGHTS
+    static let reflectDetail = "LauncherReflectDetail"   // -> NFSU2_REFLECT_DETAIL
 
     /// Each game option with its value in the original, unmodified game: Settings ›
     /// Restore Original Game sets them all.  A new option adds its line here.  (The
@@ -84,6 +88,9 @@ enum Prefs {
         OriginalValue(\.frameRate, 120),
         OriginalValue(\.fpsCounter, false),
         OriginalValue(\.picture, PictureOptions.original),
+        OriginalValue(\.reflectSky, false),
+        OriginalValue(\.reflectLights, false),
+        OriginalValue(\.reflectDetail, false),
     ]
 }
 

@@ -4872,6 +4872,7 @@ void com_report(void){
     { void ws_report(void); ws_report(); }   /* wsfov.c */
     { void visual_report(void); visual_report(); }   /* visual.c */
     { void pic_report(void); pic_report(); }         /* picture.m */
+    { void refl_report(void); refl_report(); }   /* reflect.c */
     { void gamepad_report(void); gamepad_report(); }   /* gamepad.m */
     { void xpatch_report(void); xpatch_report(); }
     { void highfps_report(void); highfps_report(); }   /* LOCAL PATCH: highfps.c */

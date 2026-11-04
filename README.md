@@ -290,7 +290,9 @@ them; tests/save_manager.sh). **Settings…** (Cmd-,) holds the options on tabs:
 Original or HD graphics and the HUD on **Graphics**; on **Picture**, optional
 settings of the HD engine only (the PC version's colour tint, console gamma, edge
 smoothing, sharpening; `TINT` / `CONSOLEGAMMA` / `EDGEAA` / `SHARPEN`, all off by
-default; the Original engine ignores them); on **Controls**, the game
+default; the Original engine ignores them) and the reflections' sky, car lights
+and detail (`NFSU2_REFLECT_SKY` / `_LIGHTS` / `_DETAIL`, HD engine only too); on
+**Controls**, the game
 controller on or off, its stick dead zone and the XtendedInput layout
 (`NFSU2_PAD` / `NFSU2_PAD_DEADZONE` / `NFSU2_XTINPUT`, which still win when set by
 hand); on **More**, **Make Copy…** builds a portable

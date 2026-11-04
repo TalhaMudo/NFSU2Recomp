@@ -142,6 +142,20 @@ struct PictureSettings: View {
                     .disabled(!active).opacity(active ? 1 : 0.5)
                 }
             }
+            Card("Reflections") {
+                Group {
+                    SettingRow(title: "Sky in reflections",
+                               description: "The wet road and the rear-view mirror show the sky instead of black. Off: as in the original game.",
+                               isOn: $model.reflectSky)
+                    SettingRow(title: "Car lights in reflections",
+                               description: "Head and tail lights of the cars shine in the wet road. Off: as in the original game.",
+                               isOn: $model.reflectLights)
+                    SettingRow(title: "More detail in reflections",
+                               description: "Full-detail buildings and cars in the reflections, and the car paint reflects the city. More work for the Mac. Off: as in the original game.",
+                               isOn: $model.reflectDetail)
+                }
+                .disabled(!active).opacity(active ? 1 : 0.5)
+            }
         }
     }
 }

@@ -31,8 +31,12 @@ final class LauncherModel: ObservableObject {
     @Published var xtendedInput: Bool { didSet { defaults.set(xtendedInput, forKey: Prefs.xtendedInput) } }
     /// Settings › Picture: PictureOptions.all[i] -> the chosen index (0 = the original game).
     @Published var picture: [Int] { didSet { for (o, i) in zip(PictureOptions.all, picture) { defaults.set(i, forKey: o.key) } } }
-    /// Picture variables that were set by hand when the launcher started: those win.
-    private let pictureFromEnv = Set(PictureOptions.all.map { $0.env }
+    @Published var reflectSky: Bool { didSet { defaults.set(reflectSky, forKey: Prefs.reflectSky) } }
+    @Published var reflectLights: Bool { didSet { defaults.set(reflectLights, forKey: Prefs.reflectLights) } }
+    @Published var reflectDetail: Bool { didSet { defaults.set(reflectDetail, forKey: Prefs.reflectDetail) } }
+    /// HD picture / reflection variables set by hand when the launcher started: those win.
+    private let pictureFromEnv = Set((PictureOptions.all.map { $0.env }
+                                      + ["NFSU2_REFLECT_SKY", "NFSU2_REFLECT_LIGHTS", "NFSU2_REFLECT_DETAIL"])
                                          .filter { ProcessInfo.processInfo.environment[$0] != nil })
     private let xtendedInputFromEnv = ProcessInfo.processInfo.environment["NFSU2_XTINPUT"] != nil
     @Published var job: Job? = nil
@@ -73,6 +77,9 @@ final class LauncherModel: ObservableObject {
         xtendedInput = defaults.bool(forKey: Prefs.xtendedInput)
         let d = defaults
         picture = PictureOptions.all.map { o in min(max(d.integer(forKey: o.key), 0), o.choices.count - 1) }
+        reflectSky = d.bool(forKey: Prefs.reflectSky)
+        reflectLights = d.bool(forKey: Prefs.reflectLights)
+        reflectDetail = d.bool(forKey: Prefs.reflectDetail)
     }
 
     /// runtime/xtinput.c has the North American v1.2 executable's addresses only.
@@ -167,6 +174,10 @@ final class LauncherModel: ObservableObject {
         // Ours are set again on every Play; a variable set by hand still wins.
         for (o, i) in zip(PictureOptions.all, picture) where !pictureFromEnv.contains(o.env) {
             if e == .hd && i > 0 { setenv(o.env, o.choices[i].value, 1) } else { unsetenv(o.env) }
+        }
+        for (name, on) in [("NFSU2_REFLECT_SKY", reflectSky), ("NFSU2_REFLECT_LIGHTS", reflectLights),
+                           ("NFSU2_REFLECT_DETAIL", reflectDetail)] where !pictureFromEnv.contains(name) {
+            if e == .hd && on { setenv(name, "1", 1) } else { unsetenv(name) }
         }
         let path = Paths.engine(loc.build, hd: e == .hd).path
         // A child process, not exec(): macOS attributes the child's file access to
