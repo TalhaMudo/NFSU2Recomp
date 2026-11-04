@@ -2081,6 +2081,31 @@ static float g_rt_bpos[RT_MAXREC][3]; static uint8_t g_rt_bpok[RT_MAXREC]; stati
 static _Atomic unsigned long long g_rt_nmoved;  /* same signature, position shifted: rebuild from scratch */
 static int g_hd_dump_now;                       /* (below) this frame was selected with DUMPFRAME */
 static uint64_t g_rt_dsig;                      /* the signature of the last built/refitted layout */
+/* HD_RT_SIGLOG=1 (diagnostic): why the instant layout changed -- record keys (with
+ * size, without size) of this frame and of the last built/refitted layout */
+static uint64_t g_rt_sk_cur[RT_MAXREC][2], g_rt_sk_prev[RT_MAXREC][2]; static unsigned g_rt_sk_pn;
+static unsigned long long g_rt_sig_why[6];      /* order, size, added only, removed only, both, forced (max frames) */
+static unsigned long long g_rt_sig_add, g_rt_sig_rem;
+static int u64cmp(const void *a, const void *b){ uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+static void rt_sig_classify(unsigned n){
+    static uint64_t a[RT_MAXREC], b[RT_MAXREC];
+    unsigned pn = g_rt_sk_pn;
+    for (unsigned q = 0; q < n; q++) a[q] = g_rt_sk_cur[q][0];
+    for (unsigned q = 0; q < pn; q++) b[q] = g_rt_sk_prev[q][0];
+    qsort(a, n, 8, u64cmp); qsort(b, pn, 8, u64cmp);
+    if (n == pn && !memcmp(a, b, (size_t)n * 8)){ g_rt_sig_why[0]++; return; }      /* same records, other order */
+    for (unsigned q = 0; q < n; q++) a[q] = g_rt_sk_cur[q][1];
+    for (unsigned q = 0; q < pn; q++) b[q] = g_rt_sk_prev[q][1];
+    qsort(a, n, 8, u64cmp); qsort(b, pn, 8, u64cmp);
+    if (n == pn && !memcmp(a, b, (size_t)n * 8)){ g_rt_sig_why[1]++; return; }      /* same records, other size (LOD) */
+    unsigned i = 0, j = 0, ad = 0, rm = 0;
+    while (i < n || j < pn){
+        if (j >= pn || (i < n && a[i] < b[j])){ ad++; i++; }
+        else if (i >= n || b[j] < a[i]){ rm++; j++; }
+        else { i++; j++; } }
+    g_rt_sig_add += ad; g_rt_sig_rem += rm;
+    g_rt_sig_why[ad && rm ? 4 : ad ? 2 : 3]++;
+}
 static uint32_t g_rt_dsince = 0xFFFFFFFFu;      /* frames since the last full build */
 static _Atomic unsigned long long g_rt_nbuild, g_rt_nrefit;
 static int hd_rt_refit_on(void){
@@ -2351,15 +2376,33 @@ static NSString *kRTFSrc = @
 "  uint f = R[tid].first; float3 p = P[f];\n"
 "  for (uint i = 1u; i < R[tid].n; i++) P[f + i] = p;\n"
 "}\n"
-/* composite: color + B * (R_new - R0) */
+/* composite: color + B * (R_new - R0).  RTSTAT (HD_RTSTAT=1, diagnostic): how many
+ * road / car pixels, how many hit by a ray (the game's reflection R0 is subtracted
+ * there), how many with a negligible weight, car misses by the reflection's main axis */
+"#ifdef RTSTAT\n"
+"#define RT_STD , device atomic_uint *ST\n"
+"#define RT_STP , device atomic_uint *ST [[buffer(7)]]\n"
+"#define RT_STA , ST\n"
+"#define RT_CNT(i) atomic_fetch_add_explicit(&ST[i], 1u, memory_order_relaxed)\n"
+"#else\n"
+"#define RT_STD\n"
+"#define RT_STP\n"
+"#define RT_STA\n"
+"#define RT_CNT(i)\n"
+"#endif\n"
 "static float4 rtc(uint2 px, float4 c, depth2d<float> dep, texture2d<float> g1,\n"
-"                  texture2d<float> g2, texture2d<float> rt, constant SSRP &S) {\n"
+"                  texture2d<float> g2, texture2d<float> rt, constant SSRP &S RT_STD) {\n"
 "  float4 gb = g1.read(px);\n"
 "  int dbg = int(S.cam.w) - 1;\n"
 "  float cls = GB_CLS(gb);\n"
 "  bool road = GB_ROAD(cls);\n"
 "  bool car  = GB_CAR(cls);\n"
 "  if (!road && !car) return dbg > 0 ? float4(c.rgb * 0.25, c.a) : c;\n"
+"#ifdef RTSTAT\n"
+"  { RT_CNT(road ? 0 : 1);\n"
+"    float3 bw = GB_B(gb, g2.read(px));\n"
+"    if (max(bw.r, max(bw.g, bw.b)) < 1.0 / 255.0) RT_CNT(road ? 10 : 11); }\n"
+"#endif\n"
 "  float4 r;\n"
 "  uint sc = uint(max(S.cb0.w, 1.0));\n"
 "  if (sc <= 1u) r = rt.read(px);\n"
@@ -2379,6 +2422,14 @@ static NSString *kRTFSrc = @
 "  }\n"
 "  if (dbg == 4) return float4(r.a > 0.0 ? r.rgb : float3(0.0, 0.0, 0.35), 1.0);\n"
 "  if (dbg == 1) return float4(road ? 0.5 : 0.0, r.a, r.a > 0.0 ? (road ? 0.0 : 1.0) : 0.6, 1.0);\n"
+"#ifdef RTSTAT\n"
+"  if (r.a > 0.0) RT_CNT(road ? 2 : 3);\n"
+"  else { RT_CNT(road ? 12 : 13);\n"
+"    if (car) { float3 d = GB_DIR(g2.read(px)); float3 a = abs(d);\n"
+"      uint ax = (a.x >= a.y && a.x >= a.z) ? 0u : (a.y >= a.z ? 1u : 2u);\n"
+"      float sg = ax == 0u ? d.x : (ax == 1u ? d.y : d.z);\n"
+"      RT_CNT(4u + ax * 2u + (sg < 0.0 ? 1u : 0u)); } }\n"
+"#endif\n"
 "  if (r.a <= 0.0) return c;\n"
 "  float4 gv = g2.read(px);\n"
 "  float3 R0 = GB_R0(gb, gv);\n"
@@ -2389,16 +2440,16 @@ static NSString *kRTFSrc = @
 "    texture2d<float> scene [[texture(0)]], depth2d<float> dep [[texture(1)]],\n"
 "    texture2d<float> g1 [[texture(2)]],\n"
 "    texture2d<float> g2 [[texture(3)]], texture2d<float> rt [[texture(5)]],\n"
-"    constant SSRP &S [[buffer(0)]]) {\n"
+"    constant SSRP &S [[buffer(0)]] RT_STP) {\n"
 "  uint2 px = uint2(in.pos.xy);\n"
-"  return rtc(px, scene.read(px), dep, g1, g2, rt, S);\n"
+"  return rtc(px, scene.read(px), dep, g1, g2, rt, S RT_STA);\n"
 "}\n"
 /* copy-free: the pixel's own color from tile memory (programmable blending) */
 "fragment float4 hd_rtc_frag_fb(FSO in [[stage_in]], float4 c [[color(0)]],\n"
 "    depth2d<float> dep [[texture(1)]], texture2d<float> g1 [[texture(2)]],\n"
 "    texture2d<float> g2 [[texture(3)]], texture2d<float> rt [[texture(5)]],\n"
-"    constant SSRP &S [[buffer(0)]]) {\n"
-"  return rtc(uint2(in.pos.xy), c, dep, g1, g2, rt, S);\n"
+"    constant SSRP &S [[buffer(0)]] RT_STP) {\n"
+"  return rtc(uint2(in.pos.xy), c, dep, g1, g2, rt, S RT_STA);\n"
 "}\n";
 /* --- COPY-FREE COMPOSITE ----------------------------------------------------
  * The ray tracing composite reads only its OWN color at every pixel.  Previously
@@ -2413,10 +2464,30 @@ static int hd_rt_fb_on(void){
     if (v < 0){ const char *e = ENVC("HD_RT_FB"); v = !(e && *e == '0') && [g_dev supportsFamily:MTLGPUFamilyApple1]; }
     return v;
 }
+/* HD_RTSTAT=1 (diagnostic): composite pixel counters, see rtc() */
+static id<MTLBuffer> g_rtstat;
+static int hd_rtstat(void){
+    static int v = -1;
+    if (v < 0){ v = ENVC("HD_RTSTAT") != NULL;
+        if (v){ g_rtstat = [g_dev newBufferWithLength:16 * 4 options:MTLResourceStorageModeShared];
+                memset([g_rtstat contents], 0, 16 * 4); } }
+    return v && g_rtstat;
+}
+static void hd_rtstat_report(void){
+    if (!g_rtstat) return;
+    const uint32_t *c = (const uint32_t *)[g_rtstat contents];
+    double rd = c[0], cr = c[1];
+    fprintf(stderr, "[HD] RTSTAT road px %u: ray hit %.1f%% (game reflection subtracted), miss %.1f%%, weight<1/255 %.1f%%\n",
+            c[0], rd ? 100.0 * c[2] / rd : 0, rd ? 100.0 * c[12] / rd : 0, rd ? 100.0 * c[10] / rd : 0);
+    fprintf(stderr, "[HD] RTSTAT car px %u: ray hit %.1f%%, miss %.1f%%, weight<1/255 %.1f%%; car misses by axis +x %u -x %u +y %u -y %u +z %u -z %u\n",
+            c[1], cr ? 100.0 * c[3] / cr : 0, cr ? 100.0 * c[13] / cr : 0, cr ? 100.0 * c[11] / cr : 0,
+            c[4], c[5], c[6], c[7], c[8], c[9]);
+}
 static void hd_rt_init(void){
     if (!hd_rt_on() || g_rt_pso) return;
     NSError *e = nil;
-    id<MTLLibrary> lib = [g_dev newLibraryWithSource:hd_gb_src(kRTFSrc) options:nil error:&e];
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:(hd_rtstat() ? [@"#define RTSTAT 1\n" stringByAppendingString:hd_gb_src(kRTFSrc)]
+                                                                     : hd_gb_src(kRTFSrc)) options:nil error:&e];
     if (!lib){ fprintf(stderr, "[HD] RT shader could not be compiled: %s\n", [[e localizedDescription] UTF8String]); g_rt = 0; return; }
     id<MTLFunction> ff = [lib newFunctionWithName:@"hd_rtc_frag"];
     id<MTLFunction> kf = [lib newFunctionWithName:@"hd_rt_kern"];
@@ -3032,7 +3103,10 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         MDraw *dr = &g_dbuf[rb][i];
         unsigned n = dr->count - dr->count % 3u, f = fill[dr->vsid];
         { uint64_t w[4] = { (uint64_t)dr->vsid << 32 | n, (uint64_t)(uint32_t)dr->ps << 32 | dr->tex, dr->gh, f };
-          for (int q = 0; q < 4; q++){ dsig ^= w[q]; dsig *= 1099511628211ull; } }
+          for (int q = 0; q < 4; q++){ dsig ^= w[q]; dsig *= 1099511628211ull; }
+          if (ri < RT_MAXREC){                     /* HD_RT_SIGLOG: the record's identity with / without its size */
+              uint64_t k = (uint64_t)dr->vsid * 1099511628211ull ^ ((uint64_t)(uint32_t)dr->ps << 32 | dr->tex);
+              k = k * 1099511628211ull ^ dr->gh; g_rt_sk_cur[ri][0] = k * 1099511628211ull ^ n; g_rt_sk_cur[ri][1] = k; } }
         fill[dr->vsid] += n;
         int base = dr->ps % PSREFL, cube = base >= PSCUBE, b = base % PSCUBE;
         HDMatC m; rt_mat_of(dr, &m);
@@ -3209,6 +3283,10 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     if (have_dyn){
         dsig ^= (uint64_t)total; dsig *= 1099511628211ull;
         dyn_refit = hd_rt_refit_on() && dsig == g_rt_dsig && g_rt_dsince < RT_REFIT_MAX;
+        if (ENVC("HD_RT_SIGLOG")){
+            if (dsig != g_rt_dsig) rt_sig_classify(ri);
+            else if (g_rt_dsince >= RT_REFIT_MAX) g_rt_sig_why[5]++;
+            memcpy(g_rt_sk_prev, g_rt_sk_cur, (size_t)ri * sizeof g_rt_sk_cur[0]); g_rt_sk_pn = ri; }
         if (dyn_refit && ri == g_rt_bn){                /* see POSITION CHECK */
             static float mv2 = -1.f;
             if (mv2 < 0.f){ const char *ev = ENVC("HD_RT_REFIT_MOVE"); float m = ev ? (float)atof(ev) : RT_REFIT_MOVE; mv2 = m * m; }
@@ -3609,17 +3687,43 @@ static void hd_ms_fallback(id<MTLCommandBuffer> cb, id<MTLTexture> scr, int pend
     [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
     atomic_fetch_add(&g_hd_msfb, 1ull);
 }
-static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLTexture> scr,
-                         unsigned zid, int refl_drawn){
+/* ---- COMPOSITE INTO THE COPY ----------------------------------------------
+ * At the end of the scene the game copies the screen to a target T of the same size
+ * (the post-process source).  HD used to composite the ray traced reflection onto
+ * the screen (load + store of the whole screen) and then copy it to T (read + write
+ * again): ~46 MB and a pass per frame for nothing.  When the screen is not read
+ * again before a draw overwrites it completely (the same rule as SCREEN
+ * REDIRECTION), the composite reads the scene and writes its result straight into
+ * T, and the copy is skipped: T gets exactly the same pixels.  HD_COMPCOPY=0 old. */
+static _Atomic unsigned long long g_hd_compcopy;
+static int draw_covers(const MDraw *dr, NSUInteger W, NSUInteger H);
+static int hd_compcopy_ok(int rb, unsigned B, id<MTLTexture> scr, id<MTLTexture> T){
+    static int on = -1; if (on < 0){ const char *e = ENVC("HD_COMPCOPY"); on = !(e && *e == '0'); }
+    if (!on || abt_off("COMPCOPY") || !T || !scr || T == scr) return 0;
+    const MDraw *D = g_dbuf[rb]; unsigned n = g_dn[rb];
+    if (D[B].blit_rect || !D[B].target || TGT_FACE(D[B].target)) return 0;
+    if (T.width != scr.width || T.height != scr.height || T.pixelFormat != scr.pixelFormat ||
+        T.textureType != MTLTextureType2D || !(T.usage & MTLTextureUsageRenderTarget)) return 0;
+    for (unsigned k = B + 1; k < n; k++){ const MDraw *x = &D[k];
+        if (x->is_blit){ if (!x->blit_src || !x->target) return 0; continue; }   /* reads / writes the screen */
+        if (x->target) continue;
+        if (x->is_clear){ if (x->clr_flags & 1u) return 0; continue; }
+        if (!x->count) continue;
+        return draw_covers(x, scr.width, scr.height);
+    }
+    return 0;                                                                  /* the frame ends: the screen is shown */
+}
+static int hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLTexture> scr,
+                         unsigned zid, int refl_drawn, id<MTLTexture> into){
     id<MTLTexture> zt = (zid && zid < MAXZ) ? g_ztex[zid] : nil;
     int ms = hd_msaa_n() > 1 && g_hd_mscol && !hd_mslazy();     /* in lazy mode single sampled afterwards */
     id<MTLRenderPipelineState> sp = ms ? g_hd_ssr_pso_ms : g_hd_ssr_pso;
     float ivp[16], vp[16], iv[16];
     if (!refl_drawn || !g_hd_cam_ok[rb] || !zt || !sp || !g_hd_g[0] ||
-        zt.width != scr.width || zt.height != scr.height) return;
+        zt.width != scr.width || zt.height != scr.height) return 0;
     memcpy(vp, &g_hd_cam[rb][32], sizeof vp);
     for (int r4 = 0; r4 < 4; r4++) vp[r4*4] *= g_hd_cam_k[rb];   /* Hor+ */
-    if (!hd_inv4(vp, ivp) || !hd_inv4(&g_hd_cam[rb][0], iv)) return;
+    if (!hd_inv4(vp, ivp) || !hd_inv4(&g_hd_cam[rb][0], iv)) return 0;
 
     struct { float vp[16], ivp[16], cam[4], prm[4], sz[4], cam2[4], cb[3][4], fogp[4], rt2[4]; } sp2;
     memset(sp2.fogp, 0, sizeof sp2.fogp); memset(sp2.rt2, 0, sizeof sp2.rt2);
@@ -3736,8 +3840,29 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
     /* HD_COMP=0 (diagnostic): skip the scene copy + composite pass.  Together with
      * HD_RT_STAGE, to measure the GPU cost of the steps one by one (no reflection in the image). */
     { static int comp = -1; if (comp < 0){ const char *e = ENVC("HD_COMP"); comp = (e && *e == '0') ? 0 : 1; }
-      if (!comp) return;
-      if (g_ab_mode == 1 || g_ab_mode == 2 || g_ab_mode == 3 || g_ab_mode == 4 || g_ab_mode == 6) return; }
+      if (!comp) return 0;
+      if (g_ab_mode == 1 || g_ab_mode == 2 || g_ab_mode == 3 || g_ab_mode == 4 || g_ab_mode == 6) return 0; }
+    if (into && rt_tris && !ms && g_rt_pso && into.pixelFormat == scr.pixelFormat){   /* see COMPOSITE INTO THE COPY */
+        MTLRenderPassDescriptor *sr = [MTLRenderPassDescriptor renderPassDescriptor];
+        sr.colorAttachments[0].texture = into;
+        sr.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        sr.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pp_rp(sr, "composite: RT into the copy");
+        id<MTLRenderCommandEncoder> se = [cb renderCommandEncoderWithDescriptor:sr];
+        [se setRenderPipelineState:g_rt_pso];
+        [se setFragmentTexture:scr atIndex:0];
+        [se setFragmentTexture:zt atIndex:1];
+        [se setFragmentTexture:g_hd_g[0] atIndex:2];
+        [se setFragmentTexture:g_hd_g[1] atIndex:3];
+        [se setFragmentTexture:g_hd_g[2] atIndex:4];
+        [se setFragmentTexture:g_rt_out atIndex:5];
+        [se setFragmentBytes:&sp2 length:sizeof sp2 atIndex:0];
+        if (g_rtstat) [se setFragmentBuffer:g_rtstat offset:0 atIndex:7];
+        [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [se endEncoding];
+        atomic_fetch_add(&g_hd_ssr_n, 1ull); atomic_fetch_add(&g_hd_compcopy, 1ull);
+        return 1;
+    }
     int fb = rt_tris && !ms && g_rt_pso_fb;        /* see COPY-FREE COMPOSITE */
     if (fb){
         MTLRenderPassDescriptor *sr = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -3753,10 +3878,11 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
         [se setFragmentTexture:g_hd_g[2] atIndex:4];
         [se setFragmentTexture:g_rt_out atIndex:5];
         [se setFragmentBytes:&sp2 length:sizeof sp2 atIndex:0];
+        if (g_rtstat) [se setFragmentBuffer:g_rtstat offset:0 atIndex:7];
         [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [se endEncoding];
         atomic_fetch_add(&g_hd_ssr_n, 1ull);
-        return;
+        return 0;
     }
     if (!g_hd_scenecopy || g_hd_scenecopy.width != scr.width || g_hd_scenecopy.height != scr.height){
         MTLTextureDescriptor *cd = [MTLTextureDescriptor
@@ -3790,10 +3916,12 @@ static void hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLText
     [se setFragmentTexture:g_hd_g[1] atIndex:3];
     [se setFragmentTexture:g_hd_g[2] atIndex:4];
     if (rt_tris) [se setFragmentTexture:g_rt_out atIndex:5];
+    if (rt_tris && g_rtstat) [se setFragmentBuffer:g_rtstat offset:0 atIndex:7];
     [se setFragmentBytes:&sp2 length:sizeof sp2 atIndex:0];
     [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [se endEncoding];
     atomic_fetch_add(&g_hd_ssr_n, 1ull);
+    return 0;
 }
 #endif
 /* --- PASS MERGING (both builds) ------------------------------------------
@@ -7456,7 +7584,13 @@ void metal_run_main_loop(void){
                                         if (st2 == dtex && hd_scene_open && !g_hd_brk[i]){
                                             hd_scene_open = 0;
                                             if (hd_gsep() && hd_refl_drawn && hd_ssr_on()) hd_gpass(cb, rb, i, hd_scene_zid);
-                                            hd_composite(cb, rb, i, dtex, hd_scene_zid, hd_refl_drawn);
+                                            id<MTLTexture> into = hd_compcopy_ok(rb, i, dtex, dt2) ? dt2 : nil;
+                                            if (hd_composite(cb, rb, i, dtex, hd_scene_zid, hd_refl_drawn, into)){
+                                                /* COMPOSITE INTO THE COPY: T has the composited scene, no copy */
+                                                unsigned tk_ = TGT_ID(dr->target)*8u + TGT_FACE(dr->target);
+                                                touched[tk_>>3] |= 1u<<(tk_&7);
+                                                continue;
+                                            }
                                         }
                                         /* MSAA: the screen content lives in a multisampled texture.
                                          * A copy written straight to the drawable would be
@@ -8366,6 +8500,11 @@ void metal_budget_report(void){
       fprintf(stderr, "[HD] RT cache: per frame mean instant %.0f tris + static %.0f tris; promoted %llu, evicted %llu, resets %llu, static builds %llu\n",
               f ? (double)atomic_load(&g_rt_dynv) / 3 / f : 0.0, f ? (double)atomic_load(&g_rt_statv) / 3 / f : 0.0,
               atomic_load(&g_rt_promo), atomic_load(&g_rt_evict), atomic_load(&g_rt_reset), atomic_load(&g_rt_sbuilds));
+      if (ENVC("HD_RT_SIGLOG"))
+          fprintf(stderr, "[HD] RT instant layout changes: same records other order %llu, other size (LOD) %llu, added only %llu, "
+                  "removed only %llu, added+removed %llu (records added %llu removed %llu); forced every %u frames %llu\n",
+                  g_rt_sig_why[0], g_rt_sig_why[1], g_rt_sig_why[2], g_rt_sig_why[3], g_rt_sig_why[4],
+                  g_rt_sig_add, g_rt_sig_rem, RT_REFIT_MAX, g_rt_sig_why[5]);
       fprintf(stderr, "[HD] RT instant structure: %llu full builds (%llu due to position shift), %llu in-place updates (refit %s)\n",
               atomic_load(&g_rt_nbuild), atomic_load(&g_rt_nmoved), atomic_load(&g_rt_nrefit), hd_rt_refit_on() ? "ON" : "OFF");
       { uint32_t gv = 0; for (unsigned k = 0; k < g_rt_ng; k++) gv += g_rt_grp[k].built;
@@ -8389,6 +8528,8 @@ void metal_budget_report(void){
             "%llu not stored, %llu times a load without clear was requested but the samples were lost (should be 0)\n",
             atomic_load(&g_hd_ml_pass), atomic_load(&g_hd_ml_miss), g_hd_ml_off ? " (memoryless mode OFF)" : "",
             atomic_load(&g_hd_mszst), atomic_load(&g_hd_mszskip), atomic_load(&g_hd_mszlost));
+    hd_rtstat_report();
+    fprintf(stderr, "[HD] composite into the copy: %llu frames (the screen copy skipped)\n", atomic_load(&g_hd_compcopy));
     fprintf(stderr, "[HD] mid-scene copy (motion blur): %llu frames -- scene continued multisampled\n",
             atomic_load(&g_hd_brk_n));
     { unsigned long long gn = atomic_load(&g_hd_gp_n);

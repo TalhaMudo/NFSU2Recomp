@@ -70,7 +70,7 @@ EXTRA=()
 if [ "${SESSION_LIGHT:-0}" != 1 ]; then
   for kv in GAMELOG=1 TIMELOG=1 THREADLOG=1 FILEOPLOG=1 GILLOG=20 SNDSTAT=1 SNDGAP=1 \
             "SNDCSV=$DIR/sound.csv" "SNDDUMP=$DIR/sound_out.raw" \
-            PASSPROF=120 "PASSPROF_CSV=$DIR/passprof.csv" GPUWIN=1,2000000000 MATLOG=1 TEXUPSAY=1; do
+            PASSPROF=120 "PASSPROF_CSV=$DIR/passprof.csv" GPUWIN=1,2000000000 MATLOG=1 TEXUPSAY=1 HD_RT_SIGLOG=1; do
     EXTRA+=(--env "$kv"); done
 fi
 if [ $ALL = 1 ]; then
