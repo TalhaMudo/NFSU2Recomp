@@ -69,6 +69,13 @@ uint32_t call_guest(CPU *c, uint32_t fn, int nargs, const uint32_t *args);   /* 
 static int g_init, g_sky, g_lights, g_detail;
 static unsigned long g_n_sky[2], g_n_lod, g_n_car, g_n_lights;
 static int g_lights_here;
+static float g_cube_far0 = -1.f;      /* the game's cube map far plane (64 m) */
+
+/* ABTEST=REFL (metal.m IN-RUN A/B): all three off in the measurement's off slices */
+static int ab_on(void){ int metal_abt_off(const char *); return !metal_abt_off("REFL"); }
+#define SKY    (g_sky && ab_on())
+#define LIGHTS (g_lights && ab_on())
+#define DETAIL (g_detail && ab_on())
 
 static int on(const char *name){
     const char *e = getenv(name);
@@ -93,7 +100,7 @@ int refl_hook(CPU *c, uint32_t ip){
     switch (ip){
     case H_ROAD_SCENERY: case H_MIRROR_SCENERY:
         refl_init();
-        if (g_sky && c->esi){
+        if (SKY && c->esi){
             uint32_t a[1] = { c->esi }, pool = MR32(SKY_POOL);
             call_guest(c, FN_SKY, 1, a);
             /* The road reflection draws the scenery mirrored in z (0x5d67b9 negates
@@ -109,7 +116,7 @@ int refl_hook(CPU *c, uint32_t ip){
         /* The road reflection takes the main views' path (edx 1-3 draw the sky).
          * The main views' sky (scale 1) fits inside their 10 km far plane; the
          * mirror's far plane is 192 m, so its sky is scaled to fit inside its own. */
-        if (g_sky && (c->edx == 3u || c->edx == 4u)){
+        if (SKY && (c->edx == 3u || c->edx == 4u)){
             uint32_t v = MR32(c->ebp + 8u), cam = v ? MR32(v + 0x40u) : 0u;
             float far = cam ? MRF32(cam + 0xc0u) : 0.f, k = far / 10400.f;
             if (k > 0.f) ST(0) = (double)(k < 1.f ? k : 1.f);
@@ -118,14 +125,15 @@ int refl_hook(CPU *c, uint32_t ip){
         return 1;
     case H_SCENERY_LOD:
         refl_init();
-        if (g_detail && (c->ebx & 0x1820u)){
-            static int far_set;
-            if (!far_set){ far_set = 1; MRF32(CUBE_FAR) = 10000.f; }
-            c->ebx &= ~0x1820u; g_n_lod++;
+        if (g_detail){
+            if (g_cube_far0 < 0.f) g_cube_far0 = MRF32(CUBE_FAR);
+            float want = DETAIL ? 10000.f : g_cube_far0;
+            if (MRF32(CUBE_FAR) != want) MRF32(CUBE_FAR) = want;
         }
+        if (DETAIL && (c->ebx & 0x1820u)){ c->ebx &= ~0x1820u; g_n_lod++; }
         return 1;
     case H_CAR_LOD: case H_CAR_LOD2:
-        if (g_detail){
+        if (DETAIL){
             uint32_t v = MR32(c->ebp + 8u);
             if (v && refl_view(MR32(v + 4u))){
                 if (ip == H_CAR_LOD){ c->ecx = 0; c->edx = 0; }
@@ -141,14 +149,14 @@ int refl_hook(CPU *c, uint32_t ip){
 /* ---- car lights in the road reflection (tools/gen_v2.sh OVR) -------------- */
 void sub_006154a0(CPU *c){                  /* cdecl (eView *view) */
     refl_init();
-    if (g_lights && !g_lights_here){ POP32(c->eip); return; }   /* drawn below instead */
+    if (LIGHTS && !g_lights_here){ POP32(c->eip); return; }   /* drawn below instead */
     sub_006154a0_orig(c);
 }
 
 void sub_00494270(CPU *c){                  /* cdecl (eView *view, int, int pass) */
     refl_init();
     uint32_t v = MR32(c->esp + 4u);
-    if (g_lights && v && MR32(v + 4u) == 4u && MR32(c->esp + 12u) == 1u){
+    if (LIGHTS && v && MR32(v + 4u) == 4u && MR32(c->esp + 12u) == 1u){
         g_lights_here = 1;
         PUSH32(v); PUSH32(MR32(c->esp + 4u));
         sub_006154a0_orig(c);
