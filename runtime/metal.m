@@ -2086,6 +2086,46 @@ static uint64_t g_rt_dsig;                      /* the signature of the last bui
 static uint64_t g_rt_sk_cur[RT_MAXREC][2], g_rt_sk_prev[RT_MAXREC][2]; static unsigned g_rt_sk_pn;
 static unsigned long long g_rt_sig_why[6];      /* order, size, added only, removed only, both, forced (max frames) */
 static unsigned long long g_rt_sig_add, g_rt_sig_rem;
+/* --- KEPT LAYOUT (instant structure) --------------------------------------------
+ * Metal's acceleration-structure build on this GPU has a large fixed cost (measured
+ * standalone, M1 Pro at the highest clock: 500 triangles 0.6 ms, the game's ~5-11
+ * thousand instant triangles 1.0 ms; a refit 0.1-0.14 ms).  The instant structure was
+ * rebuilt whenever the draw list changed at all (an object leaving, coming back, the
+ * order of copies) and every RT_REFIT_MAX frames: in a career session 54% of frames
+ * built it (20863 of 38855).  Now the layout of the last full build is KEPT:
+ *  - each draw goes back to its own slot (same VS, size, texture, geometry id; among
+ *    copies the nearest by position), the order in the draw list doesn't matter;
+ *  - a slot nobody took becomes a hole: collapsed onto its first vertex (area 0, rays
+ *    don't hit it, the tree's boxes stay in place);
+ *  - a new draw only goes into a hole that was built at the same place and is big
+ *    enough (the same object back, another LOD), otherwise a full build as before;
+ *  - the position check against the last build stays (RT_REFIT_MOVE).  So the forced
+ *    rebuild every RT_REFIT_MAX frames is only kept when a draw has no known
+ *    position; otherwise every RT_REFIT_MAXP frames.
+ * The rays see the same triangles: only how often the tree is rebuilt changes.
+ * HD_RT_SLOT=0 old behavior, ABTEST=RTSLOT in the same run. */
+#define RT_REFIT_MAXP 240u
+#define RT_LS_MAXREC  2048u
+#define RT_LS_MAXCOL  480u                   /* collapse ranges per frame (setBytes <= 4 KB) */
+typedef struct { uint64_t key; uint32_t first, n, cap; float bp[3]; uint8_t bpok, hole, collapsed, taken; } RTSlot;
+static RTSlot g_ls[RT_LS_MAXREC]; static unsigned g_ls_n; static uint32_t g_ls_tot; static int g_ls_ok;
+static uint64_t g_rt_rk[RT_MAXREC]; static uint16_t g_rt_rvs[RT_MAXREC]; static uint32_t g_rt_rn[RT_MAXREC], g_rt_rf[RT_MAXREC];
+static _Atomic unsigned long long g_rt_ls_noplace, g_rt_ls_reuse;
+static int hd_rt_refit_on(void);
+static int rt_ls_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("HD_RT_SLOT"); v = (e && *e == '0') ? 0 : 1; }
+    return v && hd_rt_refit_on() && !abt_off("RTSLOT");
+}
+static uint64_t rt_ls_key(const MDraw *dr, unsigned n){
+    uint64_t k = (uint64_t)dr->vsid * 1099511628211ull ^ ((uint64_t)(uint32_t)dr->ps << 32 | dr->tex);
+    k = k * 1099511628211ull ^ dr->gh;
+    return k * 1099511628211ull ^ n;
+}
+static int rt_rf_cmp(void *t, const void *a, const void *b){
+    (void)t; uint32_t x = g_rt_rf[*(const uint32_t *)a], y = g_rt_rf[*(const uint32_t *)b];
+    return x < y ? -1 : x > y;
+}
 static int u64cmp(const void *a, const void *b){ uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 static void rt_sig_classify(unsigned n){
     static uint64_t a[RT_MAXREC], b[RT_MAXREC];
@@ -3088,6 +3128,83 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     }
     { unsigned a = 0; for (int g = 0; g < HD_MAXVSI; g++){ off[g] = a; a += cnt[g]; } }
     memcpy(fill, off, sizeof fill);
+    /* --- placement: dense (a full build) or the kept layout (refit, see KEPT LAYOUT) --- */
+    static uint32_t pfirst[MAXD]; static uint16_t pslot[MAXD];
+    int slot_mode = 0; unsigned ncol = 0;
+    static uint32_t colr[RT_LS_MAXCOL][2];
+    if (rt_ls_on() && g_ls_ok && nrec <= RT_LS_MAXREC){
+        static float mv2 = -1.f;
+        if (mv2 < 0.f){ const char *ev = ENVC("HD_RT_REFIT_MOVE"); float m = ev ? (float)atof(ev) : RT_REFIT_MOVE; mv2 = m * m; }
+        int ok = 1, nopos = 0;
+        static uint16_t pend[RT_LS_MAXREC]; unsigned npend = 0;
+        for (unsigned s = 0; s < g_ls_n; s++) g_ls[s].taken = 0;
+        for (unsigned i = 0; i < upto && i < MAXD && ok; i++){
+            if (!act[i]) continue;
+            MDraw *dr = &g_dbuf[rb][i];
+            unsigned n = dr->count - dr->count % 3u;
+            uint64_t key = rt_ls_key(dr, n);
+            if (!g_rt_dpok[i]) nopos = 1;
+            int best = -1; float bd = 3e38f;
+            for (unsigned s = 0; s < g_ls_n; s++){
+                RTSlot *sl = &g_ls[s];
+                if (sl->taken || sl->hole || sl->key != key) continue;
+                float d = 0.f;
+                if (g_rt_dpok[i] && sl->bpok){
+                    float dx = g_rt_dp[i][0] - sl->bp[0], dy = g_rt_dp[i][1] - sl->bp[1], dz = g_rt_dp[i][2] - sl->bp[2];
+                    d = dx*dx + dy*dy + dz*dz; }
+                if (d < bd){ bd = d; best = (int)s; if (d == 0.f) break; }
+            }
+            if (best < 0){ pend[npend++] = (uint16_t)i; continue; }
+            if (bd > mv2){ ok = 0; atomic_fetch_add(&g_rt_nmoved, 1ull); break; }      /* see POSITION CHECK */
+            g_ls[best].taken = 1; pfirst[i] = g_ls[best].first; pslot[i] = (uint16_t)best;
+        }
+        /* slots nobody took this frame become holes (collapsed below) */
+        for (unsigned s = 0; s < g_ls_n && ok; s++) if (!g_ls[s].taken && !g_ls[s].hole){ g_ls[s].hole = 1; }
+        /* a new draw goes into a hole only where the hole's part was built and fits
+         * (the same object back, another LOD): the tree's boxes are already there */
+        for (unsigned q = 0; q < npend && ok; q++){
+            unsigned i = pend[q];
+            MDraw *dr = &g_dbuf[rb][i];
+            unsigned n = dr->count - dr->count % 3u;
+            int best = -1;
+            if (g_rt_dpok[i]) for (unsigned s = 0; s < g_ls_n; s++){
+                RTSlot *sl = &g_ls[s];
+                if (!sl->hole || sl->taken || !sl->bpok || sl->cap < n) continue;
+                float dx = g_rt_dp[i][0] - sl->bp[0], dy = g_rt_dp[i][1] - sl->bp[1], dz = g_rt_dp[i][2] - sl->bp[2];
+                if (dx*dx + dy*dy + dz*dz <= mv2){ best = (int)s; break; }
+            }
+            if (best < 0){ ok = 0; atomic_fetch_add(&g_rt_ls_noplace, 1ull); break; }
+            RTSlot *sl = &g_ls[best];
+            sl->taken = 1; sl->hole = 0; sl->key = rt_ls_key(dr, n); sl->n = n;
+            if (!sl->collapsed && ncol < RT_LS_MAXCOL){ colr[ncol][0] = sl->first; colr[ncol][1] = sl->cap; ncol++; }
+            else if (!sl->collapsed) ok = 0;
+            sl->collapsed = 0;
+            pfirst[i] = sl->first; pslot[i] = (uint16_t)best;
+            atomic_fetch_add(&g_rt_ls_reuse, 1ull);
+        }
+        if (ok && g_rt_dsince >= (nopos ? RT_REFIT_MAX : RT_REFIT_MAXP)){ ok = 0; g_rt_sig_why[5]++; }
+        if (ok){
+            /* holes not collapsed yet: collapse onto their first vertex (area 0, in place) */
+            for (unsigned s = 0; s < g_ls_n && ok; s++){
+                RTSlot *sl = &g_ls[s];
+                if (!sl->hole || sl->collapsed) continue;
+                if (ncol >= RT_LS_MAXCOL){ ok = 0; break; }
+                colr[ncol][0] = sl->first; colr[ncol][1] = sl->cap; ncol++;
+            }
+        }
+        if (ok){
+            for (unsigned s = 0; s < g_ls_n; s++) if (g_ls[s].hole) g_ls[s].collapsed = 1;
+            slot_mode = 1; total = g_ls_tot;
+        } else {
+            g_ls_ok = 0; ncol = 0;                  /* a full build below sets a new layout */
+        }
+    }
+    if (!slot_mode)
+        for (unsigned i = 0; i < upto && i < MAXD; i++){
+            if (!act[i]) continue;
+            MDraw *dr = &g_dbuf[rb][i];
+            pfirst[i] = fill[dr->vsid]; fill[dr->vsid] += dr->count - dr->count % 3u;
+        }
     uint32_t *item = (uint32_t *)[g_rt_item[ring] contents];
     HDRecC *rec = (HDRecC *)[g_rt_rec[ring] contents];
     HDMatC *mat = (HDMatC *)[g_rt_mat[ring] contents];
@@ -3101,13 +3218,13 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     for (unsigned i = 0; i < upto && i < MAXD; i++){
         if (!act[i]) continue;
         MDraw *dr = &g_dbuf[rb][i];
-        unsigned n = dr->count - dr->count % 3u, f = fill[dr->vsid];
+        unsigned n = dr->count - dr->count % 3u, f = pfirst[i];
         { uint64_t w[4] = { (uint64_t)dr->vsid << 32 | n, (uint64_t)(uint32_t)dr->ps << 32 | dr->tex, dr->gh, f };
           for (int q = 0; q < 4; q++){ dsig ^= w[q]; dsig *= 1099511628211ull; }
           if (ri < RT_MAXREC){                     /* HD_RT_SIGLOG: the record's identity with / without its size */
               uint64_t k = (uint64_t)dr->vsid * 1099511628211ull ^ ((uint64_t)(uint32_t)dr->ps << 32 | dr->tex);
               k = k * 1099511628211ull ^ dr->gh; g_rt_sk_cur[ri][0] = k * 1099511628211ull ^ n; g_rt_sk_cur[ri][1] = k; } }
-        fill[dr->vsid] += n;
+        if (ri < RT_MAXREC){ g_rt_rk[ri] = rt_ls_key(dr, n); g_rt_rvs[ri] = (uint16_t)dr->vsid; g_rt_rn[ri] = n; g_rt_rf[ri] = f; }
         int base = dr->ps % PSREFL, cube = base >= PSCUBE, b = base % PSCUBE;
         HDMatC m; rt_mat_of(dr, &m);
         RTEnt *e = ent[i];
@@ -3209,8 +3326,33 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
             for (int g = 1; g < HD_MAXVSI && o < 480; g++) if (cnt[g]) o += snprintf(ln + o, sizeof ln - (size_t)o, " vs_%d:%u", g, cnt[g]);
             fprintf(stderr, "[RTLOG]   instant capture (VS:verts):%s\n", o ? ln : " -"); }
       } }
+    /* --- GPU: collapse the kept layout's new holes (before the capture rewrites reused ones) --- */
+    if (ncol){
+        id<MTLComputeCommandEncoder> ce = pp_compute(cb, "RT: instant holes collapse");
+        [ce setComputePipelineState:g_rt_colk];
+        [ce setBuffer:g_rt_pos offset:0 atIndex:0];
+        [ce setBytes:colr length:(NSUInteger)ncol * 8 atIndex:1];
+        uint32_t nr = ncol; [ce setBytes:&nr length:4 atIndex:2];
+        NSUInteger tw = g_rt_colk.threadExecutionWidth;
+        [ce dispatchThreadgroups:MTLSizeMake((ncol + tw - 1) / tw, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [ce endEncoding];
+    }
+    /* capture runs: records sorted by first vertex, adjacent ones of the same VS merged
+     * (dense layout: one run per VS, as before) */
+    static uint32_t run[RT_MAXREC][3]; unsigned nrun = 0;
+    {   static uint32_t ord[RT_MAXREC];
+        unsigned nr = ri < RT_MAXREC ? ri : RT_MAXREC;
+        for (unsigned q = 0; q < nr; q++) ord[q] = q;
+        if (slot_mode) qsort_r(ord, nr, 4, NULL, rt_rf_cmp);
+        for (unsigned q = 0; q < nr; q++){
+            unsigned r = ord[q];
+            if (!g_rt_rn[r]) continue;
+            if (nrun && run[nrun-1][2] == g_rt_rvs[r] && run[nrun-1][0] + run[nrun-1][1] == g_rt_rf[r]) run[nrun-1][1] += g_rt_rn[r];
+            else { run[nrun][0] = g_rt_rf[r]; run[nrun][1] = g_rt_rn[r]; run[nrun][2] = g_rt_rvs[r]; nrun++; }
+        }
+    }
     /* --- GPU: capture --- */
-    if (total){
+    if (nrun){
         id<MTLComputeCommandEncoder> ce = pp_compute(cb, "RT: vertex capture (compute)");
         [ce setBuffer:g_mtlrvb offset:0 atIndex:1];
         [ce setBuffer:g_mtlkb offset:0 atIndex:2];
@@ -3219,16 +3361,16 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
         [ce setBuffer:g_rt_pos offset:0 atIndex:5];
         [ce setBuffer:g_rt_attr offset:0 atIndex:6];
         [ce setBuffer:(g_pool_fr[rb] ? g_pool_fr[rb] : g_mtlrvb) offset:0 atIndex:8];   /* indexed records */
-        for (int g = 1; g < HD_MAXVSI; g++){
-            if (!cnt[g]) continue;
+        for (unsigned u = 0; u < nrun; u++){
+            int g = (int)run[u][2];
             struct { float invV[16]; float prm[4]; uint32_t first, count, p0, p1; } C;
             memcpy(C.invV, iv, sizeof C.invV);
             C.prm[0] = ipx; C.prm[1] = ipy; C.prm[2] = C.prm[3] = 0.f;
-            C.first = off[g]; C.count = cnt[g]; C.p0 = C.p1 = 0;
+            C.first = run[u][0]; C.count = run[u][1]; C.p0 = C.p1 = 0;
             [ce setComputePipelineState:g_hd_vsk[g]];
             [ce setBytes:&C length:sizeof C atIndex:7];
             NSUInteger tw = g_hd_vsk[g].maxTotalThreadsPerThreadgroup;
-            [ce dispatchThreadgroups:MTLSizeMake((cnt[g] + tw - 1) / tw, 1, 1)
+            [ce dispatchThreadgroups:MTLSizeMake((run[u][1] + tw - 1) / tw, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
         }
         if (g_rt_fixk && g_rt_fixcnt){
@@ -3236,14 +3378,14 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
             [ce setBuffer:g_rt_pos offset:0 atIndex:0];
             [ce setBuffer:g_rt_fixcnt offset:0 atIndex:1];
             NSUInteger tw = g_rt_fixk.maxTotalThreadsPerThreadgroup;
-            for (int g = 1; g < HD_MAXVSI; g++){            /* per VS: so the counters tell which shader it is */
-                if (!cnt[g]) continue;
+            for (unsigned u = 0; u < nrun; u++){            /* per run of one VS: so the counters tell which shader it is */
+                int g = (int)run[u][2];
                 static float poison = -1.f;      /* HD_RT_POISON=<value>: causality test (no check done) */
                 if (poison < 0.f){ const char *ev = ENVC("HD_RT_POISON"); poison = ev ? (float)atof(ev) : 0.f; }
-                struct { uint32_t ntri; float lim; uint32_t first, slot; } F = { cnt[g] / 3u, poison > 0.f ? -poison : 100000.f, off[g], (uint32_t)g };
+                struct { uint32_t ntri; float lim; uint32_t first, slot; } F = { run[u][1] / 3u, poison > 0.f ? -poison : 100000.f, run[u][0], (uint32_t)g };
                 if (poison > 0.f && g != 3) continue;        /* only the first triangle of one VS (world) */
                 [ce setBytes:&F length:sizeof F atIndex:2];
-                [ce dispatchThreadgroups:MTLSizeMake((cnt[g] / 3u + tw - 1) / tw, 1, 1)
+                [ce dispatchThreadgroups:MTLSizeMake((run[u][1] / 3u + tw - 1) / tw, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
             }
         }
@@ -3282,12 +3424,14 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     int have_dyn = total >= 3, dyn_refit = 0;
     if (have_dyn){
         dsig ^= (uint64_t)total; dsig *= 1099511628211ull;
-        dyn_refit = hd_rt_refit_on() && dsig == g_rt_dsig && g_rt_dsince < RT_REFIT_MAX;
-        if (ENVC("HD_RT_SIGLOG")){
+        dyn_refit = slot_mode ? 1 : (!rt_ls_on() && hd_rt_refit_on() && dsig == g_rt_dsig && g_rt_dsince < RT_REFIT_MAX);
+        if (slot_mode) dsig = 0;                       /* the dense signature no longer describes the layout */
+        if (ENVC("HD_RT_SIGLOG") && !slot_mode){
             if (dsig != g_rt_dsig) rt_sig_classify(ri);
             else if (g_rt_dsince >= RT_REFIT_MAX) g_rt_sig_why[5]++;
             memcpy(g_rt_sk_prev, g_rt_sk_cur, (size_t)ri * sizeof g_rt_sk_cur[0]); g_rt_sk_pn = ri; }
-        if (dyn_refit && ri == g_rt_bn){                /* see POSITION CHECK */
+        if (slot_mode) ;                                /* checked in the placement */
+        else if (dyn_refit && ri == g_rt_bn){           /* see POSITION CHECK */
             static float mv2 = -1.f;
             if (mv2 < 0.f){ const char *ev = ENVC("HD_RT_REFIT_MOVE"); float m = ev ? (float)atof(ev) : RT_REFIT_MOVE; mv2 = m * m; }
             for (unsigned q = 0; q < ri; q++){
@@ -3326,6 +3470,13 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
                 [ae buildAccelerationStructure:g_rt_as descriptor:ad scratchBuffer:g_rt_scratch scratchBufferOffset:0];
                 g_rt_dsince = 0; atomic_fetch_add(&g_rt_nbuild, 1ull);
                 memcpy(g_rt_bpos, cpos, (size_t)ri * sizeof cpos[0]); memcpy(g_rt_bpok, cpok, ri); g_rt_bn = ri;
+                /* the new tree's layout: kept from now on (see KEPT LAYOUT) */
+                g_ls_ok = ri <= RT_LS_MAXREC; g_ls_n = g_ls_ok ? ri : 0; g_ls_tot = total;
+                for (unsigned r = 0; r < g_ls_n; r++){
+                    RTSlot *sl = &g_ls[r]; memset(sl, 0, sizeof *sl);
+                    sl->key = g_rt_rk[r]; sl->first = g_rt_rf[r]; sl->n = sl->cap = g_rt_rn[r];
+                    sl->bpok = cpok[r]; if (cpok[r]) memcpy(sl->bp, cpos[r], 12);
+                }
             }
             g_rt_dsig = dsig;
         }
@@ -3355,6 +3506,27 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
             }
         }
         [ae endEncoding];
+    }
+    /* HD_RT_DUMPDYN=<frame> HD_RT_DUMPDYN_FILE=<path>: write that frame's instant-structure
+     * vertices (float3, non-indexed) so the build can be timed outside the game (diagnostic) */
+    if (have_dyn){
+        static long dumpf = -2;
+        if (dumpf == -2){ const char *e = ENVC("HD_RT_DUMPDYN"); dumpf = e ? atol(e) : -1; }
+        if (dumpf >= 0 && frame >= (unsigned long)dumpf){
+            dumpf = -1;
+            const char *fn = ENVC("HD_RT_DUMPDYN_FILE"); if (!fn) fn = "rt_dyn.bin";
+            char *path = strdup(fn);
+            NSUInteger nb = (NSUInteger)total * 12;
+            id<MTLBuffer> sb = [g_dev newBufferWithLength:nb options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+            [be copyFromBuffer:g_rt_pos sourceOffset:0 toBuffer:sb destinationOffset:0 size:nb];
+            [be endEncoding];
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> c){ (void)c;
+                FILE *f = fopen(path, "wb");
+                if (f){ fwrite(sb.contents, 1, nb, f); fclose(f); }
+                fprintf(stderr, "[HD] RT instant vertices dumped: %lu tris -> %s\n", (unsigned long)(nb / 36), path);
+                free(path); }];
+        }
     }
     if (!have_dyn) g_rt_dsince = 0xFFFFFFFFu;
     /* the pending promotions in the built new region are now in the structure: remove from capture */
@@ -8507,6 +8679,8 @@ void metal_budget_report(void){
                   g_rt_sig_add, g_rt_sig_rem, RT_REFIT_MAX, g_rt_sig_why[5]);
       fprintf(stderr, "[HD] RT instant structure: %llu full builds (%llu due to position shift), %llu in-place updates (refit %s)\n",
               atomic_load(&g_rt_nbuild), atomic_load(&g_rt_nmoved), atomic_load(&g_rt_nrefit), hd_rt_refit_on() ? "ON" : "OFF");
+      fprintf(stderr, "[HD] RT kept layout %s: new draws into holes %llu, no place (full build) %llu, forced %llu\n",
+              rt_ls_on() ? "ON" : "OFF", atomic_load(&g_rt_ls_reuse), atomic_load(&g_rt_ls_noplace), g_rt_sig_why[5]);
       { uint32_t gv = 0; for (unsigned k = 0; k < g_rt_ng; k++) gv += g_rt_grp[k].built;
         fprintf(stderr, "[HD] RT cache: merges %llu (oldest dropped %llu), part builds %llu, refits %llu, "
                 "rehashes %llu, store %u verts (%u dead; %u groups %u verts, new %u)\n",
