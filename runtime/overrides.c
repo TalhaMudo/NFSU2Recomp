@@ -567,8 +567,10 @@ void sub_0050d510(CPU *c){
                 for (const char *t2 = tmp; *t2 && o < sizeof out - 2; t2++) out[o++] = *t2;
             }
             out[o] = 0;
-            fprintf(stderr, "  [game] %s%s", out,
-                    (o && out[o-1] == '\n') ? "" : "\n");
+            /* seconds on the PERFLOG clock (perflog.c), to line up with its CSVs */
+            { uint64_t perflog_now_us(void);
+              fprintf(stderr, "  [game %.3f] %s%s", perflog_now_us() / 1e6, out,
+                      (o && out[o-1] == '\n') ? "" : "\n"); }
             /* Inside SwitchFEngPackages ebx = the front-end package manager
              * ("this").  printf is called exactly at that point, so we catch the
              * pointer here for free; needed to force the transition. */

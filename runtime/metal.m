@@ -57,9 +57,9 @@ static void dump_init(void){
  * ~/Library/Logs/NFSU2/).  For scenes the user reaches but automated tests
  * can't produce (e.g. the end of a career race). */
 static _Atomic int g_dump_req;
-static long g_dump_req_f = -1;
+static long g_dump_req_f = -1, g_dump_req_end = -1;   /* Cmd+Shift+D: frames [f, end] */
 static int dump_wanted(long f){
-    if (f == g_dump_req_f) return 1;
+    if (g_dump_req_f >= 0 && f >= g_dump_req_f && f <= g_dump_req_end) return 1;
     for (int i = 0; i < g_dump_n; i++) if (g_dump_want[i] == (int)f) return 1;
     return 0;
 }
@@ -4491,16 +4491,43 @@ void metal_set_texproj(const float p4[4]){ memcpy(g_cur_proj, p4, sizeof g_cur_p
  * The game's own bytecode is translated to MSL and compiled here. */
 #define MAXVSF 512
 static id<MTLFunction> g_vsfn[MAXVSF];
+/* The compile runs WITHOUT the big lock (guest_blocking_begin): a new shader is
+ * compiled synchronously on the game thread when it is first drawn, and with the
+ * HD capture kernel that took 50-110 ms when a race started (2026-11-04 session:
+ * the sound threads waited 50-64 ms for the lock -> the sound stuttered between
+ * the loading screen and the race).  Nothing here touches guest memory; the
+ * results are stored after the lock is back.  VSCOMPILELOCK=1: keep the lock. */
 void metal_register_vs(int vsid, const char *msl){
     if (vsid <= 0 || vsid >= MAXVSF || !msl || !g_dev || g_vsfn[vsid]) return;
     @autoreleasepool {
         NSString *src = [kPrelude stringByAppendingString:
                          [NSString stringWithUTF8String:msl]];
         NSError *err = nil;
+        int guest_blocking_begin(void); void guest_blocking_end(void);
+        static int keep = -1; if (keep < 0) keep = ENVC("VSCOMPILELOCK") != NULL;
+        int yielded = keep ? 0 : guest_blocking_begin();
+        id<MTLFunction> vfn = nil;
+#if NFS_ENHANCED
+        id<MTLComputePipelineState> vsk = nil; NSError *ke = nil; int want_k = 0;
+#endif
         struct timespec _c0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_c0);
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
         if (g_perflog){ struct timespec _c1; clock_gettime(CLOCK_MONOTONIC, &_c1);
             perflog_event(PL_VS, (uint64_t)(_c1.tv_sec - _c0.tv_sec) * 1000000000ull + (uint64_t)_c1.tv_nsec - (uint64_t)_c0.tv_nsec, 0); }
+        char nm[32];
+        if (lib){
+            snprintf(nm, sizeof nm, "vs_%d", vsid);
+            vfn = [lib newFunctionWithName:[NSString stringWithUTF8String:nm]];
+#if NFS_ENHANCED
+            if (vsid < HD_MAXVSI && hd_rt_on()){
+                want_k = 1;
+                snprintf(nm, sizeof nm, "vsk_%d", vsid);
+                id<MTLFunction> kf = [lib newFunctionWithName:[NSString stringWithUTF8String:nm]];
+                if (kf) vsk = [g_dev newComputePipelineStateWithFunction:kf error:&ke];
+            }
+#endif
+        }
+        if (yielded) guest_blocking_end();
         if (!lib){
             static int shown = 0;
             if (shown < 5){ shown++;
@@ -4508,18 +4535,14 @@ void metal_register_vs(int vsid, const char *msl){
                         err ? [[err localizedDescription] UTF8String] : "?"); }
             return;
         }
-        char nm[32]; snprintf(nm, sizeof nm, "vs_%d", vsid);
-        g_vsfn[vsid] = [lib newFunctionWithName:[NSString stringWithUTF8String:nm]];
-        if (!g_vsfn[vsid])
+        g_vsfn[vsid] = vfn;
+        if (!vfn)
             fprintf(stderr, "vertex shader %d: function not found\n", vsid);
 #if NFS_ENHANCED
-        if (vsid < HD_MAXVSI && hd_rt_on()){
-            snprintf(nm, sizeof nm, "vsk_%d", vsid);
-            id<MTLFunction> kf = [lib newFunctionWithName:[NSString stringWithUTF8String:nm]];
-            NSError *ke = nil;
-            if (kf) g_hd_vsk[vsid] = [g_dev newComputePipelineStateWithFunction:kf error:&ke];
-            if (!g_hd_vsk[vsid]) fprintf(stderr, "[HD] capture kernel vs_%d could not be built: %s\n", vsid,
-                                         ke ? [[ke localizedDescription] UTF8String] : "no function");
+        if (want_k){
+            g_hd_vsk[vsid] = vsk;
+            if (!vsk) fprintf(stderr, "[HD] capture kernel vs_%d could not be built: %s\n", vsid,
+                              ke ? [[ke localizedDescription] UTF8String] : "no function");
         }
 #endif
     }
@@ -6954,13 +6977,17 @@ void metal_run_main_loop(void){
                         { static long yk = -2; if (yk == -2){ const char *e = ENVC("YAKALAKARE"); yk = e ? atol(e) : -1; }
                           if (fno_pre == yk) atomic_store(&g_dump_req, 1); }   /* test of the shortcut */
                         if (atomic_exchange(&g_dump_req, 0)){
-                            g_dump_req_f = fno_pre;
+                            /* a burst of consecutive frames (CAPBURST, default 8): flicker
+                             * only shows between frames; the draw list is written for the first */
+                            static long burst = -1;
+                            if (burst < 0){ const char *e = ENVC("CAPBURST"); burst = e ? atol(e) : 8; if (burst < 1) burst = 1; if (burst > 64) burst = 64; }
+                            g_dump_req_f = fno_pre; g_dump_req_end = fno_pre + burst - 1;
                             if (!g_dump_n){ const char *pl = getenv("PERFLOG"), *h = getenv("HOME");
                                 if (pl && *pl) snprintf(g_dump_dir, sizeof g_dump_dir, "%s", pl);
                                 else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/Library/Logs/NFSU2", h ? h : "/tmp"); }
-                            fprintf(stderr, "capture: frame %ld (Cmd+Shift+D) -> %s\n", fno_pre, g_dump_dir);
+                            fprintf(stderr, "capture: frames %ld-%ld (Cmd+Shift+D) -> %s\n", fno_pre, g_dump_req_end, g_dump_dir);
                         }
-                        int  dumpnow = (g_dump_n || g_dump_req_f == fno_pre) && dump_wanted(fno_pre);
+                        int  dumpnow = (g_dump_n || (g_dump_req_f >= 0 && fno_pre >= g_dump_req_f && fno_pre <= g_dump_req_end)) && dump_wanted(fno_pre);
                         /* GLYPHDUMP: screen box + UV of every quad.
                          * Goal: decode the TEXT the game writes and read its state. */
                         if (ENVC("GLYPHDUMP") && dumpnow && rb >= 0){
