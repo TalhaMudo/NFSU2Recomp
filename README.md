@@ -287,7 +287,10 @@ with `swiftc`): it finds and checks `SPEED2.EXE`, offers full screen, opens the
 logs folder and manages saves (**Saves…**: the career profiles, backups, ZIP
 export and import; the current saves are backed up before an import replaces
 them; tests/save_manager.sh). **Settings…** (Cmd-,) holds the options on tabs:
-Original or HD graphics and the HUD on **Graphics**; on **Controls**, the game
+Original or HD graphics and the HUD on **Graphics**; on **Picture**, optional
+settings of the HD engine only (the PC version's colour tint, console gamma, edge
+smoothing, sharpening; `TINT` / `CONSOLEGAMMA` / `EDGEAA` / `SHARPEN`, all off by
+default; the Original engine ignores them); on **Controls**, the game
 controller on or off, its stick dead zone and the XtendedInput layout
 (`NFSU2_PAD` / `NFSU2_PAD_DEADZONE` / `NFSU2_XTINPUT`, which still win when set by
 hand); on **More**, **Make Copy…** builds a portable

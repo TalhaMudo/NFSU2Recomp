@@ -83,6 +83,7 @@ enum Prefs {
         OriginalValue(\.wideHUD, false),
         OriginalValue(\.frameRate, 120),
         OriginalValue(\.fpsCounter, false),
+        OriginalValue(\.picture, PictureOptions.original),
     ]
 }
 
@@ -94,6 +95,40 @@ struct OriginalValue {
         restore = { $0[keyPath: option] = value }
         isSet = { $0[keyPath: option] == value }
     }
+}
+
+/// Settings › Picture: optional picture settings of the HD engine, each passed to it as
+/// an environment variable (runtime/visual.c, runtime/picture.m; the original engine
+/// ignores them).  The first choice of every option is the original game and sets nothing.
+struct PictureOption {
+    let key: String                  // launcher default: the chosen index
+    let title: String
+    let description: String
+    let env: String
+    let choices: [(label: String, value: String)]
+}
+
+enum PictureOptions {
+    static let all: [PictureOption] = [
+        PictureOption(key: "LauncherColourTint", title: "Colour",
+                      description: "The yellow-green tint the PC version lays over the city. No tint keeps grey grey, Cool is a little bluer. The HUD and menus keep their colours.",
+                      env: "TINT",
+                      choices: [("As on PC (original)", ""), ("Less tint", "less"), ("No tint", "none"), ("Cool", "cool")]),
+        PictureOption(key: "LauncherGamma", title: "Gamma",
+                      description: "Console: the deeper, darker brightness curve of the Xbox 360 version.",
+                      env: "CONSOLEGAMMA",
+                      choices: [("As on PC (original)", ""), ("Console", "1")]),
+        PictureOption(key: "LauncherEdgeSmoothing", title: "Edge smoothing",
+                      description: "Softens the jagged outlines of cars, buildings, poles and wires. Textures and the HUD stay sharp.",
+                      env: "EDGEAA",
+                      choices: [("Off (original)", ""), ("On", "1")]),
+        PictureOption(key: "LauncherSharpening", title: "Sharpening",
+                      description: "Crisper textures in the city. The HUD is left alone.",
+                      env: "SHARPEN",
+                      choices: [("Off (original)", ""), ("Low", "50"), ("High", "100")]),
+    ]
+    /// Every option at its first choice: the original game.
+    static var original: [Int] { all.map { _ in 0 } }
 }
 
 enum Locator {

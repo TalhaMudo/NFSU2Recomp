@@ -29,6 +29,11 @@ final class LauncherModel: ObservableObject {
     @Published var stickDeadzone: Double { didSet { defaults.set(stickDeadzone, forKey: Prefs.stickDeadzone) } }
     private var setPad = false           // NFSU2_PAD / NFSU2_PAD_DEADZONE were set by us
     @Published var xtendedInput: Bool { didSet { defaults.set(xtendedInput, forKey: Prefs.xtendedInput) } }
+    /// Settings › Picture: PictureOptions.all[i] -> the chosen index (0 = the original game).
+    @Published var picture: [Int] { didSet { for (o, i) in zip(PictureOptions.all, picture) { defaults.set(i, forKey: o.key) } } }
+    /// Picture variables that were set by hand when the launcher started: those win.
+    private let pictureFromEnv = Set(PictureOptions.all.map { $0.env }
+                                         .filter { ProcessInfo.processInfo.environment[$0] != nil })
     private let xtendedInputFromEnv = ProcessInfo.processInfo.environment["NFSU2_XTINPUT"] != nil
     @Published var job: Job? = nil
     @Published var notice: String? = nil
@@ -66,6 +71,8 @@ final class LauncherModel: ObservableObject {
         controller = defaults.bool(forKey: Prefs.controller)
         stickDeadzone = min(0.5, max(0, defaults.double(forKey: Prefs.stickDeadzone)))
         xtendedInput = defaults.bool(forKey: Prefs.xtendedInput)
+        let d = defaults
+        picture = PictureOptions.all.map { o in min(max(d.integer(forKey: o.key), 0), o.choices.count - 1) }
     }
 
     /// runtime/xtinput.c has the North American v1.2 executable's addresses only.
@@ -156,6 +163,11 @@ final class LauncherModel: ObservableObject {
         }
         var e = engine
         if !hasEngine(e) { e = (e == .hd) ? .original : .hd }
+        // Picture options: HD engine only (the original engine ignores them anyway).
+        // Ours are set again on every Play; a variable set by hand still wins.
+        for (o, i) in zip(PictureOptions.all, picture) where !pictureFromEnv.contains(o.env) {
+            if e == .hd && i > 0 { setenv(o.env, o.choices[i].value, 1) } else { unsetenv(o.env) }
+        }
         let path = Paths.engine(loc.build, hd: e == .hd).path
         // A child process, not exec(): macOS attributes the child's file access to
         // this launcher (the "responsible" process), so folder permissions the

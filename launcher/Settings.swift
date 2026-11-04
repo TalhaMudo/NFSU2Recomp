@@ -24,7 +24,7 @@ enum SettingsTab: String, CaseIterable {
     case graphics, picture, controls, online, game, mods, more
 
     /// The tabs that have rows, in this order.
-    static let shown: [SettingsTab] = [.graphics, .controls, .more]
+    static let shown: [SettingsTab] = [.graphics, .picture, .controls, .more]
 
     var title: String { rawValue.capitalized }
     var icon: String {          // SF Symbols available on macOS 11
@@ -118,6 +118,34 @@ struct GraphicsSettings: View {
     }
 }
 
+/// HD engine only: the original engine is the game's 2004 picture.
+struct PictureSettings: View {
+    @ObservedObject var model: LauncherModel
+    private var active: Bool { model.engine == .hd && model.hasEngine(.hd) }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Card("Picture") {
+                Text(!model.hasEngine(.hd)
+                     ? "These need the HD engine, which is not in this app."
+                     : active ? "HD engine only. (original) is the game as it was on PC."
+                              : "HD engine only: choose HD in Graphics to use them. The Original engine always shows the game as it was on PC.")
+                    .font(.system(size: 11)).foregroundColor(active ? Theme.dim : Theme.accent)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(0..<PictureOptions.all.count, id: \.self) { i in
+                    let o = PictureOptions.all[i]
+                    SettingRow(title: o.title, description: o.description) {
+                        Picker("", selection: $model.picture[i]) {
+                            ForEach(0..<o.choices.count, id: \.self) { k in Text(o.choices[k].label).tag(k) }
+                        }
+                        .pickerStyle(MenuPickerStyle()).labelsHidden().fixedSize()
+                    }
+                    .disabled(!active).opacity(active ? 1 : 0.5)
+                }
+            }
+        }
+    }
+}
+
 struct ControlsSettings: View {
     @ObservedObject var model: LauncherModel
     var body: some View {
@@ -191,9 +219,10 @@ struct SettingsView: View {
     @ViewBuilder private var page: some View {
         switch tab {
         case .graphics: GraphicsSettings(model: model)
+        case .picture: PictureSettings(model: model)
         case .controls: ControlsSettings(model: model)
         case .more: MoreSettings(model: model)
-        case .picture, .online, .game, .mods: EmptyView()      // no rows yet
+        case .online, .game, .mods: EmptyView()      // no rows yet
         }
     }
 
