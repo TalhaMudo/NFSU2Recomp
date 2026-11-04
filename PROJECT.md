@@ -2328,3 +2328,20 @@ Also seen: one 62 ms stretch of game code without any Win32/COM/indirect call at
 `0x5c587d` (11.6 s in), where the sound threads cannot get the big lock; once in ~12
 runs it lasted long enough for an 88 ms gap. Ordered texture uploads overflowed 97
 times in the 2-hour log (those uploads fall back to immediate).
+
+## 2026-11-04: the sound watchdog restarted the device every frame without sound output
+
+`tools/check.sh` failed right after the issue #49 fixes: the game never reached the
+race, 1.1 GB of "sound buffers" filled the buffer heap in 1.4 seconds. With
+`NOSOUND=1` (every test run) no output is opened, but `GetCurrentPosition` still
+returned the mixer's cursor for a registered buffer, which never moves. The game's
+sound watchdog (around 0x726032: create the primary and an 88 KB stream buffer, Play,
+read the cursor) takes a cursor that stands still for a dead device and starts over.
+Before #49 this happened ~123 times until the 128 sound slots ran out and later
+buffers, without a slot, got the clock-based cursor; with slots given back at Release
+it never ended. Now the mixer cursor is used only while output runs
+(`audio_running()`, audio.m), otherwise the clock-based one. Measured (original,
+600 frames, NOSOUND=1): 5 sound buffers / 773 KB, was 19 MB before #49 and endless
+with it. With sound on the cursor moves and the watchdog never fired (24 buffers in
+the issue's 2-hour log). Also: check.sh sets `MATLOG=1`, since the `[matrix]` totals
+it checks are now behind it.

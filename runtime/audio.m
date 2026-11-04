@@ -281,6 +281,9 @@ void audio_cursors(int id, uint32_t *play, uint32_t *write){
  * diagnostic records with the audio dump. */
 double audio_time(void){ return (double)g_mixed_frames / (double)OUT_RATE; }
 uint32_t audio_cursor(int id){ uint32_t p; audio_cursors(id, &p, 0); return p; }
+/* Is sound output running (not NOSOUND, a device was opened)?  Without it the mixer
+ * cursors stand still; com.c GetCurrentPosition then uses its clock. */
+int audio_running(void){ return g_audio_on; }
 void audio_set_volume(int id, long millibel){
     if (id <= 0 || id >= MAXSND) return;
     /* DirectSound: 0 = full volume, -10000 = silent (hundredths of a dB) */

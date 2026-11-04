@@ -4404,8 +4404,13 @@ int com_call(CPU *c, uint32_t magic){
             /* If registered with the mixer use the REAL play cursor: the game's streaming
              * logic chooses where it writes based on it; if the estimated clock and the
              * real playback diverge, the sound breaks. */
+            /* Only while the mixer really plays (audio_running): with NOSOUND=1 or no output
+             * device its cursor never moves, the game's sound watchdog (0x726032) took the
+             * device for dead and restarted it every frame -- a new 88 KB buffer each time,
+             * which ran the buffer heap out once sound slots were reused (issue #49). */
+            int audio_running(void);
             { uint32_t sid = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
-              if (sid && playing){
+              if (sid && playing && audio_running()){
                   uint32_t rp=0, rw=0;
                   void audio_cursors(int, uint32_t*, uint32_t*);
                   audio_cursors((int)sid, &rp, &rw);
