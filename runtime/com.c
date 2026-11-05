@@ -1661,6 +1661,52 @@ static void texproj_push(void){
  * 0 and the caller falls back to the old (index expansion) path. */
 static struct { uint32_t n, vbo, ibo, isz; int32_t base; uint64_t gh; } g_ix;
 static uint64_t g_dip_ix = 0, g_dip_ixfb[6];
+/* Viewport size (SetViewport), for line width in pixels. */
+static uint32_t g_vp_w = 0, g_vp_h = 0;
+static uint64_t g_line_draws = 0, g_line_segs = 0;
+static int lines_on(void){ static int on = -1;
+    if (on < 0){ const char *e = ENVC("LINES"); on = !(e && *e == '0'); } return on; }
+
+/* LINES: D3D9 line lists / strips.  Metal is only fed triangles, so each segment
+ * becomes a thin quad, built from the vertices after the vertex shader (the CPU
+ * path).  It used to read the line vertices as a triangle list: the dyno chart's
+ * power / torque curves (LINESTRIP) came out as near-zero-area triangles, invisible.
+ * D3D9 lines are 1 pixel wide at the game's resolution; here the width follows the
+ * viewport height (1 pixel at 768 lines), so a curve stays as visible at 1898 lines.
+ * Lines are never culled in D3D9: with culling on, both windings are sent and exactly
+ * one survives; with it off, only one. */
+static void draw_lines_tv(const TVert *tv, uint32_t nv, uint32_t pt, unsigned tex){
+    static TVert q[4096];
+    float vw = g_vp_w ? (float)g_vp_w : 1024.f, vh = g_vp_h ? (float)g_vp_h : 768.f;
+    float half = vh / 768.f * 0.5f; if (half < 0.5f) half = 0.5f;
+    int both = g_rs[22] != 1u;                  /* CULLMODE != NONE */
+    uint32_t nseg = (pt == 2u) ? nv/2u : (nv ? nv-1u : 0u), n = 0;
+    uint32_t per = both ? 12u : 6u;
+    g_line_draws++;
+    for (uint32_t s2 = 0; s2 < nseg; s2++){
+        const TVert *a = &tv[pt == 2u ? 2u*s2 : s2], *b = &tv[pt == 2u ? 2u*s2+1u : s2+1u];
+        if (!(a->w > 0.f) || !(b->w > 0.f)) continue;
+        float ax = a->x/a->w*vw*0.5f, ay = a->y/a->w*vh*0.5f;
+        float bx = b->x/b->w*vw*0.5f, by = b->y/b->w*vh*0.5f;
+        float dx = bx-ax, dy = by-ay, len = sqrtf(dx*dx+dy*dy);
+        if (!(len > 1e-6f)){ dx = 1.f; dy = 0.f; len = 1.f; }
+        dx /= len; dy /= len;
+        /* normal offset + half a width along the line so strip joints have no gaps */
+        float nx = -dy*half, ny = dx*half, ex = dx*half, ey = dy*half;
+        TVert c[4] = { *a, *a, *b, *b };
+        const float sx[4] = { nx-ex, -nx-ex, nx+ex, -nx+ex }, sy[4] = { ny-ey, -ny-ey, ny+ey, -ny+ey };
+        for (int k = 0; k < 4; k++){
+            float w = c[k].w;
+            c[k].x += sx[k]*2.f/vw*w; c[k].y += sy[k]*2.f/vh*w;
+        }
+        if (n + per > 4096u){ metal_draw_tv(q, n, 4u, tex); n = 0; }
+        q[n++]=c[0]; q[n++]=c[1]; q[n++]=c[2];  q[n++]=c[1]; q[n++]=c[3]; q[n++]=c[2];
+        if (both){ q[n++]=c[0]; q[n++]=c[2]; q[n++]=c[1];  q[n++]=c[1]; q[n++]=c[2]; q[n++]=c[3]; }
+        g_line_segs++;
+    }
+    if (n) metal_draw_tv(q, n, 4u, tex);
+}
+
 static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     uint64_t _t0 = now_ns();
     static TVert tv[4096];
@@ -1746,7 +1792,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
      * D3D declaration and embedded in the shader.
      * An untranslatable shader (flow control etc.) doesn't silently run wrong:
      * vs_to_msl returns 0 and we fall back to the proven CPU path. */
-    if (prog && nel && stride && stride <= 256u && g_gpuvs){
+    int is_line = (pt == 2u || pt == 3u);
+    if (!is_line && prog && nel && stride && stride <= 256u && g_gpuvs){
         int gid = gpuvs_id(prog, g_cur_vs, g_cur_decl, el, nel);
         if (gid > 0){
             int  metal_draw_raw(const void*, unsigned, unsigned, unsigned,
@@ -1973,7 +2020,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
                         g_vsk.f[q][0],g_vsk.f[q][1],g_vsk.f[q][2],g_vsk.f[q][3]);
         }
     }
-    metal_draw_tv(tv, nv, pt, g_cur_tex);
+    if (is_line) draw_lines_tv(tv, nv, pt, g_cur_tex);
+    else metal_draw_tv(tv, nv, pt, g_cur_tex);
     return 1;
 }
 
@@ -2708,8 +2756,11 @@ int com_call(CPU *c, uint32_t magic){
                 draw_stats_save(ptype, stride_hist);
                 if (metal_available()){
                     uint32_t nprim=A(c,2), vp=A(c,3);
-                    uint32_t nv = (pt==4) ? nprim*3u : nprim+2u;
-                    if (vp && stride && nv >= 3 && nv < 4096u &&
+                    int line = (pt==2u || pt==3u);
+                    uint32_t nv = (pt==4) ? nprim*3u : pt==2u ? nprim*2u : pt==3u ? nprim+1u : nprim+2u;
+                    if (line && !lines_on()) nv = 0;
+                    if (pt == 1u) nv = 0;               /* points: not supported */
+                    if (vp && stride && nv >= (line ? 2u : 3u) && nv < 4096u &&
                         mem_is_committed(vp) && mem_is_committed(vp + nv*stride - 1))
                         draw_up(pt, nv, vp, stride);
                 }
@@ -3549,6 +3600,7 @@ int com_call(CPU *c, uint32_t magic){
         else if (MID(SetViewport)){
             static int nv2=0;
             uint32_t vp2=A(c,1);
+            if (vp2 && mem_is_committed(vp2+15)){ g_vp_w = MR32(vp2+8); g_vp_h = MR32(vp2+12); }
             if (ENVC("XFORM") && nv2<6 && vp2 && mem_is_committed(vp2+23)){ nv2++;
                 fprintf(stderr,"  [SetViewport] x=%u y=%u g=%u y=%u minZ=%.3f maxZ=%.3f\n",
                         MR32(vp2), MR32(vp2+4), MR32(vp2+8), MR32(vp2+12),
@@ -4923,6 +4975,8 @@ void com_report(void){
         fprintf(stderr,"  --- DrawPrimitiveUP: primitive types ---\n");
         for (int i=0;i<8;i++) if (g_ptype[i])
             fprintf(stderr,"    %-16s %llu\n", PT[i], (unsigned long long)g_ptype[i]);
+        if (g_line_draws) fprintf(stderr,"    lines drawn as quads: %llu draws, %llu segments\n",
+                                  (unsigned long long)g_line_draws, (unsigned long long)g_line_segs);
         fprintf(stderr,"  --- vertex stride sizes ---\n");
         for (int i=0;i<64;i++) if (g_stride[i])
             fprintf(stderr,"    %3d bytes  %llu\n", i*4, (unsigned long long)g_stride[i]);
