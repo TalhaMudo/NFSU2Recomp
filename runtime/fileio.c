@@ -86,6 +86,31 @@ static int resolve_in(const char *root, const char *win, char *out, size_t outsz
     return !missing;
 }
 
+/* Does this host path exist, with the last component matched case-insensitively?
+ * On a hit the real name is written back into path.  Needed on case-sensitive
+ * volumes, where the game asks for "STREETXTUT_en.vp6" but the file is
+ * "StreetXTut_en.vp6" (issue #4). */
+static int stat_ci(char *path, size_t sz){
+    struct stat st;
+    if (stat(path, &st) == 0) return 1;
+    char *slash = strrchr(path, '/');
+    if (!slash) return 0;
+    *slash = 0;
+    DIR *d = opendir(path);
+    *slash = '/';
+    if (!d) return 0;
+    struct dirent *e; int found = 0;
+    while ((e = readdir(d))){
+        if (!strcasecmp(e->d_name, slash + 1)){
+            size_t dl = (size_t)(slash - path) + 1;
+            if (dl + strlen(e->d_name) < sz){ strcpy(slash + 1, e->d_name); found = 1; }
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
 /* Does the game folder hold this file?  Windows-style path, case-insensitive. */
 int fileio_game_file_exists(const char *win){
     char p[1024]; struct stat st;
@@ -282,7 +307,7 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
                     if (base >= 3 && real[base-3] == '_') cut = base - 3;
                     snprintf(alt, sizeof alt, "%.*s%s%s",
                              (int)cut, real, sfx[q], dot);
-                    if (stat(alt, &_st) == 0){
+                    if (stat_ci(alt, sizeof alt)){
                         if (getenv("VERBOSE") || getenv("FILELIST"))
                             fprintf(stderr,"  [file] language fallback: \"%s\" -> \"%s\"\n",
                                     real, alt);
