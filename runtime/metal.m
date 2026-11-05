@@ -3155,7 +3155,14 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
                 if (d < bd){ bd = d; best = (int)s; if (d == 0.f) break; }
             }
             if (best < 0){ pend[npend++] = (uint16_t)i; continue; }
-            if (bd > mv2){ ok = 0; atomic_fetch_add(&g_rt_nmoved, 1ull); break; }      /* see POSITION CHECK */
+            if (bd > mv2){ ok = 0; atomic_fetch_add(&g_rt_nmoved, 1ull);
+                /* HD_RT_MOVELOG=<n> (diagnostic): which draw broke the position check */
+                { static int ml = -1, mn = 0; if (ml < 0){ const char *e = ENVC("HD_RT_MOVELOG"); ml = e ? atoi(e) : 0; }
+                  if (mn < ml){ mn++; RTSlot *sl = &g_ls[best];
+                    fprintf(stderr, "[HD] RT move: draw %u vs %d ps %d tex %u tris %u gh %llx moved %.1f (now %.1f %.1f %.1f, built %.1f %.1f %.1f) blend %u depth %u\n",
+                            i, dr->vsid, dr->ps, dr->tex, n / 3u, dr->gh, sqrtf(bd), g_rt_dp[i][0], g_rt_dp[i][1], g_rt_dp[i][2],
+                            sl->bp[0], sl->bp[1], sl->bp[2], dr->blend, dr->depth); } }
+                break; }      /* see POSITION CHECK */
             g_ls[best].taken = 1; pfirst[i] = g_ls[best].first; pslot[i] = (uint16_t)best;
         }
         /* slots nobody took this frame become holes (collapsed below) */
@@ -5847,6 +5854,15 @@ void metal_early_init(void){
                                                [[e4 localizedDescription] UTF8String]);
                 }
             }
+            /* RT setup at startup, not on the first 3D frame: it compiles the ray
+             * kernels and allocates the stores.  Done lazily it took ~0.5 s on the main
+             * menu's garage scene (the "load this save?" dialog): picture and sound
+             * stalled.  Here it runs before the boot movies. */
+            if (hd_rt_on()){
+                CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+                hd_rt_init();
+                fprintf(stderr, "[HD] RT set up at startup: %.0f ms\n", (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+            }
 #endif
         }
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
@@ -6438,6 +6454,85 @@ static int fs_pref_load(void){
     const char *e = ENVC("NFSFULL");
     if (e && *e) return e[0] != '0';
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"NFSUFullScreen"] ? 1 : 0;
+}
+
+/* ---- DRAWABLE WITHOUT STALLING THE GAME ------------------------------------
+ * nextDrawable blocks until the window server gives a drawable back.  During a
+ * Space / Mission Control swipe (three fingers on the trackpad) it gives none for
+ * ~0.5 s: the main thread waited, the guest waited for the main thread, nobody
+ * refilled the sound buffers -- picture AND sound stalled (session 2026-11-05,
+ * t=551.7 s: 528 ms in nextDrawable).  Now the drawable is asked for on another
+ * thread, one frame ahead.  The frame waits for it at most DQ_WAIT_MS (normally it
+ * comes with vsync, well under that); if it doesn't come, the frame is drawn into a
+ * private texture and not shown, and while the request is still out the next frames
+ * don't wait at all.  The game keeps its pace, so do the sound and the timers.
+ * A drawable of the wrong size (the window changed meanwhile) is dropped.
+ * DRAWQ=0 old behavior (nextDrawable on the main thread). */
+#define DQ_WAIT_MS 50
+static dispatch_queue_t     g_dq_q;
+static dispatch_semaphore_t g_dq_sem;
+static id<CAMetalDrawable>  g_dq_d;          /* the delivered drawable (main thread takes it) */
+static int g_dq_pending, g_dq_late;          /* request out / the last wait timed out */
+static unsigned long long g_dq_skipped, g_dq_dropped;
+static int drawq_on(void){ static int on = -1;
+    if (on < 0){ const char *e = ENVC("DRAWQ"); on = !(e && *e == '0'); } return on; }
+static void dq_request(void){
+    if (g_dq_pending) return;
+    if (!g_dq_q){ g_dq_q = dispatch_queue_create("nfsu2.drawable", dispatch_queue_attr_make_with_qos_class(
+                      DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+                  g_dq_sem = dispatch_semaphore_create(0); }
+    g_dq_pending = 1;
+    dispatch_async(g_dq_q, ^{
+        /* DQSTALL=<frame>,<ms> (test): the window server "holds" the drawables once,
+         * as during a Space swipe */
+        { static long sf = -2; static int sms; if (sf == -2){ const char *e = ENVC("DQSTALL"); sf = -1;
+              if (e) sscanf(e, "%ld,%d", &sf, &sms); }
+          if (sf >= 0 && (long)atomic_load(&g_frames_drawn) >= sf){ sf = -1; usleep((useconds_t)sms * 1000u); } }
+        id<CAMetalDrawable> d = [g_layer nextDrawable];
+        g_dq_d = d;                               /* published by the semaphore */
+        dispatch_semaphore_signal(g_dq_sem);
+    });
+}
+/* the drawable for this frame, or nil: draw off screen, don't present */
+static id<CAMetalDrawable> dq_next(void){
+    if (!drawq_on()) return [g_layer nextDrawable];
+    dq_request();
+    long w = dispatch_semaphore_wait(g_dq_sem, g_dq_late ? DISPATCH_TIME_NOW
+                                     : dispatch_time(DISPATCH_TIME_NOW, (int64_t)DQ_WAIT_MS * 1000000));
+    if (w != 0){
+        /* A short hold (a swipe) runs at full pace; a long one (window hidden, another
+         * Space) is capped at ~30 frames a second, as before, so frames nobody sees
+         * don't burn power. */
+        static CFAbsoluteTime since; CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (!g_dq_late) since = now;
+        else if (now - since > 2.0 &&
+                 dispatch_semaphore_wait(g_dq_sem, dispatch_time(DISPATCH_TIME_NOW, 33 * 1000000LL)) == 0) w = 0;
+        if (w != 0){ g_dq_late = 1; g_dq_skipped++; return nil; }
+    }
+    g_dq_late = 0; g_dq_pending = 0;
+    id<CAMetalDrawable> d = g_dq_d; g_dq_d = nil;
+    CGSize ds = g_layer.drawableSize;
+    if (d && (d.texture.width != (NSUInteger)ds.width || d.texture.height != (NSUInteger)ds.height)){
+        g_dq_dropped++; d = nil;
+        dq_request();
+        if (dispatch_semaphore_wait(g_dq_sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)DQ_WAIT_MS * 1000000)) == 0){
+            g_dq_pending = 0; d = g_dq_d; g_dq_d = nil; }
+        else { g_dq_late = 1; g_dq_skipped++; return nil; }
+    }
+    if (!d) g_dq_skipped++;
+    return d;
+}
+/* the stand-in target of a frame that isn't shown (3 rotating private textures) */
+static id<MTLTexture> dq_offscreen(void){
+    static id<MTLTexture> ot[3]; static unsigned oi;
+    CGSize ds = g_layer.drawableSize; unsigned k3 = (oi++) % 3u;
+    if (!ot[k3] || ot[k3].width != (NSUInteger)ds.width || ot[k3].height != (NSUInteger)ds.height ||
+        ot[k3].pixelFormat != g_layer.pixelFormat){
+        MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:g_layer.pixelFormat
+            width:(NSUInteger)ds.width height:(NSUInteger)ds.height mipmapped:NO];
+        od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
+        ot[k3] = [g_dev newTextureWithDescriptor:od]; }
+    return ot[k3];
 }
 
 /* ---- SYSTEM SHORTCUT BLOCK ---------------------------------------------
@@ -7177,14 +7272,7 @@ void metal_run_main_loop(void){
                      * capacity.  displaySyncEnabled=NO has no effect in an invisible window. */
                     id<CAMetalDrawable> d = nil; id<MTLTexture> dtex = nil;
                     { static int nd = -1; if (nd < 0) nd = ENVC("NODRAW") ? 1 : 0;
-                      if (nd){ static id<MTLTexture> ot[3]; static unsigned oi;
-                          CGSize ds = g_layer.drawableSize; unsigned k3 = (oi++) % 3u;
-                          if (!ot[k3] || ot[k3].width != (NSUInteger)ds.width || ot[k3].height != (NSUInteger)ds.height){
-                              MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:g_layer.pixelFormat
-                                  width:(NSUInteger)ds.width height:(NSUInteger)ds.height mipmapped:NO];
-                              od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
-                              ot[k3] = [g_dev newTextureWithDescriptor:od]; }
-                          dtex = ot[k3]; }
+                      if (nd) dtex = dq_offscreen();
                       else if (noshow && g_flush_tid && g_flush_tid < MAXTEX){
                           /* an off-screen flush: the screen goes into a texture the next frame copies back */
                           CGSize ds = g_layer.drawableSize;
@@ -7196,7 +7284,7 @@ void metal_run_main_loop(void){
                               od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
                               ft = [g_dev newTextureWithDescriptor:od]; g_tex[g_flush_tid] = ft; }
                           dtex = ft; }
-                      else { d = [g_layer nextDrawable]; dtex = d.texture;
+                      else { d = dq_next(); dtex = d ? d.texture : dq_offscreen();
                              if (d && fbonly_on()) dtex = fbonly_mid(d.texture); } }
                     clock_gettime(CLOCK_MONOTONIC,&_d1);
                     atomic_fetch_add(&g_wait_drawable_ns,
@@ -8748,6 +8836,9 @@ void metal_budget_report(void){
             (double)atomic_load(&g_wait_present_ns)/(double)fr/1e6,
             (double)atomic_load(&g_wait_frame_ns)/(double)fr/1e6,
             (double)atomic_load(&g_wait_drawable_ns)/(double)fr/1e6);
+    fprintf(stderr, "  drawable          : %s; frames not shown (no drawable within %d ms) %llu, wrong-size drawables dropped %llu\n",
+            drawq_on() ? "asked one frame ahead on its own thread" : "nextDrawable on the main thread [DRAWQ=0]",
+            DQ_WAIT_MS, g_dq_skipped, g_dq_dropped);
     fprintf(stderr, "  render passes     : %.1f/frame,  draw calls: %.0f/frame\n",
             (double)atomic_load(&g_pass_n)/(double)fr,
             (double)atomic_load(&g_draw_n)/(double)fr);
