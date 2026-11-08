@@ -1435,7 +1435,8 @@ static void vsk_copy_used(VSConst *dst, const VSConst *src, const VSProg *prog){
  * it once and keep it (-2 = not looked at yet). */
 static int8_t g_pos_cx[MAXVS], g_pos_cw[MAXVS]; static uint8_t g_pos_seen[MAXVS];
 static unsigned long g_asp_np[MAXVS], g_asp_no[MAXVS]; static float g_asp_cw3[MAXVS];
-/* Is this orthographic draw a full-width bar (clip x -1..1, part of the height)?
+/* Is this orthographic draw a full-width bar (clip x -1..1, part of the height)
+ * or a full-screen filter (see below)?
  * The cinematic letterbox bars are.  With HUDFIX they were narrowed to the centre
  * like the HUD, so in a cinematic the bars stopped at the old 4:3 edges and the
  * scene showed through at the sides.  Such bars are left at full width.  Only
@@ -1444,6 +1445,8 @@ static unsigned long g_asp_np[MAXVS], g_asp_no[MAXVS]; static float g_asp_cw3[MA
 typedef struct { uint32_t vp, nv, stride; int p_off, p_type; } VtxView;
 static unsigned long g_asp_wide = 0;
 static float g_wide_ylo, g_wide_yhi;
+/* size of each Metal texture id as created (CreateTexture), for ortho_full_width */
+static uint16_t g_tid_w[65536], g_tid_h[65536];
 static int ortho_full_width(const VSConst *vsk, int cx, const VtxView *vv){
     if (!vv || !vv->vp || !vv->nv || vv->nv > 64u || !vv->stride || vv->p_off < 0) return 0;
     if (vv->p_type != 2 && vv->p_type != 3) return 0;        /* FLOAT3 / FLOAT4 */
@@ -1463,7 +1466,17 @@ static int ortho_full_width(const VSConst *vsk, int cx, const VtxView *vv){
     /* Bars only: full width but part of the height and on screen (measured: the
      * cinematic bars are y 0.75..1 and -1..-0.75).  A full-screen picture (splash,
      * loading screen, y -1..1 or larger) keeps its 4:3 shape. */
-    return lo <= -0.98f && hi >= 0.98f && (yhi - ylo) < 1.9f && yhi > -1.f && ylo < 1.f;
+    if (!(lo <= -0.98f && hi >= 0.98f)) return 0;
+    if ((yhi - ylo) < 1.9f && yhi > -1.f && ylo < 1.f) return 1;
+    /* A full-screen quad with no texture or a tiny one (<= 64 px) is a screen
+     * filter, not a picture: the rain darkening is a 16x16 texture over the whole
+     * screen (issue #52).  Squeezed, it left lighter strips at the sides.  Splash
+     * and loading pictures (1024x1024) keep their 4:3 shape. */
+    if (ylo <= -0.98f && yhi >= 0.98f){
+        unsigned t = g_tex_stage[0];
+        if (!t || (t < 65536u && g_tid_w[t] && g_tid_w[t] <= 64u && g_tid_h[t] <= 64u)) return 1;
+    }
+    return 0;
 }
 static int hudpos_on(void){ static int v = -1; if (v < 0){ const char *e = ENVC("HUDPOS"); v = (e && *e == '1'); } return v; }
 static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog, const VtxView *vv){
@@ -3710,6 +3723,8 @@ int com_call(CPU *c, uint32_t magic){
                 /* D3DUSAGE_RENDERTARGET = 1 */
                 uint32_t tid = metal_create_texture_ex(mw,mh,mlev,fmt,(usage & 1u)?1u:0u);
                 MR32(t+28)=tid;
+                if (tid && tid < 65536u){ g_tid_w[tid] = (uint16_t)(mw > 65535u ? 65535u : mw);
+                                          g_tid_h[tid] = (uint16_t)(mh > 65535u ? 65535u : mh); }
                 { void metal_tex_set_owner(unsigned, uint32_t); metal_tex_set_owner(tid, t); }
                 if (ekind == ENH_ROAD && tid){ void metal_hd_mark_road(unsigned,unsigned,unsigned);
                                                metal_hd_mark_road(tid, w, h); }
