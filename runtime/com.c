@@ -226,6 +226,11 @@ static void gbuf_free(uint32_t p){
     pthread_mutex_unlock(&g_gb_lk);
 }
 static uint32_t gbuf_alloc(uint32_t n){
+    /* GBUFBIG=<bytes> (diagnostic): name the guest caller of every larger buffer */
+    { static long big = -1; if (big < 0){ const char *e = getenv("GBUFBIG"); big = e ? atol(e) : 0; }
+      extern CPU *g_cur_cpu;
+      if (big && n >= (uint32_t)big && g_cur_cpu)
+          fprintf(stderr, "  [gbuf] %u bytes, guest return 0x%08x\n", n, MR32(g_cur_cpu->esp)); }
     n=(n+63)&~63u;
     pthread_mutex_lock(&g_gb_lk);
     gbuf_init();

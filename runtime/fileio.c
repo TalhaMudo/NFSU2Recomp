@@ -25,11 +25,40 @@ uint64_t g_file_open=0, g_file_fail=0, g_file_read=0, g_bytes_read=0;
 uint64_t g_overlapped_reads=0;
 static int g_empty_next = 0;
 
+/* --- mod layer (NFSU2_MODS=<folder>) ----------------------------------------
+ * The launcher's Mods tab (launcher/Mods.swift) installs the turned-on mods into a
+ * folder of its own: the files the mods changed or added, at their game-folder
+ * paths, and in ".deleted" the game files a mod removed (one path per line,
+ * '/'-separated).  Reads look there after the save layer and before the game
+ * folder; a folder that only the mods have (scripts\ for a plugin) is taken from
+ * there, a folder both have is listed from both.  Nothing is written there.
+ * Not set: only the game's own files.                                        */
+static char g_mroot[1024] = "";
+static char **g_mdel; static int g_nmdel;
+static void mods_load_deleted(void){
+    char p[1100]; snprintf(p, sizeof p, "%s/.deleted", g_mroot);
+    FILE *f = fopen(p, "r"); if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)){
+        size_t l = strlen(line); while (l && (line[l-1]=='\n' || line[l-1]=='\r')) line[--l] = 0;
+        if (!l) continue;
+        g_mdel = realloc(g_mdel, sizeof *g_mdel * (size_t)(g_nmdel + 1));
+        g_mdel[g_nmdel++] = strdup(line);
+    }
+    fclose(f);
+}
+
 void fileio_set_root(const char *exe_path){
     strncpy(g_root, exe_path, sizeof g_root - 1);
     char *slash = strrchr(g_root, '/');
     if (slash) *slash = 0; else strcpy(g_root, ".");
     fprintf(stderr,"file: game root directory = %s\n", g_root);
+    const char *m = getenv("NFSU2_MODS"); struct stat st;
+    if (m && *m && stat(m, &st) == 0 && S_ISDIR(st.st_mode)){
+        snprintf(g_mroot, sizeof g_mroot, "%s", m);
+        mods_load_deleted();
+        fprintf(stderr,"file: mod files = %s (%d game files removed by mods)\n", g_mroot, g_nmdel);
+    }
 }
 
 /* Convert a Windows path to a real path.
@@ -86,6 +115,27 @@ static int resolve_in(const char *root, const char *win, char *out, size_t outsz
     return !missing;
 }
 
+/* The game-folder-relative form of a Windows path ("C:\\NFSU2\\TRACKS\\X.BUN" ->
+ * "TRACKS/X.BUN"), as resolve_in reads it. */
+static void win_rel(const char *win, char *rel, size_t sz){
+    const char *p = win; size_t k = 0;
+    if (p[0] && p[1]==':') p += 2;
+    while (*p=='\\' || *p=='/') p++;
+    if (!strncasecmp(p,"NFSU2",5) && (p[5]=='\\'||p[5]=='/'||p[5]==0)){ p += 5; while (*p=='\\'||*p=='/') p++; }
+    while (p[0]=='.' && (p[1]=='\\'||p[1]=='/')) p += 2;
+    for (; *p && k < sz-1; p++) rel[k++] = (*p=='\\') ? '/' : *p;
+    while (k && rel[k-1]=='/') k--;
+    rel[k] = 0;
+}
+/* Did a mod remove this game file (or a folder above it)? */
+static int mods_deleted(const char *rel){
+    for (int i = 0; i < g_nmdel; i++){
+        size_t l = strlen(g_mdel[i]);
+        if (!strncasecmp(rel, g_mdel[i], l) && (rel[l] == 0 || rel[l] == '/')) return 1;
+    }
+    return 0;
+}
+
 /* Does this host path exist, with the last component matched case-insensitively?
  * On a hit the real name is written back into path.  Needed on case-sensitive
  * volumes, where the game asks for "STREETXTUT_en.vp6" but the file is
@@ -110,6 +160,9 @@ static int stat_ci(char *path, size_t sz){
     closedir(d);
     return found;
 }
+/* Resolve a Windows path for reading (write root first, then the game root);
+ * for win32_asi.c's wide-character calls.  Defined after resolve() below. */
+int fileio_resolve_read(const char *win, char *out, size_t outsz);
 
 /* Does the game folder hold this file?  Windows-style path, case-insensitive. */
 int fileio_game_file_exists(const char *win){
@@ -142,15 +195,33 @@ void fileio_set_write_root(const char *dir){
     mkparents(g_wroot); mkdir(g_wroot, 0755);
     fprintf(stderr,"file: save directory = %s\n", g_wroot);
 }
-/* Read: the write root if it exists there, otherwise the game root. */
+/* Read: the write root if it exists there, then the mod layer, otherwise the game root. */
 static int resolve(const char *win, char *out, size_t outsz){
     if (g_wroot[0]){
         char w[1024];
         if (resolve_in(g_wroot, win, w, sizeof w) && strcmp(w, g_wroot) != 0){
             snprintf(out, outsz, "%s", w); return 1; }
     }
+    if (g_mroot[0]){
+        char w[1024], rel[1024]; struct stat st;
+        win_rel(win, rel, sizeof rel);
+        if (rel[0] && resolve_in(g_mroot, win, w, sizeof w) && stat(w, &st) == 0){
+            char g[1024]; struct stat gs;
+            if (S_ISREG(st.st_mode) || !(resolve_in(g_root, win, g, sizeof g) && stat(g, &gs) == 0)){
+                if (S_ISREG(st.st_mode)){   /* the first open of each file is logged */
+                    static uint32_t seen[1024]; static int nseen = 0;
+                    uint32_t hsh = 2166136261u; for (const char *q = rel; *q; q++) hsh = (hsh ^ (uint8_t)(*q | 0x20)) * 16777619u;
+                    int known = 0; for (int i = 0; i < nseen; i++) if (seen[i] == hsh){ known = 1; break; }
+                    if (!known && nseen < 1024){ seen[nseen++] = hsh; fprintf(stderr, "  [file] mod: %s\n", rel); }
+                }
+                snprintf(out, outsz, "%s", w); return 1; }
+        }
+        if (rel[0] && mods_deleted(rel)){       /* removed by a mod: a path that isn't there */
+            snprintf(out, outsz, "%s/%s", g_mroot, rel); return 0; }
+    }
     return resolve_in(g_root, win, out, outsz);
 }
+int fileio_resolve_read(const char *win, char *out, size_t outsz){ return resolve(win, out, outsz); }
 /* Write: ALWAYS the write root if there is one. */
 static int resolve_w(const char *win, char *out, size_t outsz){
     return resolve_in(g_wroot[0] ? g_wroot : g_root, win, out, outsz);
@@ -177,7 +248,9 @@ static void copy_up(const char *win, const char *wpath){
 #define FH_BASE 0x00900000u
 #define FH_MAX  256
 typedef struct { int fd; int empty; int used; char path[512]; DIR *dir; char pat[128];
-                 DIR *dir2; char path1[512]; } FH;   /* dir2: the game root (while the save layer is active) */
+                 DIR *dir2; char path1[512];         /* dir2: the game root (while the save layer is active) */
+                 DIR *dir3; char path3[512];         /* dir3: the mod layer (NFSU2_MODS) */
+                 char rel[512]; } FH;                /* the scanned folder, game-relative ('/'), for .deleted */
 static FH g_fh[FH_MAX];
 static uint32_t fh_new(void){
     for (int i=1;i<FH_MAX;i++) if(!g_fh[i].used){ memset(&g_fh[i],0,sizeof g_fh[i]);
@@ -215,22 +288,35 @@ static int win_match(const char *pat, const char *name){
 /* Give the next name in a directory scan: write root first, then the game root.
  * full: the real path of the entry found (for attributes/size). */
 static int find_next(FH *f, char *nm, size_t nsz, char *full, size_t fsz){
-    struct dirent *e;
-    if (f->dir){
+    struct dirent *e; char p[1100]; struct stat st;
+    if (f->dir){                                     /* 1. the save layer */
         while ((e = readdir(f->dir))){
             if (e->d_name[0] == '.') continue;
             if (!win_match(f->pat, e->d_name)) continue;
             snprintf(full, fsz, "%s/%s", f->path1, e->d_name);
             snprintf(nm, nsz, "%s", e->d_name); return 1; }
     }
-    if (f->dir2){
+    if (f->dir3){                                    /* 2. the mod layer */
+        while ((e = readdir(f->dir3))){
+            if (e->d_name[0] == '.') continue;
+            if (!win_match(f->pat, e->d_name)) continue;
+            if (f->path1[0]){ snprintf(p, sizeof p, "%s/%s", f->path1, e->d_name); if (stat(p, &st) == 0) continue; }
+            snprintf(full, fsz, "%s/%s", f->path3, e->d_name);
+            snprintf(nm, nsz, "%s", e->d_name); return 1; }
+    }
+    if (f->dir2){                                    /* 3. the game folder */
         while ((e = readdir(f->dir2))){
             if (e->d_name[0] == '.') continue;
             if (!win_match(f->pat, e->d_name)) continue;
-            if (f->path1[0]){               /* already given from the write root */
-                char p[1024]; struct stat st;
+            if (f->path1[0]){               /* already given from the save layer */
                 snprintf(p, sizeof p, "%s/%s", f->path1, e->d_name);
                 if (stat(p, &st) == 0) continue; }
+            if (f->path3[0]){               /* ... or from the mod layer */
+                snprintf(p, sizeof p, "%s/%s", f->path3, e->d_name);
+                if (stat(p, &st) == 0) continue; }
+            if (g_nmdel){                   /* removed by a mod */
+                snprintf(p, sizeof p, "%s%s%s", f->rel, f->rel[0] ? "/" : "", e->d_name);
+                if (mods_deleted(p)) continue; }
             snprintf(full, fsz, "%s/%s", f->path, e->d_name);
             snprintf(nm, nsz, "%s", e->d_name); return 1; }
     }
@@ -521,29 +607,37 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
         if (g_wroot[0]){
             if (win[0]) resolve_in(g_wroot, win, wreal, sizeof wreal);
             else snprintf(wreal, sizeof wreal, "%s", g_wroot); }
+        char mreal[1024]; mreal[0] = 0;
+        if (g_mroot[0]){
+            if (win[0]) resolve_in(g_mroot, win, mreal, sizeof mreal);
+            else snprintf(mreal, sizeof mreal, "%s", g_mroot); }
+        char rel[512]; rel[0] = 0; if (win[0]) win_rel(win, rel, sizeof rel);
         DIR *d1 = wreal[0] ? opendir(wreal) : 0;
-        DIR *d2 = opendir(real);
-        if(!d1 && !d2){ r=INVALID_HANDLE; }
+        DIR *d3 = mreal[0] ? opendir(mreal) : 0;
+        DIR *d2 = (rel[0] && mods_deleted(rel)) ? 0 : opendir(real);
+        if(!d1 && !d2 && !d3){ r=INVALID_HANDLE; }
         else { uint32_t h=fh_new(); FH*f=fh_get(h);
-               if(!f){ if(d1) closedir(d1); if(d2) closedir(d2); r=INVALID_HANDLE; }
-               else { f->dir=d1; f->dir2=d2; snprintf(f->pat,sizeof f->pat,"%s",pat);
-                      snprintf(f->path1,sizeof f->path1,"%s",wreal);
+               if(!f){ if(d1) closedir(d1); if(d2) closedir(d2); if(d3) closedir(d3); r=INVALID_HANDLE; }
+               else { f->dir=d1; f->dir2=d2; f->dir3=d3; snprintf(f->pat,sizeof f->pat,"%s",pat);
+                      snprintf(f->path1,sizeof f->path1,"%s",d1 ? wreal : "");
+                      snprintf(f->path3,sizeof f->path3,"%s",d3 ? mreal : "");
                       snprintf(f->path,sizeof f->path,"%s",real);
+                      snprintf(f->rel,sizeof f->rel,"%s",rel);
                       char nm[260], full[1400];
                       if (!find_next(f, nm, sizeof nm, full, sizeof full)){
-                          if(f->dir) closedir(f->dir); if(f->dir2) closedir(f->dir2);
+                          if(f->dir) closedir(f->dir); if(f->dir2) closedir(f->dir2); if(f->dir3) closedir(f->dir3);
                           f->used=0; r=INVALID_HANDLE; }
                       else { fill_find_data(A(c,1), full, nm); r=h; } } }
     }
     else if (!strcmp(n,"FindNextFileA")){
         FH*f=fh_get(A(c,0)); r=0; char nm[260], full[1400];
-        if(f && (f->dir || f->dir2) && find_next(f, nm, sizeof nm, full, sizeof full)){
+        if(f && (f->dir || f->dir2 || f->dir3) && find_next(f, nm, sizeof nm, full, sizeof full)){
             fill_find_data(A(c,1), full, nm);
             r=1; }
     }
     else if (!strcmp(n,"FindClose")){
         FH*f=fh_get(A(c,0));
-        if(f){ if(f->dir) closedir(f->dir); if(f->dir2) closedir(f->dir2); f->used=0; } r=1;
+        if(f){ if(f->dir) closedir(f->dir); if(f->dir2) closedir(f->dir2); if(f->dir3) closedir(f->dir3); f->used=0; } r=1;
     }
     else return 0;
     *out = r;

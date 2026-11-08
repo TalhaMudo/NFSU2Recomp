@@ -467,7 +467,15 @@ class Lifter:
                     continue
                 if m in ('hlt','ud2'): break
                 va=i.address+i.size
-                if len(ins)>maxins: break
+                if len(ins)>maxins:
+                    # A very long straight-line block (an ASI plugin's static
+                    # initialisers: thousands of std::string constructions) is
+                    # split here; the rest is a block of its own, reached by the
+                    # fall-through goto.  Before, the rest was never discovered and
+                    # the C function ended in the middle of the guest function.
+                    if self.in_text(va) and va not in seen: seen.add(va); q.append(va)
+                    self.split_blocks = getattr(self, 'split_blocks', 0) + 1
+                    break
             blocks[ins[0].address if ins else va]=ins
         return blocks, calls
 
@@ -479,6 +487,10 @@ class Lifter:
 
     def insn(self, i, targets):
         m=i.mnemonic; ops=i.operands; o=ops
+        # "lock xadd" -> "xadd": guest code runs under one lock (the GIL) and is
+        # never preempted between blocking calls, so a locked read-modify-write
+        # is the plain one.  The exe has none; ASI plugins (MSVC CRT) have many.
+        if m.startswith('lock '): m = m[5:]
         E=lambda k: self.rd(o[k]); W=lambda k,v: self.wr(o[k],v)
         bits = (o[0].size*8) if o else 32
         L=[]
@@ -733,6 +745,19 @@ class Lifter:
             return [f"MR16{self.ea(o[0].mem)} = fsw_get(c);"]
         if m in ('fnstcw','fstcw'): return [f"MR16{self.ea(o[0].mem)} = c->fcw;"]
         if m=='fldcw':              return [f"c->fcw = MR16{self.ea(o[0].mem)};"]
+        # FPU environment, 32-bit protected mode layout (28 bytes): CW, SW, tag word,
+        # then instruction/operand pointers (stored as 0).  The tags are not
+        # tracked: "all empty" (0xFFFF).  fnstenv also masks every exception, as
+        # the hardware does.  The MSVC CRT's _statusfp/_controlfp use the pair.
+        if m in ('fnstenv','fstenv'):
+            ea = self.ea(o[0].mem)
+            return [f"{{ uint32_t _e = (uint32_t){ea}; MR32(_e) = c->fcw; MR32(_e+4) = fsw_get(c);"
+                    f" MR32(_e+8) = 0xFFFFu; MR32(_e+12) = 0; MR32(_e+16) = 0; MR32(_e+20) = 0; MR32(_e+24) = 0;"
+                    f" c->fcw |= 0x3Fu; }}"]
+        if m=='fldenv':
+            ea = self.ea(o[0].mem)
+            return [f"{{ uint32_t _e = (uint32_t){ea}; c->fcw = MR16(_e);"
+                    f" c->fsw = (uint16_t)(MR16(_e+4) & (uint16_t)~0x3800u); c->top = (MR16(_e+4) >> 11) & 7u; }}"]
         if m in ('ffree','ffreep','fnclex','fclex','fnop','fwait','wait','fdecstp','fincstp'):
             return [f"/* {m}: no effect in our model */"] + (["FPOP();"] if m=='ffreep' else [])
         if m in ('finit','fninit'):
@@ -1612,7 +1637,15 @@ class Lifter:
             m = i.mnemonic; pos = i.address + i.size
             if m == 'jmp' and i.operands[0].type == X86_OP_IMM:
                 t = i.operands[0].imm
-                if t not in lbl: raise XPatchError(f"xpatch {s.name}: jmp to {t:#x} is not a label")
+                if t not in lbl:
+                    # XPATCH_TAILJMP=1 (ASI plugins): a jump out of the function --
+                    # MakeJMP into the plugin, or to another game function -- is a
+                    # tail call.  Plugin code caves come back through resume
+                    # entries (tools/mods/asi_resume.py).
+                    if _os.environ.get('XPATCH_TAILJMP') != '1':
+                        raise XPatchError(f"xpatch {s.name}: jmp to {t:#x} is not a label")
+                    L.append(f"dispatch_indirect(c, 0x{t & 0xffffffff:x}u); return;   /* tail jump */")
+                    ends = True; break
                 L.append(f"goto L_{t:08x};"); ends = True; break
             if m.startswith('j') and m[1:] in CC and i.operands[0].type == X86_OP_IMM:
                 t = i.operands[0].imm
@@ -1704,7 +1737,16 @@ class Lifter:
                     xr_done.add(i.address)
                 if i.address in xsites:
                     if x87opt and xb.active: body += ["    "+l for l in xb.close()]
-                    body += ["    "+l for l in self._xp_emit(xsites[i.address], lbl, targets, set())]
+                    try:
+                        body += ["    "+l for l in self._xp_emit(xsites[i.address], lbl, targets, set())]
+                    except XPatchError as _e:
+                        # XPATCH_SOFT=<prefix>: a recorded plugin write that does not
+                        # lift as code is data the lifter took for code (a switch
+                        # index table inside .text); the write itself is enough.
+                        # Reported to genall as a negative address.
+                        _sp = _os.environ.get('XPATCH_SOFT')
+                        if not (_sp and xsites[i.address].name.startswith(_sp)): raise
+                        self.xp_hits.add((xsites[i.address].name, -xsites[i.address].a))
                 if x87opt and xb.active and (m=='jmp' or (m.startswith('j') and m[1:] in CC)
                         or m in ('jecxz','jcxz','loop','loope','loopz','loopne','loopnz')):
                     body += ["    "+l for l in xb.close()]
@@ -1764,6 +1806,16 @@ class Lifter:
                         body.append(f"    if({CC[m[1:]]}) {{ unsupported_insn(c, 0x{i.address:x}u, \"dal-disari\"); POP32(c->eip); return; }}")
                     nxt=i.address+i.size
                     if k==len(ins)-1 and nxt in lbl: body.append(f"    goto L_{nxt:08x};")
+                    continue
+                # PUSHRET=1 (ASI plugins): "push imm; ret" is a jump to imm.  Plugin
+                # code caves return into the middle of a game function this way
+                # (push 0x513CDA; retn); a plain ret would return to the C caller.
+                if (m == 'ret' and not i.operands and k > 0 and _os.environ.get('PUSHRET') == '1'
+                        and ins[k-1].mnemonic == 'push' and ins[k-1].operands[0].type == X86_OP_IMM):
+                    _t = ins[k-1].operands[0].imm & 0xffffffff
+                    if x87opt and xb.active: body += ["    "+l for l in xb.close()]
+                    if self.in_text(_t): body.append(f"    c->esp += 4u; goto L_{_t:08x};   /* push imm; ret */")
+                    else: body.append(f"    c->esp += 4u; dispatch_indirect(c, 0x{_t:x}u); return;   /* push imm; ret */")
                     continue
                 self.cur_fmask = self.fafter.get(i.address, F_ALL)
                 try:

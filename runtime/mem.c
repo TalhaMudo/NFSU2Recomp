@@ -224,6 +224,10 @@ int mem_load_pe(const char *path){
     mem_init();
     mem_commit(base, imgsz);                 /* the whole image range */
     g_image_end = base + imgsz;
+    /* the headers too, as Windows maps them: ASI plugins identify the exe by
+     * reading its entry point from the PE header at the image base */
+    { uint32_t hsz = *(uint32_t*)(nt+24+60); if (hsz > (uint32_t)sz) hsz = (uint32_t)sz;
+      memcpy(g_mem + base, buf, hsz); }
     for (int i=0;i<nsec;i++){
         uint8_t *s = sh + i*40;
         char nm[9]={0}; memcpy(nm,s,8);

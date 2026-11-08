@@ -41,6 +41,20 @@ final class LauncherModel: ObservableObject {
     private let xtendedInputFromEnv = ProcessInfo.processInfo.environment["NFSU2_XTINPUT"] != nil
     @Published var job: Job? = nil
     @Published var notice: String? = nil
+    // Settings › Mods (Mods.swift): the added mods, what each row says while it is
+    // being added / downloaded or after it failed, and the mod files being built.
+    @Published var mods: [InstalledMod] = []
+    @Published var modNote: [String: String] = [:]
+    @Published var modBusy: Set<String> = []
+    @Published var modsApplying: String? = nil
+    var modsPending = false, playAfterMods = false
+    var modsDoneHook: ((String?) -> Void)? = nil        // test hooks (main.swift)
+    var modsFailure: String? = nil                       // the last failure of this round
+    let modsFromEnv = ProcessInfo.processInfo.environment["NFSU2_MODS"] != nil
+    lazy var enginesHaveUnlimiter: Bool = {
+        let na = SupportedExe.builds.first { $0.engineSuffix == "-na" }
+        return [false, true].contains { Mods.engineHasUnlimiter(Paths.engine(na, hd: $0)) }
+    }()
 
     private let defaults = UserDefaults.standard
     private var builder: PortableBuilder?
@@ -80,6 +94,7 @@ final class LauncherModel: ObservableObject {
         reflectSky = d.bool(forKey: Prefs.reflectSky)
         reflectLights = d.bool(forKey: Prefs.reflectLights)
         reflectDetail = d.bool(forKey: Prefs.reflectDetail)
+        mods = Mods.load()
     }
 
     /// runtime/xtinput.c has the North American v1.2 executable's addresses only.
@@ -139,6 +154,16 @@ final class LauncherModel: ObservableObject {
     func play() {
         guard case .ready(let loc) = game else { return }
         let env = ProcessInfo.processInfo.environment
+        // Mods: their files must be built for this game first (Mods.swift).
+        let on = activeMods
+        if modsApplying != nil || (!on.isEmpty && !Mods.isBuilt(on, game: loc)) {
+            playAfterMods = true
+            if modsApplying == nil { applyMods() }
+            return
+        }
+        if !modsFromEnv {
+            if on.isEmpty { unsetenv("NFSU2_MODS") } else { setenv("NFSU2_MODS", Mods.files.path, 1) }
+        }
         let fromEnv = !(env["NFSU2_DATA"] ?? "").isEmpty      // a one-off override: don't remember it
         if !loc.embedded && !fromEnv { defaults.set(loc.folder.path, forKey: Prefs.gameFolder) }
         if !engineForced { defaults.set(engine.rawValue, forKey: Prefs.engine) }

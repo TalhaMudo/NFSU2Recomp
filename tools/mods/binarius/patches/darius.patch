@@ -1,0 +1,550 @@
+diff --git a/Nikki/Support.Underground2/Class/CarTypeInfo.cs b/Nikki/Support.Underground2/Class/CarTypeInfo.cs
+index 731180c..1fbedbf 100644
+--- a/Nikki/Support.Underground2/Class/CarTypeInfo.cs
++++ b/Nikki/Support.Underground2/Class/CarTypeInfo.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.IO;
+ using System.ComponentModel;
+ using System.Collections.Generic;
+@@ -24,6 +24,14 @@ namespace Nikki.Support.Underground2.Class
+     {
+         #region Fields
+ 
++        [MemoryCastable()]
++        private byte[] _raw_0x3E0;
++        [MemoryCastable()]
++        private byte[] _raw_rpm_street;
++        [MemoryCastable()]
++        private byte[] _raw_rpm_pro;
++        [MemoryCastable()]
++        private byte[] _raw_rpm_top;
+         private string _collection_name;
+ 
+         /// <summary>
+@@ -640,8 +648,8 @@ namespace Nikki.Support.Underground2.Class
+             bw.WriteNullTermUTF8(this._collection_name, 0x20);
+ 
+             // Write GeometryFileName
+-            string path1 = Path.Combine("CARS", this.CollectionName, "GEOMETRY.BIN");
+-            string path2 = Path.Combine("CARS", this.CollectionName, "GEOMETRY.LZC");
++            string path1 = @"CARS\" + this.CollectionName + @"\GEOMETRY.BIN"; // local change: the game's separator, not the host's
++            string path2 = @"CARS\" + this.CollectionName + @"\GEOMETRY.LZC";
+             bw.WriteNullTermUTF8(path1, 0x20);
+             bw.WriteNullTermUTF8(path2, 0x20);
+             bw.WriteBytes(0, 0x40);
+@@ -744,34 +752,38 @@ namespace Nikki.Support.Underground2.Class
+             this.DRIFT_ADD_CONTROL.Write(bw);
+ 
+             // Skip Street + Pro Engine and Street Turbo, 0x03E0 - 0x0450
+-            bw.Write(this.TOP_ENGINE.EngineTorque1 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque2 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque3 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque4 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque5 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque6 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque7 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque8 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque9 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque1 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque2 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque3 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque4 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque5 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque6 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque7 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque8 / 3);
+-            bw.Write(this.TOP_ENGINE.EngineTorque9 / 3);
+-            bw.Write(this.TOP_TURBO.TurboBraking / 10);
+-            bw.Write(this.TOP_TURBO.TurboVacuum / 10);
+-            bw.Write(this.TOP_TURBO.TurboHeatHigh / 10);
+-            bw.Write(this.TOP_TURBO.TurboHeatLow / 10);
+-            bw.Write(this.TOP_TURBO.TurboHighBoost / 10);
+-            bw.Write(this.TOP_TURBO.TurboLowBoost / 10);
+-            bw.Write(this.TOP_TURBO.TurboSpool / 10);
+-            bw.Write(this.TOP_TURBO.TurboSpoolTimeDown / 10);
+-            bw.Write(this.TOP_TURBO.TurboSpoolTimeUp / 10);
+-            bw.Write((int)0);
++            if (this._raw_0x3E0 != null && this._raw_0x3E0.Length == 0x70) bw.Write(this._raw_0x3E0);
++            else
++            {
++                bw.Write(this.TOP_ENGINE.EngineTorque1 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque2 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque3 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque4 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque5 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque6 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque7 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque8 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque9 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque1 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque2 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque3 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque4 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque5 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque6 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque7 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque8 / 3);
++                bw.Write(this.TOP_ENGINE.EngineTorque9 / 3);
++                bw.Write(this.TOP_TURBO.TurboBraking / 10);
++                bw.Write(this.TOP_TURBO.TurboVacuum / 10);
++                bw.Write(this.TOP_TURBO.TurboHeatHigh / 10);
++                bw.Write(this.TOP_TURBO.TurboHeatLow / 10);
++                bw.Write(this.TOP_TURBO.TurboHighBoost / 10);
++                bw.Write(this.TOP_TURBO.TurboLowBoost / 10);
++                bw.Write(this.TOP_TURBO.TurboSpool / 10);
++                bw.Write(this.TOP_TURBO.TurboSpoolTimeDown / 10);
++                bw.Write(this.TOP_TURBO.TurboSpoolTimeUp / 10);
++                bw.Write((int)0);
++            }
+ 
+             // Top Weight Reduction Performance
+             this.TOP_WEIGHT_REDUCTION.Write(bw);
+@@ -791,21 +803,21 @@ namespace Nikki.Support.Underground2.Class
+ 
+             // Street RPM Performance
+             this.STREET_RPM.Write(bw);
+-            bw.Write(this.TOP_ENGINE.SpeedRefreshRate / 3);
++            if (this._raw_rpm_street != null) bw.Write(this._raw_rpm_street); else bw.Write(this.TOP_ENGINE.SpeedRefreshRate / 3);
+ 
+             // Street ECU Performance
+             this.STREET_ECU.Write(bw);
+ 
+             // Pro RPM Performance
+             this.PRO_RPM.Write(bw);
+-            bw.Write(this.TOP_ENGINE.SpeedRefreshRate * 2 / 3);
++            if (this._raw_rpm_pro != null) bw.Write(this._raw_rpm_pro); else bw.Write(this.TOP_ENGINE.SpeedRefreshRate * 2 / 3);
+ 
+             // Pro ECU Performance
+             this.PRO_ECU.Write(bw);
+ 
+             // Top RPM Performance
+             this.TOP_RPM.Write(bw);
+-            bw.Write(this.TOP_ENGINE.SpeedRefreshRate);
++            if (this._raw_rpm_top != null) bw.Write(this._raw_rpm_top); else bw.Write(this.TOP_ENGINE.SpeedRefreshRate);
+ 
+             // Top ECU Performance
+             this.TOP_ECU.Write(bw);
+@@ -1029,7 +1041,9 @@ namespace Nikki.Support.Underground2.Class
+             this.DRIFT_ADD_CONTROL.Read(br);
+ 
+             // Skip Street + Pro Engine and Street Turbo, 0x03E0 - 0x0450
+-            br.BaseStream.Position += 0x70;
++            // Local change: kept as read (Nikki writes TOP / 3 there, which changed
++            // every car's street and pro engine on any save).
++            this._raw_0x3E0 = br.ReadBytes(0x70);
+ 
+             // Top Weight Reduction Performance
+             this.TOP_WEIGHT_REDUCTION.Read(br);
+@@ -1049,21 +1063,21 @@ namespace Nikki.Support.Underground2.Class
+ 
+             // Street RPM Performance
+             this.STREET_RPM.Read(br);
+-            br.BaseStream.Position += 4;
++            this._raw_rpm_street = br.ReadBytes(4);
+ 
+             // Street ECU Performance
+             this.STREET_ECU.Read(br);
+ 
+             // Pro RPM Performance
+             this.PRO_RPM.Read(br);
+-            br.BaseStream.Position += 4;
++            this._raw_rpm_pro = br.ReadBytes(4);
+ 
+             // Pro ECU Performance
+             this.PRO_ECU.Read(br);
+ 
+             // Top RPM Performance
+             this.TOP_RPM.Read(br);
+-            br.BaseStream.Position += 4;
++            this._raw_rpm_top = br.ReadBytes(4);
+ 
+             // Top ECU Performance
+             this.TOP_ECU.Read(br);
+diff --git a/Nikki/Support.Underground2/Class/TPKBlock.cs b/Nikki/Support.Underground2/Class/TPKBlock.cs
+index bc54d7b..cff13cf 100644
+--- a/Nikki/Support.Underground2/Class/TPKBlock.cs
++++ b/Nikki/Support.Underground2/Class/TPKBlock.cs
+@@ -598,7 +598,7 @@ namespace Nikki.Support.Underground2.Class
+             if (fname.EndsWith(".tpk") || fname.EndsWith(".TPK"))
+             {
+ 
+-                fname = Path.GetFileNameWithoutExtension(fname).ToUpper();
++                fname = Path.GetFileNameWithoutExtension(fname.Replace('\\', '/')).ToUpper(); // local macOS change: Windows path in the data
+ 
+                 if (this.Manager is null)
+                 {
+diff --git a/Nikki/Support.Underground2/Class/Texture.cs b/Nikki/Support.Underground2/Class/Texture.cs
+index 037eeab..a8cbb4b 100644
+--- a/Nikki/Support.Underground2/Class/Texture.cs
++++ b/Nikki/Support.Underground2/Class/Texture.cs
+@@ -367,6 +367,7 @@ namespace Nikki.Support.Underground2.Class
+             this.Mipmaps = (byte)generator.MipMaps;
+             this._compression = generator.Compression;
+             this.Data = generator.Buffer;
++            this.CapMipmaps(); // local macOS change, see CapMipmaps
+ 
+             // Default all other values
+             this._num_palettes = (short)(this.PaletteSize / 4);
+@@ -379,6 +380,40 @@ namespace Nikki.Support.Underground2.Class
+             this.ScaleT = 0;
+         }
+ 
++        /// <summary>
++        /// Local macOS change: the game uploads at most 8 mip levels of a texture (the
++        /// most any of its own has; Carbon 4K's CARBONFIBRE brings 13, and levels 9-13
++        /// were never filled).  A .dds with more keeps its 8 largest.  The layout is told
++        /// from the size: DXT1 (8-byte blocks), DXT3/5 (16), or 4, 2, 1 bytes a pixel;
++        /// a size that fits none is left as it is.
++        /// </summary>
++        private void CapMipmaps()
++        {
++            const int max = 8;
++            if (this.Mipmaps <= max || this.PaletteSize != 0) return;
++            long Total(int levels, int block, int bpp)
++            {
++                long t = 0;
++                for (int i = 0; i < levels; ++i)
++                {
++                    int w = Math.Max(1, this.Width >> i), h = Math.Max(1, this.Height >> i);
++                    t += block > 0 ? (long)Math.Max(1, (w + 3) / 4) * Math.Max(1, (h + 3) / 4) * block : (long)w * h * bpp;
++                }
++                return t;
++            }
++            foreach (var (block, bpp) in new[] { (8, 0), (16, 0), (0, 4), (0, 2), (0, 1) })
++            {
++                if (Total(this.Mipmaps, block, bpp) != this.Data.Length) continue;
++                var keep = (int)Total(max, block, bpp);
++                var data = new byte[keep];
++                Array.Copy(this.Data, data, keep);
++                this.Data = data;
++                this.Size = keep;
++                this.Mipmaps = max;
++                return;
++            }
++        }
++
+         /// <summary>
+         /// Reads .dds data from the <see cref="TPKBlock"/>.
+         /// </summary>
+diff --git a/Nikki/Support.Underground2/Gameplay/GCareerRace.cs b/Nikki/Support.Underground2/Gameplay/GCareerRace.cs
+index 47defae..0c6e5ce 100644
+--- a/Nikki/Support.Underground2/Gameplay/GCareerRace.cs
++++ b/Nikki/Support.Underground2/Gameplay/GCareerRace.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.IO;
+ using System.ComponentModel;
+ using Nikki.Core;
+@@ -23,6 +23,8 @@ namespace Nikki.Support.Underground2.Gameplay
+ 	{
+ 		#region Fields
+ 
++		[MemoryCastable()]
++		private uint _unlock_raw;
+ 		private string _collection_name;
+ 
+ 		[MemoryCastable()]
+@@ -585,6 +587,7 @@ namespace Nikki.Support.Underground2.Gameplay
+ 			bw.WriteEnum(this.UnusedValue);
+ 			bw.WriteEnum(this.EventBehavior);
+ 
++			var raw = BitConverter.GetBytes(this._unlock_raw);
+ 			switch (this.UnlockMethod)
+ 			{
+ 
+@@ -593,20 +596,21 @@ namespace Nikki.Support.Underground2.Gameplay
+ 					break;
+ 
+ 				case UnlockCondition.ReqRegRacesWon:
+-					bw.Write((short)0);
++					bw.Write(raw[0]);
++					bw.Write(raw[1]);
+ 					bw.Write(this.ReqRegRacesWon);
+-					bw.Write((byte)0);
++					bw.Write(raw[3]);
+ 					break;
+ 
+ 				case UnlockCondition.ReqVarRacesWon:
+-					bw.Write((byte)0);
++					bw.Write(raw[0]);
+ 					bw.Write(this.ReqRegRacesWon);
+ 					bw.Write(this.ReqSponRacesWon);
+ 					bw.Write(this.ReqURLRacesWon);
+ 					break;
+ 
+ 				default:
+-					bw.Write((int)0);
++					bw.Write(this._unlock_raw);
+ 					break;
+ 
+ 			}
+@@ -701,7 +705,12 @@ namespace Nikki.Support.Underground2.Gameplay
+ 			this.UnusedValue = br.ReadEnum<eBoolean>();
+ 			this.EventBehavior = br.ReadEnum<EventBehaviorType>();
+ 
+-			// Unlock conditions
++			// Unlock conditions.  Local change: the 4 bytes are kept as read, and
++			// Assemble writes the known fields over them.  Nikki wrote zeros for the
++			// rest (the stage byte of every condition but SpecificRaceWon, and all of
++			// AtStageStart/UnknownType), which locked the Quick Race tracks.
++			this._unlock_raw = br.ReadUInt32();
++			br.BaseStream.Position -= 4;
+ 			switch (this.UnlockMethod)
+ 			{
+ 
+diff --git a/Nikki/Support.Underground2/Parts/GameParts/Stage.cs b/Nikki/Support.Underground2/Parts/GameParts/Stage.cs
+index 9be4df1..6b12f64 100644
+--- a/Nikki/Support.Underground2/Parts/GameParts/Stage.cs
++++ b/Nikki/Support.Underground2/Parts/GameParts/Stage.cs
+@@ -1,4 +1,4 @@
+-﻿using System.IO;
++using System.IO;
+ using Nikki.Reflection.Enum;
+ using Nikki.Reflection.Abstract;
+ using Nikki.Reflection.Attributes;
+@@ -13,6 +13,8 @@ namespace Nikki.Support.Underground2.Parts.GameParts
+ 	/// </summary>
+ 	public class Stage : SubPart
+ 	{
++		private byte _flags;
++
+ 		/// <summary>
+ 		/// Track ID of this <see cref="Stage"/>.
+ 		/// </summary>
+@@ -43,6 +45,7 @@ namespace Nikki.Support.Underground2.Parts.GameParts
+ 				NumberOfLaps = this.NumberOfLaps,
+ 				InReverseDirection = this.InReverseDirection
+ 			};
++			result._flags = this._flags;
+ 			return result;
+ 		}
+ 
+@@ -53,7 +56,10 @@ namespace Nikki.Support.Underground2.Parts.GameParts
+ 		public void Read(BinaryReader br)
+ 		{
+ 			this.TrackID = br.ReadUInt16();
+-			this.InReverseDirection = (eBoolean)(br.ReadByte() % 2);
++			// Local change: bit 0 is the direction; the other bits are kept (the game
++			// sets bit 1 on the races whose tracks Quick Race offers from the start).
++			this._flags = br.ReadByte();
++			this.InReverseDirection = (eBoolean)(this._flags % 2);
+ 			this.NumberOfLaps = br.ReadByte();
+ 		}
+ 
+@@ -64,7 +70,7 @@ namespace Nikki.Support.Underground2.Parts.GameParts
+ 		public void Write(BinaryWriter bw)
+ 		{
+ 			bw.Write(this.TrackID);
+-			bw.WriteEnum(this.InReverseDirection);
++			bw.Write((byte)((this._flags & ~1) | (this.InReverseDirection == eBoolean.True ? 1 : 0)));
+ 			bw.Write(this.NumberOfLaps);
+ 		}
+ 	}
+diff --git a/Nikki/Utils/Interop.cs b/Nikki/Utils/Interop.cs
+index c16ade3..6a66077 100644
+--- a/Nikki/Utils/Interop.cs
++++ b/Nikki/Utils/Interop.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.Runtime.InteropServices;
+ using Nikki.Reflection.Enum;
+ 
+@@ -7,114 +7,123 @@ using Nikki.Reflection.Enum;
+ namespace Nikki.Utils
+ {
+ 	/// <summary>
+-	/// Collection with HUFF compresssor and decompressor.
++	/// Compressor and decompressor (managed). Local macOS change: the original calls the
++	/// Windows-only LZCompressLib.dll. Here RAWW and JDLZ are done in C#; the NFSU2 bundles
++	/// (FrontB.lzc, GlobalB.lzc) are JDLZ. HUFF goes to libhuff.dylib: the game's own
++	/// decoder (SPEED2.EXE 0x573840) lifted to C. Compress always writes RAWW (stored),
++	/// which the game reads too.
+ 	/// </summary>
+ 	public static class Interop
+ 	{
+-		[DllImport("LZCompressLib.dll", EntryPoint = "BlockDecompress", CallingConvention = CallingConvention.Cdecl)]
+-		private static extern int PrivateDecode([In] byte[] input, int insize, [Out] byte[] output);
++		[DllImport("libhuff", EntryPoint = "huff_decode", CallingConvention = CallingConvention.Cdecl)]
++		private static extern int HuffDecode(byte[] input, int inlen, byte[] output, int outcap);
+ 
+-		[DllImport("LZCompressLib.dll", EntryPoint = "BlockCompress", CallingConvention = CallingConvention.Cdecl)]
+-		private static extern int PrivateEncode([In] byte[] input, int insize, [Out] byte[] output, int comp);
+-
+-		[DllImport("LZCompressLib.dll", EntryPoint = "BlockDecompress", CallingConvention = CallingConvention.Cdecl)]
+-		private static extern unsafe int PrivateDecode(byte* input, int insize, byte* output);
+-
+-		[DllImport("LZCompressLib.dll", EntryPoint = "BlockCompress", CallingConvention = CallingConvention.Cdecl)]
+-		private static extern unsafe int PrivateEncode(byte* input, int insize, byte* output, int comp);
+-
+-		private static readonly object _s_lock = new object();
++		private static int I32(byte[] b, int o) => BitConverter.ToInt32(b, o);
+ 
+ 		/// <summary>
+ 		/// Decompresses buffer based on its header.
+ 		/// </summary>
+-		/// <param name="input">Array to decompress.</param>
+-		/// <returns>Decompressed data.</returns>
+ 		public static byte[] Decompress(byte[] input)
+ 		{
+ 			if (input == null || input.Length < 0x10) return null;
+ 
+-			var type = BitConverter.ToInt32(input, 0);
++			var type = I32(input, 0);
+ 			if (!Enum.IsDefined(typeof(LZCompressionType), type)) return input;
+ 
+-			var outsize = BitConverter.ToInt32(input, 8);
++			var outsize = I32(input, 8);
+ 			var output = new byte[outsize];
+ 
+-			lock (Interop._s_lock)
++			switch ((LZCompressionType)type)
+ 			{
+-			
+-				PrivateDecode(input, input.Length, output);
+-			
+-			}
++				case LZCompressionType.RAWW:
++					Buffer.BlockCopy(input, 0x10, output, 0, Math.Min(outsize, input.Length - 0x10));
++					return output;
+ 
+-			return output;
+-		}
+-	
+-		/// <summary>
+-		/// Compresses buffer based on compression type passed.
+-		/// </summary>
+-		/// <param name="input">Array to compress.</param>
+-		/// <param name="type">Type of the compression.</param>
+-		/// <returns>Compressed data.</returns>
+-		public static byte[] Compress(byte[] input, LZCompressionType type)
+-		{
+-			if (input == null) return null;
++				case LZCompressionType.JDLZ:
++					Jdlz(input, output);
++					return output;
+ 
+-			var output = new byte[input.Length << 1];
+-			int outsize = 0;
++				case LZCompressionType.HUFF:
++					if (HuffDecode(input, input.Length, output, outsize) != outsize)
++						throw new InvalidOperationException("HUFF: block not decoded");
++					return output;
+ 
+-			lock (Interop._s_lock)
+-			{
+-			
+-				outsize = PrivateEncode(input, input.Length, output, (int)type);
+-			
++				default:
++					throw new NotSupportedException($"compression {(LZCompressionType)type} is not supported on this platform");
+ 			}
+-
+-			Array.Resize(ref output, outsize);
+-			return output;
+ 		}
+ 
+-		/// <summary>
+-		/// Compresses buffer based on compression type passed.
+-		/// </summary>
+-		/// <param name="input">Array to compress.</param>
+-		/// <param name="start">Start index of compression.</param>
+-		/// <param name="count">Number of bytes to compress.</param>
+-		/// <param name="type">Type of the compression.</param>
+-		/// <returns>Compressed data.</returns>
+-		public static byte[] Compress(byte[] input, int start, int count, LZCompressionType type)
++		private static void Jdlz(byte[] input, byte[] output)
+ 		{
+-			if (input == null) return null;
+-			if (start < 0 || count <= 0) return null;
+-			if (start + count > input.Length) return null;
+-
+-			var output = new byte[count << 1];
+-			int outsize = 0;
++			int flags1 = 1, flags2 = 1;
++			int ip = 0x10, op = 0;
++			int inlen = input.Length, outlen = output.Length;
+ 
+-			unsafe
++			while (ip < inlen && op < outlen)
+ 			{
++				if (flags1 == 1) flags1 = input[ip++] | 0x100;
++				if (flags2 == 1) flags2 = input[ip++] | 0x100;
+ 
+-				fixed (byte* inptr = &input[start])
++				if ((flags1 & 1) != 0)
+ 				{
++					int length, dist;
+ 
+-					fixed (byte* outptr = &output[0])
++					if ((flags2 & 1) != 0)
+ 					{
+-
+-						lock (Interop._s_lock)
+-						{
+-
+-							outsize = PrivateEncode(inptr, count, outptr, (int)type);
+-
+-						}
+-
++						length = (input[ip + 1] | ((input[ip] & 0xF0) << 4)) + 3;
++						dist = (input[ip] & 0x0F) + 1;
++					}
++					else
++					{
++						dist = (input[ip + 1] | ((input[ip] & 0xE0) << 3)) + 17;
++						length = (input[ip] & 0x1F) + 3;
+ 					}
+ 
++					ip += 2;
++					if (dist > op) throw new InvalidOperationException("JDLZ: reference before start of output");
++					for (int i = 0; i < length && op < outlen; ++i, ++op) output[op] = output[op - dist];
++					flags2 >>= 1;
++				}
++				else
++				{
++					output[op++] = input[ip++];
+ 				}
+ 
++				flags1 >>= 1;
+ 			}
+ 
+-			Array.Resize(ref output, outsize);
++			if (op != outlen) throw new InvalidOperationException($"JDLZ: {op} of {outlen} bytes decoded");
++		}
++
++		private static byte[] Raww(byte[] input, int start, int count)
++		{
++			var output = new byte[count + 0x10];
++			BitConverter.GetBytes((int)LZCompressionType.RAWW).CopyTo(output, 0);
++			output[4] = 0x01; output[5] = 0x10;
++			BitConverter.GetBytes(count).CopyTo(output, 8);
++			BitConverter.GetBytes(count + 0x10).CopyTo(output, 12);
++			Buffer.BlockCopy(input, start, output, 0x10, count);
+ 			return output;
+ 		}
++
++		/// <summary>
++		/// Compresses buffer (stored as RAWW whatever type is asked).
++		/// </summary>
++		public static byte[] Compress(byte[] input, LZCompressionType type)
++		{
++			if (input == null) return null;
++			return Raww(input, 0, input.Length);
++		}
++
++		/// <summary>
++		/// Compresses part of a buffer (stored as RAWW whatever type is asked).
++		/// </summary>
++		public static byte[] Compress(byte[] input, int start, int count, LZCompressionType type)
++		{
++			if (input == null) return null;
++			if (start < 0 || count <= 0) return null;
++			if (start + count > input.Length) return null;
++			return Raww(input, start, count);
++		}
+ 	}
+ }

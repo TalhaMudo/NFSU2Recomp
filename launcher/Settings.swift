@@ -24,7 +24,7 @@ enum SettingsTab: String, CaseIterable {
     case graphics, picture, controls, online, game, mods, more
 
     /// The tabs that have rows, in this order.
-    static let shown: [SettingsTab] = [.graphics, .picture, .controls, .more]
+    static let shown: [SettingsTab] = [.graphics, .picture, .controls, .mods, .more]
 
     var title: String { rawValue.capitalized }
     var icon: String {          // SF Symbols available on macOS 11
@@ -45,15 +45,18 @@ struct SettingRow<Control: View>: View {
     let title: String
     let description: String
     let control: Control
-    init(title: String, description: String = "", @ViewBuilder control: () -> Control) {
-        self.title = title; self.description = description; self.control = control()
+    var descriptionColor = Theme.dim       // Theme.warn for a message the player should read
+    init(title: String, description: String = "", descriptionColor: Color = Theme.dim,
+         @ViewBuilder control: () -> Control) {
+        self.title = title; self.description = description; self.descriptionColor = descriptionColor
+        self.control = control()
     }
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.system(size: 12.5)).foregroundColor(Theme.text)
                 if !description.isEmpty {
-                    Text(description).font(.system(size: 11)).foregroundColor(Theme.dim)
+                    Text(description).font(.system(size: 11)).foregroundColor(descriptionColor)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -190,6 +193,133 @@ struct ControlsSettings: View {
     }
 }
 
+struct ModsSettings: View {
+    @ObservedObject var model: LauncherModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Card("NFSU2 Unlimiter") { UnlimiterRow(model: model) }
+            Card("Mods") {
+                ForEach(model.otherMods) { m in ModRow(model: model, mod: m) }
+                if model.otherMods.isEmpty {
+                    Text("No mods yet. Mods from nfsmods.xyz and similar sites: ones with an install script for Binary or Binarius (install.end, .endlauncher), and ones that are plain game files (folders such as TRACKS, GLOBAL, CARS).")
+                        .font(.system(size: 11)).foregroundColor(Theme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(alignment: .center, spacing: 8) {
+                    if let n = model.modNote["add"] {
+                        Text(n).font(.system(size: 11))
+                            .foregroundColor(model.modBusy.contains("add") ? Theme.dim : Theme.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Add Mod…") { model.addMod() }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(model.modBusy.contains("add") || !model.isReady)
+                }
+            }
+            if let s = model.modsApplying {
+                Text(s).font(.system(size: 11)).foregroundColor(Theme.accent).padding(.horizontal, 4)
+            }
+            Text("The game folder is never changed: the mods are installed into a copy, and only the files they change are kept, in Application Support. Off: as in the original game. Mods with a plugin (.asi) other than Unlimiter need it translated for the Mac first and are not taken.")
+                .font(.system(size: 11)).foregroundColor(Theme.dim)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 4)
+        }
+    }
+}
+
+struct UnlimiterRow: View {
+    @ObservedObject var model: LauncherModel
+    var body: some View {
+        let id = Mods.Unlimiter.id
+        let m = model.unlimiter, problem = model.unlimiterProblem
+        let busy = model.modBusy.contains(id), note = model.modNote[id]
+        VStack(alignment: .leading, spacing: 8) {
+            SettingRow(title: "\(Mods.Unlimiter.name) \(Mods.Unlimiter.version)  ·  \(Mods.Unlimiter.author)",
+                       description: note ?? problem ?? (m != nil
+                            ? "More cars, parts, rims and paints for add-on mods; separate front and rear rims, more rim brands. Off: as in the original game."
+                            : "More cars, parts, rims and paints for add-on mods. \(formatBytes(Mods.Unlimiter.size)) from GitHub."),
+                       descriptionColor: (note != nil && !busy) || problem != nil ? Theme.warn : Theme.dim) {
+                if let m = m {
+                    Toggle("", isOn: Binding(get: { m.on }, set: { model.setMod(m, $0) }))
+                        .labelsHidden().toggleStyle(SwitchToggleStyle())
+                        .disabled(busy || problem != nil || model.modsApplying != nil)
+                } else {
+                    HStack(spacing: 6) {
+                        Button("Download") { model.downloadUnlimiter() }
+                            .buttonStyle(SecondaryButtonStyle()).disabled(busy || problem != nil)
+                        Button("Add File…") { model.addUnlimiterFile() }
+                            .buttonStyle(SecondaryButtonStyle()).disabled(busy || problem != nil)
+                    }
+                }
+            }
+            if let m = m, m.on, problem == nil { ModQuestions(model: model, mod: m, hidden: Mods.Unlimiter.hidden) }
+        }
+        .contextMenu {
+            Button("Open Unlimiter's Page") { NSWorkspace.shared.open(Mods.Unlimiter.page) }
+            if let m = m {
+                Button("Show in Finder") { model.revealMod(m) }
+                Button("Remove \(Mods.Unlimiter.name)") { model.removeMod(m) }
+            }
+        }
+    }
+}
+
+/// One added mod: its switch, what it is, its questions.
+struct ModRow: View {
+    @ObservedObject var model: LauncherModel
+    let mod: InstalledMod
+    var body: some View {
+        let note = model.modNote[mod.id]
+        let what = mod.kind == .script ? "Binary / Binarius script" : "game files"
+        let issues = mod.issues.isEmpty ? "" : " The last install reported \(mod.issues.count == 1 ? "a problem" : "\(mod.issues.count) problems"): \(mod.issues[0].message ?? "")"
+        VStack(alignment: .leading, spacing: 8) {
+            SettingRow(title: mod.name,
+                       description: note ?? "\(mod.source), \(what).\(issues)",
+                       descriptionColor: note != nil || !mod.issues.isEmpty ? Theme.warn : Theme.dim) {
+                Toggle("", isOn: Binding(get: { mod.on }, set: { model.setMod(mod, $0) }))
+                    .labelsHidden().toggleStyle(SwitchToggleStyle())
+                    .disabled(model.modsApplying != nil)
+            }
+            if mod.on { ModQuestions(model: model, mod: mod, hidden: []) }
+        }
+        .contextMenu {
+            Button("Show in Finder") { model.revealMod(mod) }
+            Button("Remove \(mod.name)") { model.removeMod(mod) }
+        }
+    }
+}
+
+/// The questions a mod's script asked when it was installed, with the answers used;
+/// another answer installs it again.
+struct ModQuestions: View {
+    @ObservedObject var model: LauncherModel
+    let mod: InstalledMod
+    let hidden: [String]
+    var body: some View {
+        let qs = mod.prompts.filter { q in !hidden.contains { q.description.contains($0) } }
+        if !qs.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(qs, id: \.description) { q in
+                    HStack(alignment: .center, spacing: 8) {
+                        // "NFSU2 Unlimiter: Please choose ..." under Unlimiter's own row: without the name
+                        Text(q.description.hasPrefix(mod.name + ": ") ? String(q.description.dropFirst(mod.name.count + 2)) : q.description)
+                            .font(.system(size: 11)).foregroundColor(Theme.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                        Picker("", selection: Binding(get: { q.choice }, set: { model.setChoice(mod, q, $0) })) {
+                            ForEach(q.options, id: \.self) { o in Text(o).tag(o) }
+                        }
+                        .labelsHidden().pickerStyle(MenuPickerStyle()).frame(maxWidth: 210)
+                        .disabled(model.modsApplying != nil)
+                    }
+                }
+            }
+            .padding(.leading, 14)
+        }
+    }
+}
+
 struct MoreSettings: View {
     @ObservedObject var model: LauncherModel
     var body: some View {
@@ -235,8 +365,9 @@ struct SettingsView: View {
         case .graphics: GraphicsSettings(model: model)
         case .picture: PictureSettings(model: model)
         case .controls: ControlsSettings(model: model)
+        case .mods: ModsSettings(model: model)
         case .more: MoreSettings(model: model)
-        case .online, .game, .mods: EmptyView()      // no rows yet
+        case .online, .game: EmptyView()      // no rows yet
         }
     }
 

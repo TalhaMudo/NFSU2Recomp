@@ -36,6 +36,14 @@ static void guest_exit_now(void){
 
 typedef struct { uint32_t iat; const char*dll; const char*name; int nargs; } ImpEnt;
 extern const ImpEnt g_imp[]; extern const uint32_t g_imp_count;
+/* The import table in use: the exe's (impargs.c) followed by the imports of any
+ * ASI plugin (runtime/asi.c, win32_add_import).  Bridges are IMP_MAGIC + index. */
+static ImpEnt *g_impt; static uint32_t g_impn, g_impcap;
+uint32_t win32_add_import(const char *dll, const char *name, int nargs, uint32_t iat);
+int asi_owns(uint32_t addr);                  /* runtime/asi.c: address inside a loaded plugin */
+uint32_t asi_module_handle(const char *name, int *known);
+uint32_t asi_module_path(uint32_t hmod, char *out, uint32_t outsz);
+int win32_asi_call(CPU*, const char*, uint32_t*);
 void mem_commit(uint32_t,uint32_t);
 void guest_backtrace(CPU*,int);
 int win32_ext_call(CPU*, const char*, uint32_t*);
@@ -332,9 +340,25 @@ static void qpc_who(CPU *c){
     }
 }
 
+/* TLS for runtime/win32_asi.c (Fls*) and runtime/asi.c (a plugin's implicit TLS
+ * slot): the same slots as TlsAlloc/TlsGetValue below, fs:[0x2C] + 4*index. */
+uint32_t win32_tls_alloc(void){ return (tls_next<128)? (uint32_t)tls_next++ : 0xffffffffu; }
+/* Slots for plugins (their implicit TLS and Fls*): from 160 up, never the low
+ * numbers.  The exe reads slot 0 before allocating anything and expects 0
+ * there; a plugin block in slot 0 crashed it during start-up. */
+uint32_t win32_tls_alloc_plugin(void){ static uint32_t n = 160; return n < 256 ? n++ : 0xffffffffu; }
+uint32_t win32_tls_get(CPU *c, uint32_t i){
+    uint32_t arr = (c->fs_base && mem_is_committed(c->fs_base+0x2cu)) ? MR32(c->fs_base+0x2cu) : 0;
+    if (arr && i<256u && mem_is_committed(arr+4u*i)) return MR32(arr+4u*i);
+    return (i<128)?tls_slot[i]:0; }
+void win32_tls_set(CPU *c, uint32_t i, uint32_t v){
+    uint32_t arr = (c->fs_base && mem_is_committed(c->fs_base+0x2cu)) ? MR32(c->fs_base+0x2cu) : 0;
+    if (arr && i<256u && mem_is_committed(arr+4u*i)) MR32(arr+4u*i)=v;
+    else if (i<128) tls_slot[i]=v; }
+
 int win32_call(CPU *c, uint32_t idx){
-    if (idx >= g_imp_count) return 0;
-    const ImpEnt *e = &g_imp[idx];
+    if (idx >= g_impn) return 0;
+    const ImpEnt *e = &g_impt[idx];
     stat_[idx].calls++; g_win32_calls++;
     guest_fair_yield();          /* give the other guest threads a turn */
     POP32(c->eip);                      /* take the return address */
@@ -352,7 +376,13 @@ int win32_call(CPU *c, uint32_t idx){
         uint64_t v = host_qpc(); uint32_t p=ARG(c,0);
         if(p){ MR32(p)=(uint32_t)v; MR32(p+4)=(uint32_t)(v>>32); } r=1; }
     else if (!strcmp(n,"GetVersion"))            r = 0x0A280105u;      /* 5.1.2600 */
-    else if (!strcmp(n,"GetModuleHandleA"))      r = 0x00400000u;
+    else if (!strcmp(n,"GetModuleHandleA")){
+        /* NULL or the exe -> the image.  A plugin asks for other plugins by name
+         * (Unlimiter: GetModuleHandleA("NFSU2ExtraOptions.asi")); those must say
+         * "not loaded" unless they are.  Other names keep the old answer. */
+        uint32_t p = ARG(c,0); int known = 0;
+        r = p ? asi_module_handle((const char*)(g_mem+p), &known) : 0;
+        if (!known) r = 0x00400000u; }
     else if (!strcmp(n,"GetProcessHeap"))        r = 0x00000001u;
     else if (!strcmp(n,"HeapCreate"))            r = 0x00000002u;
     else if (!strcmp(n,"HeapDestroy"))           r = 1;
@@ -457,15 +487,26 @@ int win32_call(CPU *c, uint32_t idx){
         if (!r) r = 1u; }
     else if (!strcmp(n,"GetCurrentProcessId"))   r = 100;
     else if (!strcmp(n,"GetCurrentProcess"))     r = 0xffffffffu;
-    else if (!strcmp(n,"GetLastError"))          r = 0;
-    else if (!strcmp(n,"SetLastError"))          r = 0;
+    /* The last error lives in the TEB (fs:[0x34]) as on Windows.  Plugins get it;
+     * the exe keeps seeing 0, as it always has here.  A plugin's std::filesystem
+     * stops iterating a folder only when GetLastError() says ERROR_NO_MORE_FILES. */
+    else if (!strcmp(n,"GetLastError"))
+        r = (asi_owns(c->eip) && c->fs_base) ? MR32(c->fs_base + 0x34u) : 0;
+    else if (!strcmp(n,"SetLastError")){ if (c->fs_base) MR32(c->fs_base + 0x34u) = ARG(c,0); r = 0; }
     else if (!strcmp(n,"GetTickCount")) r = game_ms_at(c->eip);   /* see SOUND PACE CLOCK */
     else if (!strcmp(n,"QueryPerformanceFrequency")){ uint32_t p=ARG(c,0); if(p){MR32(p)=1000000;MR32(p+4)=0;} r=1; }
     else if (!strcmp(n,"SetUnhandledExceptionFilter")) r = 0;
     else if (!strcmp(n,"UnhandledExceptionFilter"))    r = 0;
-    else if (!strcmp(n,"IsProcessorFeaturePresent"))   r = 1;
+    else if (!strcmp(n,"IsProcessorFeaturePresent"))
+        /* A plugin's CRT picks SSE2/AVX string and math routines from this
+         * (PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10); the lifter does not cover all of
+         * them, so plugins are told "no" and take the plain x86 paths.  The exe
+         * keeps the old answer. */
+        r = asi_owns(c->eip) ? 0u : 1u;
     else if (!strcmp(n,"GetModuleFileNameA")){ uint32_t p=ARG(c,1),sz=ARG(c,2);
-        const char*s="C:\\\\NFSU2\\\\SPEED2.EXE"; uint32_t l=(uint32_t)strlen(s);
+        char mp[300]; const char*s="C:\\\\NFSU2\\\\SPEED2.EXE";
+        if (asi_module_path(ARG(c,0), mp, sizeof mp)) s = mp;     /* a plugin's own path */
+        uint32_t l=(uint32_t)strlen(s);
         if(p&&sz){ if(l>=sz) l=sz-1; memcpy(g_mem+p,s,l); MR8(p+l)=0; } r=l; }
     else if (!strcmp(n,"ExitProcess")){ g_exit_code=(int)ARG(c,0);
         fprintf(stderr,"\n*** guest ExitProcess(%u) - terminating\n",ARG(c,0));
@@ -478,8 +519,10 @@ int win32_call(CPU *c, uint32_t idx){
         uint32_t pname = ARG(c,1); r = 0;
         if (pname > 0xffff){                       /* by name (not ordinal) */
             const char *want = (const char*)(g_mem + pname);
-            for (uint32_t i=0;i<g_imp_count;i++)
-                if (!strcmp(g_imp[i].name, want)){ r = IMP_MAGIC + i; break; }
+            for (uint32_t i=0;i<g_impn;i++)
+                if (!strcmp(g_impt[i].name, want)){ r = IMP_MAGIC + i; break; }
+            if (!r && asi_owns(c->eip)){ int asi_nargs(const char*); int na = asi_nargs(want);
+                     if (na >= 0) r = IMP_MAGIC + win32_add_import("kernel32.dll", want, na, 0); }
             { static int sh=0;
               if (ENVC("VERBOSE") && !r && sh<12){ sh++; fprintf(stderr,"      [dll] GetProcAddress(\"%s\") NOT FOUND\n", want); } }
         } }
@@ -572,7 +615,9 @@ int win32_call(CPU *c, uint32_t idx){
     else if (!strcmp(n,"Direct3DCreate9")) r = com_direct3dcreate9();
     else if (!strcmp(n,"DirectInput8Create")) r = com_directinput8create(ARG(c,3));
     else if (!strcmp(n,"DirectSoundCreate") || (!strcmp(n,"#1") && !strcasecmp(e->dll,"DSOUND.dll")))
-        r = com_directsoundcreate(ARG(c,1));
+    {   r = com_directsoundcreate(ARG(c,1));
+        /* DSBT=<n> (diagnostic): the guest call chain of the n-th DirectSoundCreate */
+        static int nds = 0; if (getenv("DSBT") && ++nds == atoi(getenv("DSBT"))) guest_backtrace(c, 16); }
     else if (!strcmp(n,"SetConsoleCtrlHandler")) r = 1;
     else if (!strcmp(n,"RtlUnwind"))             r = 0;
     else if (!strcmp(n,"TerminateProcess")){ g_exit_code=(int)ARG(c,1);
@@ -580,6 +625,7 @@ int win32_call(CPU *c, uint32_t idx){
         guest_exit_now(); }
     else if (fileio_call(c, n, &r)) { /* file I/O */ }
     else if (win32_ext_call(c, n, &r)) { /* second-round layer */ }
+    else if (win32_asi_call(c, n, &r)) { /* runtime/win32_asi.c: ASI plugin needs + late stubs */ }
     else { handled = 0; g_win32_unimpl++; stat_[idx].unimpl++;
            if (getenv("FILEOPLOG"))
                fprintf(stderr, "  [stub] %s (return 0x%08x)\n", n, MR32(c->esp));
@@ -597,15 +643,33 @@ int win32_call(CPU *c, uint32_t idx){
     return 1;
 }
 
+/* Add an import (an ASI plugin's IAT entry, or GetProcAddress of a function the
+ * exe never imported).  Returns its index; the bridge address is IMP_MAGIC+index.
+ * An existing entry with the same name is reused (its argument count is the
+ * same: stdcall counts belong to the function, not the importer). */
+uint32_t win32_add_import(const char *dll, const char *name, int nargs, uint32_t iat){
+    for (uint32_t i = 0; i < g_impn; i++)
+        if (!strcmp(g_impt[i].name, name)){ if (iat) MR32(iat) = IMP_MAGIC + i; return i; }
+    if (g_impn == g_impcap){
+        fprintf(stderr, "win32: import table full (%u)\n", g_impcap); exit(9); }
+    ImpEnt *e = &g_impt[g_impn];
+    e->iat = iat; e->dll = strdup(dll); e->name = strdup(name); e->nargs = nargs;
+    if (iat) MR32(iat) = IMP_MAGIC + g_impn;
+    return g_impn++;
+}
+
 void win32_init(void){
-    stat_ = calloc(g_imp_count, sizeof *stat_);
+    g_impcap = g_imp_count + 256u;
+    g_impt = calloc(g_impcap, sizeof *g_impt);
+    memcpy(g_impt, g_imp, g_imp_count * sizeof *g_impt); g_impn = g_imp_count;
+    stat_ = calloc(g_impcap, sizeof *stat_);
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     tick0 = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
     mem_commit(HEAP_BASE, 0x10000);
     g_cmdline = galloc(64,1);
     strcpy((char*)(g_mem+g_cmdline), "SPEED2.EXE");
     /* fill the IAT with magic addresses */
-    for (uint32_t i=0;i<g_imp_count;i++) MR32(g_imp[i].iat) = IMP_MAGIC + i;
+    for (uint32_t i=0;i<g_imp_count;i++) MR32(g_impt[i].iat) = IMP_MAGIC + i;
     com_init();
     /* addresses to be read later for diagnosing the CRT heap mode */
     fprintf(stderr,"win32: %u imports bound to the IAT, heap 0x%08x\n", g_imp_count, HEAP_BASE);
@@ -627,22 +691,22 @@ void win32_report(void){
     enh_report();
     { extern void d3dx_hle_report(void); d3dx_hle_report(); }
     fprintf(stderr,"  --- NOT IMPLEMENTED (called, stub returned) ---\n");
-    for (uint32_t i=0;i<g_imp_count;i++)
+    for (uint32_t i=0;i<g_impn;i++)
         if (stat_[i].unimpl)
-            fprintf(stderr,"    %-14s %-32s %u times\n", g_imp[i].dll, g_imp[i].name, stat_[i].unimpl);
+            fprintf(stderr,"    %-14s %-32s %u times\n", g_impt[i].dll, g_impt[i].name, stat_[i].unimpl);
     fprintf(stderr,"  --- 15 MOST CALLED ---\n");
     for (int k=0;k<15;k++){
         uint32_t best=0, bi=0;
-        for (uint32_t i=0;i<g_imp_count;i++) if (stat_[i].calls>best){ best=stat_[i].calls; bi=i; }
+        for (uint32_t i=0;i<g_impn;i++) if (stat_[i].calls>best){ best=stat_[i].calls; bi=i; }
         if(!best) break;
-        fprintf(stderr,"    %-14s %-32s %u\n", g_imp[bi].dll, g_imp[bi].name, best);
+        fprintf(stderr,"    %-14s %-32s %u\n", g_impt[bi].dll, g_impt[bi].name, best);
         stat_[bi].calls = 0;
     }
     int shown=0;
-    for (uint32_t i=0;i<g_imp_count && shown<15;i++)
+    for (uint32_t i=0;i<g_impn && shown<15;i++)
         if (stat_[i].calls){
             /* we don't know whether they were handled; just show the frequently called ones */
         }
-    for (uint32_t i=0;i<g_imp_count;i++)
-        if (stat_[i].calls>1 && shown<15){ fprintf(stderr,"    %-30s %u times\n", g_imp[i].name, stat_[i].calls); shown++; }
+    for (uint32_t i=0;i<g_impn;i++)
+        if (stat_[i].calls>1 && shown<15){ fprintf(stderr,"    %-30s %u times\n", g_impt[i].name, stat_[i].calls); shown++; }
 }

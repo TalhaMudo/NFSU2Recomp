@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Runs a Binarius "User" end launcher on macOS without the Windows UI.
+       Uses only the MIT libraries (Endscript, Nikki/Darius, CoreExtensions),
+       cloned and patched by tools/mods/binarius/build.sh into $(BinariusSrc). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RollForward>Major</RollForward>
+    <BinariusSrc Condition="'$(BinariusSrc)' == ''">../../../../out/binarius/src</BinariusSrc>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(BinariusSrc)/CoreExtensions/CoreExtensions/CoreExtensions.csproj" />
+    <ProjectReference Include="$(BinariusSrc)/Endscript/Endscript/Endscript.csproj" />
+    <ProjectReference Include="$(BinariusSrc)/Darius/Nikki/Nikki.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="$(BinariusSrc)/../libhuff.dylib" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

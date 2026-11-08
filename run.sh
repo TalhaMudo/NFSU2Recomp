@@ -8,6 +8,9 @@ if [ -n "$NFSU2_DATA" ]; then
   if [ -d "$NFSU2_DATA" ]; then EXE="$NFSU2_DATA/SPEED2.EXE"; else EXE="$NFSU2_DATA"; fi
 fi
 [ -f "$EXE" ] || { echo "SPEED2.EXE not found: $EXE"; exit 1; }
+# NFSU2_MODS=<folder>: mod files, read before the game's own (changed copies at their
+#   game-folder paths, a .deleted list); the launcher's Mods tab builds
+#   ~/Library/Application Support/NFSU2/Mods/Files.  See runtime/fileio.c, docs/MODS.md.
 # NFSU2_REGION=na|eu: the game's region.  Default: detected from the data's region
 #   cars (CARS/CIVIC + RSX without CORSA + PEUGOT106 = North American, e.g. US discs).
 #   See runtime/overrides.c, region_install.

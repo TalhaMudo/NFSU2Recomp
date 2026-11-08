@@ -1,0 +1,47 @@
+diff --git a/Endscript/Commands/SpeedReflectCommand.cs b/Endscript/Commands/SpeedReflectCommand.cs
+index 4730fae..e50fc69 100644
+--- a/Endscript/Commands/SpeedReflectCommand.cs
++++ b/Endscript/Commands/SpeedReflectCommand.cs
+@@ -40,7 +40,7 @@ namespace Endscript.Commands
+ 			if (String.Compare(this._type, "auto", StringComparison.OrdinalIgnoreCase) == 0)
+ 			{
+ 
+-				var speedto = Path.Combine(map.Profile.Directory, @"scripts\SpeedReflect.asi");
++				var speedto = Path.Combine(map.Profile.Directory, "scripts", "SpeedReflect.asi");
+ 				Directory.CreateDirectory(Path.Combine(map.Profile.Directory, "scripts"));
+ 				File.Copy(speedfrom, speedto, true);
+ 
+diff --git a/Endscript/Commands/UnlockMemoryCommand.cs b/Endscript/Commands/UnlockMemoryCommand.cs
+index 86a7f2d..2facda1 100644
+--- a/Endscript/Commands/UnlockMemoryCommand.cs
++++ b/Endscript/Commands/UnlockMemoryCommand.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.IO;
+ using Nikki.Utils;
+ using Endscript.Core;
+@@ -30,17 +30,17 @@ namespace Endscript.Commands
+ 			if (String.Compare(this._file, "all", StringComparison.OrdinalIgnoreCase) == 0)
+ 			{
+ 
+-				MemoryUnlock.FastUnlock(map.Profile.Directory + @"\GLOBAL\CARHEADERSMEMORYFILE.BIN");
+-				MemoryUnlock.FastUnlock(map.Profile.Directory + @"\GLOBAL\FRONTENDMEMORYFILE.BIN");
+-				MemoryUnlock.FastUnlock(map.Profile.Directory + @"\GLOBAL\INGAMEMEMORYFILE.BIN");
+-				MemoryUnlock.FastUnlock(map.Profile.Directory + @"\GLOBAL\PERMANENTMEMORYFILE.BIN");
+-				MemoryUnlock.LongUnlock(map.Profile.Directory + @"\GLOBAL\GLOBALMEMORYFILE.BIN");
++				MemoryUnlock.FastUnlock(Path.Combine(map.Profile.Directory, "GLOBAL", "CARHEADERSMEMORYFILE.BIN"));
++				MemoryUnlock.FastUnlock(Path.Combine(map.Profile.Directory, "GLOBAL", "FRONTENDMEMORYFILE.BIN"));
++				MemoryUnlock.FastUnlock(Path.Combine(map.Profile.Directory, "GLOBAL", "INGAMEMEMORYFILE.BIN"));
++				MemoryUnlock.FastUnlock(Path.Combine(map.Profile.Directory, "GLOBAL", "PERMANENTMEMORYFILE.BIN"));
++				MemoryUnlock.LongUnlock(Path.Combine(map.Profile.Directory, "GLOBAL", "GLOBALMEMORYFILE.BIN"));
+ 
+ 			}
+ 			else
+ 			{
+ 
+-				if (String.Compare(this._file, @"GLOBAL\GLOBALMEMORYFILE.BIN", StringComparison.OrdinalIgnoreCase) == 0)
++				if (String.Compare(this._file.Replace('\\', '/'), "GLOBAL/GLOBALMEMORYFILE.BIN", StringComparison.OrdinalIgnoreCase) == 0)
+ 				{
+ 
+ 					MemoryUnlock.LongUnlock(Path.Combine(map.Profile.Directory, this._file));

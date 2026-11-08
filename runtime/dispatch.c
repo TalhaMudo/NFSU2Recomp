@@ -42,6 +42,34 @@ void dispatch_init(void){
             g_fn_count, dup, oob, TEXT_SIZE*4.0/1048576.0);
 }
 
+/* --- more lifted modules: ASI plugins (runtime/asi.c) ---
+ * A plugin's code is lifted into its own table (genall FNTAB_PREFIX) at its own
+ * address range; calls into it arrive here like any other indirect call. */
+typedef struct { uint32_t lo, size, n; const uint32_t *addr; const guest_fn *ptr; uint32_t *idx; } DMod;
+static DMod g_dmod[4]; static int g_ndmod;
+void dispatch_add_module(uint32_t lo, uint32_t size, const uint32_t *addr, const guest_fn *ptr, uint32_t n){
+    if (g_ndmod == 4) return;
+    DMod *m = &g_dmod[g_ndmod];
+    m->lo = lo; m->size = size; m->n = n; m->addr = addr; m->ptr = ptr;
+    m->idx = calloc(size, sizeof(uint32_t));
+    if (!m->idx){ fprintf(stderr,"could not allocate a module dispatch table\n"); exit(1); }
+    for (uint32_t i = 0; i < n; i++)
+        if (addr[i] - lo < size) m->idx[addr[i] - lo] = i + 1;
+    g_ndmod++;
+    fprintf(stderr, "dispatch: module 0x%08x..0x%08x, %u functions\n", lo, lo + size, n);
+}
+/* guest function start at or below a, in a module; 0 if none */
+static uint32_t dmod_nearest(uint32_t a){
+    for (int k = 0; k < g_ndmod; k++){
+        DMod *m = &g_dmod[k];
+        if (a - m->lo >= m->size) continue;
+        uint32_t lo = 0, hi = m->n, best = 0;
+        while (lo < hi){ uint32_t md = (lo+hi)/2; if (m->addr[md] <= a){ best = m->addr[md]; lo = md+1; } else hi = md; }
+        return best;
+    }
+    return 0;
+}
+
 int  win32_call(CPU*, uint32_t);
 int  run_generated(CPU*, uint32_t);
 void genexec_report(void);
@@ -109,6 +137,14 @@ void dispatch_indirect(CPU *c, uint32_t addr){
                 }
             }
             g_stat_indirect_ok++; g_fn_ptr[k-1](c); return; }
+    }
+    for (int k = 0; k < g_ndmod; k++){
+        uint32_t o2 = addr - g_dmod[k].lo;
+        if (o2 < g_dmod[k].size){
+            uint32_t j = g_dmod[k].idx[o2];
+            if (j){ g_stat_indirect_ok++; g_dmod[k].ptr[j-1](c); return; }
+            break;
+        }
     }
     /* No lifted counterpart.  The game may have generated code at this address
      * AT RUN TIME (NFSU2's material pipeline does this heavily).
@@ -212,6 +248,12 @@ void guest_backtrace(CPU *c, int maxn){
         uint32_t a = c->esp + 4u*k;
         if (!mem_is_committed(a)) continue;      /* skip unmapped pages */
         uint32_t v = MR32(a);
+        uint32_t fm = dmod_nearest(v);
+        if (fm){
+            fprintf(stderr,"      [%2d] +0x%04x  return 0x%08x   (plugin sub_%08x + 0x%x)\n",
+                    shown, k*4, v, fm, v-fm);
+            shown++; continue;
+        }
         if (v - TEXT_BASE < TEXT_SIZE){
             uint32_t f = nearest_fn(v);
             fprintf(stderr,"      [%2d] +0x%04x  return 0x%08x   (sub_%08x + 0x%x)\n",

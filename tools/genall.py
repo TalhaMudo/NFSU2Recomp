@@ -23,6 +23,14 @@ def discover_all():
         for nm,va,vs,d in L.secs:
             if va<=a<va+len(d)-3: return struct.unpack_from('<I',d,a-va)[0]
     funcs={EP}
+    # EXTRA_FUNCS=<file>: more entry points, one hex address per line ('#' comments).
+    # ASI plugin code caves jump back into the middle of game functions
+    # (tools/mods/asi_resume.py); each such address is lifted as its own entry.
+    xf = os.environ.get('EXTRA_FUNCS')
+    if xf:
+        for ln in open(xf):
+            ln = ln.split('#', 1)[0].strip()
+            if ln: funcs.add(int(ln, 16))
     for a in (int(x,16) for x in open(os.environ.get('RELOCS','out/relocs.txt'))):
         v=rd32(a)
         if v is not None and L.in_text(v): funcs.add(v)
@@ -202,6 +210,12 @@ if __name__=='__main__':
                 "static const char *const xp_names[] = { 0 };\nstatic const char *const xpv_names[] = { 0 };\n")
     if spec:
         hit_names = {n for n, a in xhits}
+        # XPATCH_SOFT sites that did not lift as code (negative address): data
+        soft = sorted({n for n, a in xhits if a < 0} - {n for n, a in xhits if a >= 0})
+        xhits = {(n, a) for n, a in xhits if a >= 0}
+        with open(f"{OUT}/xpatch_data.txt", 'w') as f:
+            f.write("".join(n + "\n" for n in soft))
+        if soft: print(f"  [xpatch: {len(soft)} sites are data, not code: {', '.join(soft)}]")
         lost = [n for n in spec.names if n not in hit_names]
         print(f"  [xpatch: {len(spec.names)} switches, {len(xhits)} sites lifted]")
         for n, a in sorted(xhits, key=lambda t: t[1]): print(f"    {a:#x}  {n}")
@@ -232,10 +246,13 @@ if __name__=='__main__':
         f.write("#endif\n")
     with open(f"{OUT}/fntab.c",'w') as f:
         f.write('#include "cpu.h"\n#include "decls.h"\ntypedef void(*guest_fn)(CPU*);\n')
-        f.write(f"const uint32_t g_fn_count = {len(allf)};\n")
-        f.write("const uint32_t g_fn_addr[] = {\n")
+        # FNTAB_PREFIX=ul_: a second module (an ASI plugin) gets its own table
+        # (g_ul_fn_count/addr/ptr) next to the exe's; runtime/asi.c registers it.
+        P = os.environ.get('FNTAB_PREFIX', '')
+        f.write(f"const uint32_t g_{P}fn_count = {len(allf)};\n")
+        f.write(f"const uint32_t g_{P}fn_addr[] = {{\n")
         for i in range(0,len(allf),8): f.write("  "+",".join(f"0x{a:08x}u" for a in allf[i:i+8])+",\n")
-        f.write("};\nconst guest_fn g_fn_ptr[] = {\n")
+        f.write(f"}};\nconst guest_fn g_{P}fn_ptr[] = {{\n")
         for i in range(0,len(allf),4): f.write("  "+",".join(f"sub_{a:08x}" for a in allf[i:i+4])+",\n")
         f.write("};\n")
     print(f"\n=== URETIM OZETI ({time.time()-t0:.0f}s) ===")

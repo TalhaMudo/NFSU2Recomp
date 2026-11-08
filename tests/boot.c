@@ -115,6 +115,7 @@ static void *guest_main_thread(void *unused){
     if (setjmp(g_exit_jmp)==0){
         g_exit_armed = 1;
         guest_lock(&cpu);
+        { extern void asi_attach(CPU*); asi_attach(&cpu); }   /* runtime/asi.c: plugins' DllMain */
         PUSH32(0xDEADC0DEu);
         sub_0075bcc7(&cpu);
         guest_unlock();
@@ -173,6 +174,7 @@ int main(int argc,char**argv){
     mem_commit(PEB_BASE,0x1000);
     MR32(PEB_BASE+0x08)=0x00400000u;      /* ImageBaseAddress   */
     MR32(PEB_BASE+0xA4)=5; MR32(PEB_BASE+0xA8)=1;
+    { extern int asi_load(uint32_t); asi_load(TEB_BASE); }      /* runtime/asi.c: scripts\*.asi */
 
     { extern CPU *g_cur_cpu; g_cur_cpu = &cpu; }
     memset(&cpu,0,sizeof cpu);

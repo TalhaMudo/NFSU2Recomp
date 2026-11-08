@@ -105,7 +105,7 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
 | `runtime/overrides.c`, `d3dx_hle.c` | hand-written replacements for specific game functions |
 | `runtime/enhance.c` | HD build only (`-DNFS_ENHANCED=1`) |
 | `runtime/bundle.m`, `pack.sh` | `.app` behaviour and packaging |
-| `launcher/*.swift` | the app's launcher window (Swift/SwiftUI): finds and checks the game, Original/HD, portable copy |
+| `launcher/*.swift` | the app's launcher window (Swift/SwiftUI): finds and checks the game, Original/HD, portable copy, mods |
 | `tests/boot.c` | program entry point (runs the game from its PE entry point) |
 
 ## Verification
@@ -298,6 +298,13 @@ controller on or off, its stick dead zone and the XtendedInput layout
 hand); on **More**, **Make Copy…** builds a portable
 app with the game files inside (APFS clones, seconds on the same disk), so nobody
 needs `pack.sh --embed` or a terminal for that.
+On **Mods**, PC mods for the game's data are added from their archive or folder
+(**Add Mod…**): mods with a Binary / Binarius install script (`install.end`,
+`.endlauncher`), run with Binarius' own libraries, and mods that are plain game
+files; **NFSU2 Unlimiter** 4.0.0.802 has its own row with Download (North American
+v1.2 game). Each mod has a switch, off by default; the game folder is never
+changed: the mods are installed into a clone of it and only the files they change
+are kept, in Application Support (`docs/MODS.md`).
 **Restore Original Game** sets every option back to the original, unmodified
 game. Untick "Show this window when the app opens" to go straight into the game
 (hold Option to get the window back). `NFSU2_SKIP_LAUNCHER=1` / `NFSU2_ENGINE=original|hd` do the same

@@ -91,6 +91,7 @@ enum Prefs {
         OriginalValue(\.reflectSky, false),
         OriginalValue(\.reflectLights, false),
         OriginalValue(\.reflectDetail, false),
+        OriginalValue(\.modsOn, Set<String>()),        // Settings › Mods: every mod off
     ]
 }
 

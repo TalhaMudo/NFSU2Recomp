@@ -95,6 +95,16 @@ else
   cp "$BIN" "$APP/Contents/MacOS/NFSU2"     # old layout: the engine is the executable
 fi
 chmod +x "$APP/Contents/MacOS/"*
+
+# --- mod installer (Settings › Mods; tools/mods/binarius/build.sh), if built ---
+# Binarius' libraries with .NET inside (one file, ~36 MB): players need no .NET.
+MODINST="$ROOT/out/binarius/modinstall-app"
+NESTED=()
+if [ -x "$LAUNCHER" ] && [ -x "$MODINST/modinstall" ]; then
+  mkdir -p "$APP/Contents/Resources/modinstall"
+  cp -R "$MODINST/." "$APP/Contents/Resources/modinstall/"
+  NESTED+=(Resources/modinstall/libhuff.dylib Resources/modinstall/modinstall)
+fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # --- icon ---
@@ -176,6 +186,28 @@ for e in "${ENGINES[@]}"; do
     codesign --force --sign - --timestamp=none "$APP/Contents/MacOS/$e" 2>/dev/null || echo "warning: codesign failed: $e"
   fi
 done
+# the mod installer: .NET compiles at run time, which the hardened runtime allows only
+# with these entitlements
+if [ ${#NESTED[@]} -gt 0 ]; then
+  ENT="$(mktemp -t modinstall).plist"
+  cat > "$ENT" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>
+PLIST
+  for e in "${NESTED[@]}"; do
+    if [ -n "$SIGN_ID" ]; then
+      codesign --force --options runtime --entitlements "$ENT" --sign "$SIGN_ID" --timestamp "$APP/Contents/$e" || { echo "codesign FAILED: $e"; exit 1; }
+    else
+      codesign --force --sign - --timestamp=none "$APP/Contents/$e" 2>/dev/null || echo "warning: codesign failed: $e"
+    fi
+  done
+  rm -f "$ENT"
+fi
 if [ -n "$SIGN_ID" ]; then
   codesign --force --options runtime --sign "$SIGN_ID" --timestamp "$APP" \
     && echo "signature: $SIGN_ID" || { echo "codesign FAILED"; exit 1; }
