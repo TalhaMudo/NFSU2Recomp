@@ -24,7 +24,7 @@ enum SettingsTab: String, CaseIterable {
     case graphics, picture, controls, online, game, mods, more
 
     /// The tabs that have rows, in this order.
-    static let shown: [SettingsTab] = [.graphics, .picture, .controls, .mods, .more]
+    static let shown: [SettingsTab] = [.graphics, .picture, .controls, .game, .mods, .more]
 
     var title: String { rawValue.capitalized }
     var icon: String {          // SF Symbols available on macOS 11
@@ -188,6 +188,27 @@ struct ControlsSettings: View {
                            isOn: $model.xtendedInput)
                 .disabled(!model.controller || !model.canUseXtendedInput)
                 .opacity(model.controller && model.canUseXtendedInput ? 1 : 0.5)
+            }
+        }
+    }
+}
+
+struct GameSettings: View {
+    @ObservedObject var model: LauncherModel
+    var body: some View {
+        let langs = model.languages
+        VStack(alignment: .leading, spacing: 12) {
+            Card("Language") {
+                SettingRow(title: "Language",
+                           description: "The game's menus and text, and its movies where the game folder has them in that language (for example MOVIES/Scene01_fr.vp6); otherwise the English movie plays. Only the languages in this game folder are listed.") {
+                    Picker("", selection: $model.language) {
+                        ForEach(langs, id: \.id) { l in Text(l.label).tag(l.id) }
+                        if !langs.contains(where: { $0.id == model.language }) {
+                            Text("\(model.language) (not in this game folder)").tag(model.language)
+                        }
+                    }
+                    .pickerStyle(MenuPickerStyle()).labelsHidden().fixedSize()
+                }
             }
         }
     }
@@ -365,9 +386,10 @@ struct SettingsView: View {
         case .graphics: GraphicsSettings(model: model)
         case .picture: PictureSettings(model: model)
         case .controls: ControlsSettings(model: model)
+        case .game: GameSettings(model: model)
         case .mods: ModsSettings(model: model)
         case .more: MoreSettings(model: model)
-        case .online, .game: EmptyView()      // no rows yet
+        case .online: EmptyView()      // no rows yet
         }
     }
 

@@ -11,6 +11,11 @@ fi
 # NFSU2_MODS=<folder>: mod files, read before the game's own (changed copies at their
 #   game-folder paths, a .deleted list); the launcher's Mods tab builds
 #   ~/Library/Application Support/NFSU2/Mods/Files.  See runtime/fileio.c, docs/MODS.md.
+# NFSU2_LANGUAGE=<language>: the game's language (launcher Settings > Game): English US,
+#   English UK, French, German, Italian, Spanish, Swedish, Danish, Dutch (or fr, de, it,
+#   es, sv, da, nl).  The text comes from LANGUAGES/<language>.BIN; movies are taken in
+#   that language when the folder has them (Scene01_fr.vp6, ealogo_dn.vp6...), otherwise
+#   English.  Unset: English, as before.  See runtime/win32_ext.c game_language.
 # NFSU2_REGION=na|eu: the game's region.  Default: detected from the data's region
 #   cars (CARS/CIVIC + RSX without CORSA + PEUGOT106 = North American, e.g. US discs).
 #   See runtime/overrides.c, region_install.

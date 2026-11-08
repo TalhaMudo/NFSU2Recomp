@@ -777,6 +777,44 @@ static void *timer_thread_main(void *p){
 /* ---- exported API ---- */
 static uint32_t A(CPU *c, int i){ return MR32(c->esp + 4u*(uint32_t)i); }
 
+/* ---- the game's language ------------------------------------------------
+ * At start the game reads the "Language" value and compares it with its own
+ * names (table at 0x7fca08, the same in the EU and NA executables): that picks
+ * the text file (LANGUAGES\*.BIN) and the movies' language.  On a PC the
+ * installer writes it; here it was always "English".  NFSU2_LANGUAGE (set by the
+ * launcher's Settings > Game > Language) gives one of the game's names; short
+ * forms are accepted too.  Unknown values keep English.  Each row: name, short
+ * form, the movie file suffixes of that language (EA's own first).  The movies
+ * follow the choice in fileio.c (movie_lang_suffixes). */
+static const char *const g_langs[][5] = {
+    { "English US", "english", "_en", 0 },          { "English UK", "englishuk", "_en", 0 },
+    { "French", "fr", "_fr", 0 },                   { "German", "de", "_ge", "_de", 0 },
+    { "Italian", "it", "_it", 0 },                  { "Spanish", "es", "_sp", "_es", 0 },
+    { "Swedish", "sv", "_sw", "_sv", 0 },           { "Danish", "da", "_dn", "_da", 0 },
+    { "Dutch", "nl", "_du", "_nl", 0 },             { "Korean", "ko", "_ko", "_kr", 0 },
+    { "Chinese (Traditional)", "chinese", "_ch", "_tw", 0 }, { "Japanese", "ja", "_jp", "_ja", 0 },
+};
+static int g_lang = -2;                    /* -2 not read yet, -1 unset / unknown */
+static void lang_read(void){
+    if (g_lang != -2) return;
+    g_lang = -1;
+    const char *e = getenv("NFSU2_LANGUAGE");
+    if (!e || !*e) return;
+    for (int i = 0; i < (int)(sizeof g_langs / sizeof g_langs[0]); i++)
+        if (!strcasecmp(e, g_langs[i][0]) || !strcasecmp(e, g_langs[i][1])){ g_lang = i; break; }
+    if (g_lang >= 0) fprintf(stderr, "language: %s\n", g_langs[g_lang][0]);
+    else             fprintf(stderr, "language: unknown NFSU2_LANGUAGE \"%s\", English kept\n", e);
+}
+/* The movie suffixes to look for first (0-terminated), 0 without a chosen language. */
+const char *const *movie_lang_suffixes(void){
+    lang_read();
+    return g_lang >= 0 ? &g_langs[g_lang][2] : 0;
+}
+const char *game_language(void){
+    lang_read();
+    return g_lang >= 0 ? g_langs[g_lang][0] : 0;
+}
+
 /* --- simple persistent registry ----------------------------------------
  * The settings the game writes (graphics detail, resolution, sound) used to be
  * thrown away.  Here they are kept and written to the ~/.nfsu2_registry file. */
@@ -895,7 +933,8 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
             fprintf(stderr,"  [registry] QueryValue(\"%s\")\n", vn);
 
         const char *sval = 0; uint32_t dval = 0; int have_d = 0;
-        { int ri = reg_find(vn);            /* look at the SAVED value first */
+        if (!strcasecmp(vn,"Language")) sval = game_language();   /* NFSU2_LANGUAGE */
+        if (!sval){ int ri = reg_find(vn);  /* look at the SAVED value first */
           if (ri >= 0){
               if (g_reg[ri].is_str) sval = g_reg[ri].sv;
               else { dval = g_reg[ri].dw; have_d = 1; }

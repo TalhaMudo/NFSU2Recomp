@@ -74,6 +74,7 @@ enum Prefs {
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
     static let frameRate = "LauncherFrameRate"      // 30 | 60 | 120 | 240 -> NFSU2_FPS
     static let fpsCounter = "LauncherFPSCounter"    // -> NFSU2_FPSCOUNTER
+    static let language = "LauncherLanguage"       // GameLanguage.id, "" = English -> NFSU2_LANGUAGE
     // HD engine only (Settings > Picture, Reflections; runtime/reflect.c).
     static let reflectSky = "LauncherReflectSky"         // -> NFSU2_REFLECT_SKY
     static let reflectLights = "LauncherReflectLights"   // -> NFSU2_REFLECT_LIGHTS
@@ -93,6 +94,36 @@ enum Prefs {
         OriginalValue(\.reflectDetail, false),
         OriginalValue(\.modsOn, Set<String>()),        // Settings › Mods: every mod off
     ]
+}
+
+/// Settings › Game › Language: the languages the game itself has (runtime/win32_ext.c,
+/// game_language), offered when the game folder has the language's text file.  The
+/// game's Korean, Chinese and Japanese need their Asian release's fonts and text,
+/// which the European and North American folders don't have, so they are left out.
+/// Like the language picked in the PC installer, this is not a change to the game:
+/// it is not in Prefs.originalGame.
+struct GameLanguage: Hashable {
+    let id: String          // NFSU2_LANGUAGE, the game's own name; "" = English, the default
+    let label: String
+    let file: String        // LANGUAGES/<file>
+    static let all: [GameLanguage] = [
+        GameLanguage(id: "", label: "English", file: "English.bin"),
+        GameLanguage(id: "French", label: "Français", file: "French.bin"),
+        GameLanguage(id: "German", label: "Deutsch", file: "German.bin"),
+        GameLanguage(id: "Italian", label: "Italiano", file: "Italian.bin"),
+        GameLanguage(id: "Spanish", label: "Español", file: "Spanish.bin"),
+        GameLanguage(id: "Dutch", label: "Nederlands", file: "Dutch.bin"),
+        GameLanguage(id: "Swedish", label: "Svenska", file: "Swedish.bin"),
+        GameLanguage(id: "Danish", label: "Dansk", file: "Danish.bin"),
+    ]
+    /// The languages whose text file is in this game folder (any letter case).
+    static func available(in folder: URL?) -> [GameLanguage] {
+        guard let f = folder,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: f.appendingPathComponent("LANGUAGES").path)
+        else { return [all[0]] }
+        let have = Set(names.map { $0.lowercased() })
+        return all.filter { $0.id.isEmpty || have.contains($0.file.lowercased()) }
+    }
 }
 
 /// An option of LauncherModel and the value that gives the original game.

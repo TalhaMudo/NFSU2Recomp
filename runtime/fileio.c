@@ -267,6 +267,7 @@ int fileio_is_handle(uint32_t h){ return fh_get(h)!=0; }
  * BOOTMOVIES=off: the logos, the blank screen, the notice and the opening movie
  * are not opened; the game goes on as for a missing file. */
 int bootmovies_mode(void);                 /* overrides.c: 0 original, 1 skippable, 2 off */
+const char *const *movie_lang_suffixes(void);  /* win32_ext.c: 0 without NFSU2_LANGUAGE */
 static int is_boot_movie(const char *path){
     const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
     const char *ext = strrchr(b, '.');
@@ -382,6 +383,28 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
          * suffix embedded, but the folder has "_en" files.  If the requested one
          * doesn't exist, try "_en" and the suffix-less version.         */
         struct stat _st;
+        /* With a language chosen (NFSU2_LANGUAGE), a movie is looked for in that
+         * language first, whatever suffix the game asked for: the European
+         * executable always asks for "_fr" (sub_0051c740), the North American one
+         * for none ("PSA.vp6").  Without the chosen language's file the request
+         * and the fallback below go on as before. */
+        if (!(flags & O_CREAT)){
+            const char *const *pref = movie_lang_suffixes();
+            const char *dot = strrchr(real, '.');
+            if (pref && dot && !strcasecmp(dot, ".vp6") && dot - real > 3){
+                char alt[1024];
+                size_t cut = (size_t)(dot - real) - (dot[-3] == '_' ? 3 : 0);
+                for (int q = 0; pref[q]; q++){
+                    snprintf(alt, sizeof alt, "%.*s%s%s", (int)cut, real, pref[q], dot);
+                    if (stat_ci(alt, sizeof alt)){
+                        if (strcmp(alt, real) && (getenv("VERBOSE") || getenv("FILELIST")))
+                            fprintf(stderr,"  [file] movie language: \"%s\" -> \"%s\"\n", real, alt);
+                        snprintf(real, sizeof real, "%s", alt);
+                        break;
+                    }
+                }
+            }
+        }
         if (!(flags & O_CREAT) && stat(real, &_st) != 0){
             char alt[1024]; const char *dot = strrchr(real, '.');
             if (dot && dot - real > 3){

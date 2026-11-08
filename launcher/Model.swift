@@ -25,6 +25,11 @@ final class LauncherModel: ObservableObject {
     @Published var frameRate: Int { didSet { defaults.set(frameRate, forKey: Prefs.frameRate) } }
     @Published var fpsCounter: Bool { didSet { defaults.set(fpsCounter, forKey: Prefs.fpsCounter) } }
     private var setFPS = false           // NFSU2_FPS / NFSU2_FPSCOUNTER were set by us
+    /// Settings › Game › Language (GameLanguage.id; "" = English); passed as NFSU2_LANGUAGE.
+    @Published var language: String { didSet { defaults.set(language, forKey: Prefs.language) } }
+    private let languageFromEnv = ProcessInfo.processInfo.environment["NFSU2_LANGUAGE"] != nil
+    /// The languages this game folder has.
+    var languages: [GameLanguage] { GameLanguage.available(in: location?.folder) }
     @Published var controller: Bool { didSet { defaults.set(controller, forKey: Prefs.controller) } }
     @Published var stickDeadzone: Double { didSet { defaults.set(stickDeadzone, forKey: Prefs.stickDeadzone) } }
     private var setPad = false           // NFSU2_PAD / NFSU2_PAD_DEADZONE were set by us
@@ -86,6 +91,8 @@ final class LauncherModel: ObservableObject {
         let fr = defaults.integer(forKey: Prefs.frameRate)
         frameRate = [30, 60, 120, 240].contains(fr) ? fr : 120
         fpsCounter = defaults.bool(forKey: Prefs.fpsCounter)
+        let lang = defaults.string(forKey: Prefs.language) ?? ""
+        language = GameLanguage.all.contains { $0.id == lang } ? lang : ""
         controller = defaults.bool(forKey: Prefs.controller)
         stickDeadzone = min(0.5, max(0, defaults.double(forKey: Prefs.stickDeadzone)))
         xtendedInput = defaults.bool(forKey: Prefs.xtendedInput)
@@ -180,6 +187,13 @@ final class LauncherModel: ObservableObject {
             if frameRate == 120 { unsetenv("NFSU2_FPS") } else { setenv("NFSU2_FPS", String(frameRate), 1) }
             setenv("NFSU2_FPSCOUNTER", fpsCounter ? "1" : "0", 1)
             setFPS = true
+        }
+        // The game's language (runtime/win32_ext.c); one set by hand wins.  A language
+        // whose file this game folder lacks falls back to English.
+        if !languageFromEnv {
+            if !language.isEmpty && languages.contains(where: { $0.id == language }) {
+                setenv("NFSU2_LANGUAGE", language, 1)
+            } else { unsetenv("NFSU2_LANGUAGE") }
         }
         // Controller settings; NFSU2_PAD / NFSU2_PAD_DEADZONE set by hand still win.  Ours
         // are overwritten on every Play, so a change takes effect without restarting.
