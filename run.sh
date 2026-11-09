@@ -16,6 +16,8 @@ fi
 #   es, sv, da, nl).  The text comes from LANGUAGES/<language>.BIN; movies are taken in
 #   that language when the folder has them (Scene01_fr.vp6, ealogo_dn.vp6...), otherwise
 #   English.  Unset: English, as before.  See runtime/win32_ext.c game_language.
+# NFSU2_HUDHD=1: sharper HUD and menus (launcher Settings > More): out/hudhd.pak (or the
+#   app's Resources), =<path> another pack; built by tools/hudhd_pack.py.  runtime/hudhd.c
 # NFSU2_REGION=na|eu: the game's region.  Default: detected from the data's region
 #   cars (CARS/CIVIC + RSX without CORSA + PEUGOT106 = North American, e.g. US discs).
 #   See runtime/overrides.c, region_install.

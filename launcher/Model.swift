@@ -25,6 +25,11 @@ final class LauncherModel: ObservableObject {
     @Published var frameRate: Int { didSet { defaults.set(frameRate, forKey: Prefs.frameRate) } }
     @Published var fpsCounter: Bool { didSet { defaults.set(fpsCounter, forKey: Prefs.fpsCounter) } }
     private var setFPS = false           // NFSU2_FPS / NFSU2_FPSCOUNTER were set by us
+    /// Settings › More: the HUD, menus and fonts from hudhd.pak (runtime/hudhd.c); passed as NFSU2_HUDHD.
+    @Published var sharperHUD: Bool { didSet { defaults.set(sharperHUD, forKey: Prefs.sharperHUD) } }
+    private let sharperHUDFromEnv = ProcessInfo.processInfo.environment["NFSU2_HUDHD"] != nil
+    /// The pack is in this app (pack.sh puts it in when it was built).
+    var hasSharperHUD: Bool { FileManager.default.fileExists(atPath: Paths.bundle.appendingPathComponent("Contents/Resources/hudhd.pak").path) }
     /// Settings › Game › Language (GameLanguage.id; "" = English); passed as NFSU2_LANGUAGE.
     @Published var language: String { didSet { defaults.set(language, forKey: Prefs.language) } }
     private let languageFromEnv = ProcessInfo.processInfo.environment["NFSU2_LANGUAGE"] != nil
@@ -91,6 +96,7 @@ final class LauncherModel: ObservableObject {
         let fr = defaults.integer(forKey: Prefs.frameRate)
         frameRate = [30, 60, 120, 240].contains(fr) ? fr : 120
         fpsCounter = defaults.bool(forKey: Prefs.fpsCounter)
+        sharperHUD = defaults.bool(forKey: Prefs.sharperHUD)
         let lang = defaults.string(forKey: Prefs.language) ?? ""
         language = GameLanguage.all.contains { $0.id == lang } ? lang : ""
         controller = defaults.bool(forKey: Prefs.controller)
@@ -187,6 +193,10 @@ final class LauncherModel: ObservableObject {
             if frameRate == 120 { unsetenv("NFSU2_FPS") } else { setenv("NFSU2_FPS", String(frameRate), 1) }
             setenv("NFSU2_FPSCOUNTER", fpsCounter ? "1" : "0", 1)
             setFPS = true
+        }
+        // Sharper HUD and menus (runtime/hudhd.c), both engines; one set by hand wins.
+        if !sharperHUDFromEnv {
+            if sharperHUD && hasSharperHUD { setenv("NFSU2_HUDHD", "1", 1) } else { unsetenv("NFSU2_HUDHD") }
         }
         // The game's language (runtime/win32_ext.c); one set by hand wins.  A language
         // whose file this game folder lacks falls back to English.

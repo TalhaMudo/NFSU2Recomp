@@ -345,6 +345,13 @@ struct MoreSettings: View {
     @ObservedObject var model: LauncherModel
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if model.hasSharperHUD {
+                Card("Extras") {
+                    SettingRow(title: "Sharper HUD and menus",
+                               description: "The speedometer, minimap, menus, fonts and car logos redrawn at up to four times the detail, from LunicAura106's Upscaled HUD. Loaded with the game, no extra work while playing. Off: as in the original game.",
+                               isOn: $model.sharperHUD)
+                }
+            }
             Card {
                 SettingRow(title: "Portable copy",
                            description: "One app with the game inside, for another Mac or a USB drive. Movies and language packs can be left out to make it smaller.") {

@@ -1234,6 +1234,7 @@ static id<MTLSamplerState>        g_samp;
                         * before that a race used ~3000 new ids and 16384 ran out after ~30 min. */
 static uint8_t g_tex_cube[MAXTEX];          /* 1 = MTLTextureTypeCube */
 static unsigned g_tex_lvlmask[MAXTEX];
+static uint8_t g_tex_fixed[MAXTEX];         /* filled once by metal_tex_fill_fixed (hudhd.c): game uploads are dropped */
 static id<MTLTexture> g_tex[MAXTEX];
 static unsigned       g_texn = 1;            /* 0 = "no texture" (white) */
 /* --- releasing render targets on Reset --------------------------------
@@ -1402,6 +1403,7 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     g_tex[id_] = t;
     g_tex_cube[id_] = 0;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
+    g_tex_fixed[id_] = 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
 }
@@ -4240,6 +4242,7 @@ static void tex_release_pending(void){
         g_tex[i] = nil; g_tex_live[i] = 0; g_tex_pending[i] = 0; g_tex_owner[i] = 0;
         if (g_tex_isrt[i]) g_rt_freed++;
         g_tex_isrt[i] = 0; g_tex_cube[i] = 0; g_tex_lvlmask[i] = 0; g_tex_freed[i] = 1; g_texup_n[i] = 0;
+        g_tex_fixed[i] = 0;
 #if NFS_ENHANCED
         g_hd_road[i] = 0; g_hd_dirty[i] = 0; g_hd_ow[i] = 0; g_hd_oh[i] = 0; g_rt_tstamp[i] = 0;
         for (unsigned m = 0; m < g_rt_smn && m < RT_SMAXE; m++){   /* static reflection materials */
@@ -4282,6 +4285,7 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
                                const void *data, unsigned pitch,
                                unsigned w, unsigned h, unsigned d3dfmt){
     if (!id_ || id_ >= MAXTEX || !g_tex[id_] || !data) return;
+    if (g_tex_fixed[id_]) return;            /* hudhd.c: the high-resolution copy stays */
     g_texup_n[id_]++;
     unsigned blk, bpb;
     if (d3dfmt_to_mtl(d3dfmt, &blk, &bpb) == MTLPixelFormatInvalid) return;
@@ -4330,6 +4334,29 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
 void metal_upload_texture(unsigned id_, unsigned level, const void *data,
                           unsigned pitch, unsigned w, unsigned h, unsigned d3dfmt){
     metal_upload_texture_face(id_, level, 0u, data, pitch, w, h, d3dfmt);
+}
+/* A texture made with content of our own (hudhd.c, the sharper HUD): every level
+ * written now, straight into a texture the GPU has not seen yet, and the game's own
+ * uploads to it are dropped from then on.  data: the levels in turn, tightly packed. */
+void metal_tex_fill_fixed(unsigned id_, unsigned levels, unsigned w, unsigned h,
+                          unsigned d3dfmt, const void *data, size_t size){
+    if (!id_ || id_ >= MAXTEX || !g_tex[id_] || !data) return;
+    unsigned blk, bpb;
+    if (d3dfmt_to_mtl(d3dfmt, &blk, &bpb) == MTLPixelFormatInvalid) return;
+    const uint8_t *p = data, *end = p + size;
+    for (unsigned lv = 0; lv < levels && lv < 16u; lv++){
+        unsigned lw = w >> lv, lh = h >> lv;
+        if (!lw) lw = 1; if (!lh) lh = 1;
+        size_t pitch = (blk == 1) ? (size_t)lw * bpb : (size_t)((lw + blk - 1) / blk) * bpb;
+        size_t rows = (blk == 1) ? lh : (lh + blk - 1) / blk;
+        if (p + pitch * rows > end) break;
+        [g_tex[id_] replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:lv
+                        withBytes:p bytesPerRow:pitch];
+        g_tex_lvlmask[id_] |= 1u << lv;
+        p += pitch * rows;
+    }
+    g_tex_fixed[id_] = 1;
+    atomic_fetch_add(&g_tex_uploaded, 1);
 }
 /* Compare the declared mip count with the levels ACTUALLY uploaded.
  * An unuploaded level = undefined memory; when that level gets selected at

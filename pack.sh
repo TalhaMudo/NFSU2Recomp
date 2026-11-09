@@ -105,6 +105,16 @@ if [ -x "$LAUNCHER" ] && [ -x "$MODINST/modinstall" ]; then
   cp -R "$MODINST/." "$APP/Contents/Resources/modinstall/"
   NESTED+=(Resources/modinstall/libhuff.dylib Resources/modinstall/modinstall)
 fi
+# --- sharper HUD and menus (Settings › More; runtime/hudhd.c) ---
+# hudhd.pak, built by tools/hudhd_pack.py from LunicAura106's Upscaled HUD
+# (nfsmods.xyz/mod/4319; UHUD_SRC= the .7z, by default next to the other mod files).
+# Without it the app has no such option.
+UHUD_SRC="${UHUD_SRC:-$HOME/Downloads/nfsu2-mod-files/dl/nfsmods/NFSU2UHUD11192022a.7z}"
+if [ ! -f "$ROOT/out/hudhd.pak" ] && [ -f "$UHUD_SRC" ]; then
+  python3 -I "$ROOT/tools/hudhd_pack.py" "$UHUD_SRC" "$ROOT/out/hudhd.pak" || rm -f "$ROOT/out/hudhd.pak"
+fi
+if [ -f "$ROOT/out/hudhd.pak" ]; then cp "$ROOT/out/hudhd.pak" "$APP/Contents/Resources/hudhd.pak"
+else echo "note: no hudhd.pak (UHUD_SRC), the app is made without the sharper HUD option"; fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # --- icon ---

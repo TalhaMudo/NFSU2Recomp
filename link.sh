@@ -42,9 +42,9 @@ case "${BUILD:-eu}" in
   *)  echo "BUILD must be eu or na"; exit 1 ;;
 esac
 
-CSRC="mem dispatch genexec win32 win32_ext win32_asi asi com debug res fileio overrides d3dx_hle vsemu enhance perflog wsfov gheap sndlead xpatch highfps xtinput visual reflect"
+CSRC="mem dispatch genexec win32 win32_ext win32_asi asi com debug res fileio overrides d3dx_hle vsemu enhance perflog wsfov gheap sndlead xpatch highfps xtinput visual reflect hudhd"
 MSRC="metal audio bundle gamepad picture"
-FW="-lm -framework Cocoa -framework Metal -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreServices -framework AudioToolbox -framework GameController -framework CoreText"
+FW="-lm -lz -framework Cocoa -framework Metal -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreServices -framework AudioToolbox -framework GameController -framework CoreText"
 SHARDS="$SOBJ/shard_*.o $SOBJ/fntab.o $SOBJ/stubs.o"
 # ASI plugin (tools/mods/build_ul.sh): its lifted code and the runtime table of
 # its recorded patches.  Only with the North American engine (the plugins'

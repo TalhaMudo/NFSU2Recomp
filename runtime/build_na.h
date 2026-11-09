@@ -21,6 +21,8 @@
 #define GA_0x005cab69u 0x005cab59u   /* function 005caae0 + 0x89 */
 #define GA_0x005cae71u 0x005cae61u   /* function 005caae0 + 0x391 */
 #define GA_0x005cbe54u 0x005cbe44u   /* function 005cbdd0 + 0x84 */
+#define GA_0x005ce2eau 0x005ce2dau   /* function 005ce180 + 0x16a */
+#define GA_0x005ce30eu 0x005ce2feu   /* function 005ce180 + 0x18e */
 #define GA_0x005cf430u 0x005cf420u   /* function 005cf430 + 0x0 */
 #define GA_0x005d2c27u 0x005d2c17u   /* function 005d2922 + 0x305 */
 #define GA_0x005d6666u 0x005d6656u   /* function 005d6580 + 0xe6 */

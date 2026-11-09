@@ -48,6 +48,11 @@ int app_is_bundled(void){
     return 1;
 }
 
+/* Contents/Resources of the bundle we run from, 0 outside a bundle. */
+const char *app_resource_dir(void){ return app_is_bundled() ? g_res_dir : 0; }
+/* The folder of this executable (out/ when run from the repository). */
+const char *app_exe_dir(void){ app_is_bundled(); return g_exe_dir[0] ? g_exe_dir : 0; }
+
 /* The in-bundle equivalent of the exports in run.sh.  If already in the
  * environment we leave them alone: overriding with "NFSU2_DATA=... open -a"
  * stays possible.  ALARM is deliberately 0: boot.c's 20 s diagnostic timeout

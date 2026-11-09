@@ -74,6 +74,7 @@ enum Prefs {
     static let wideHUD = "LauncherWideHUD"         // HUDPOS=1 for the engine
     static let frameRate = "LauncherFrameRate"      // 30 | 60 | 120 | 240 -> NFSU2_FPS
     static let fpsCounter = "LauncherFPSCounter"    // -> NFSU2_FPSCOUNTER
+    static let sharperHUD = "LauncherSharperHUD"   // -> NFSU2_HUDHD (Settings › More)
     static let language = "LauncherLanguage"       // GameLanguage.id, "" = English -> NFSU2_LANGUAGE
     // HD engine only (Settings > Picture, Reflections; runtime/reflect.c).
     static let reflectSky = "LauncherReflectSky"         // -> NFSU2_REFLECT_SKY
@@ -88,6 +89,7 @@ enum Prefs {
         OriginalValue(\.wideHUD, false),
         OriginalValue(\.frameRate, 120),
         OriginalValue(\.fpsCounter, false),
+        OriginalValue(\.sharperHUD, false),
         OriginalValue(\.picture, PictureOptions.original),
         OriginalValue(\.reflectSky, false),
         OriginalValue(\.reflectLights, false),

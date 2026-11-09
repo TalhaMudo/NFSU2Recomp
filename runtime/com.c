@@ -3726,7 +3726,11 @@ int com_call(CPU *c, uint32_t magic){
             if (ekind == ENH_ROAD){ mlev = 1u; for (uint32_t q = mw > mh ? mw : mh; q > 1u; q >>= 1) mlev++; }
             if (metal_available()){
                 /* D3DUSAGE_RENDERTARGET = 1 */
-                uint32_t tid = metal_create_texture_ex(mw,mh,mlev,fmt,(usage & 1u)?1u:0u);
+                /* hudhd.c: a HUD / menu texture of the game's loader may come from the
+                 * sharper pack (Metal size only; the game keeps w x h) */
+                unsigned hudhd_create(uint32_t, uint32_t);
+                uint32_t tid = (usage & 1u) ? 0u : hudhd_create(c->eip, c->esi);
+                if (!tid) tid = metal_create_texture_ex(mw,mh,mlev,fmt,(usage & 1u)?1u:0u);
                 MR32(t+28)=tid;
                 if (tid && tid < 65536u){ g_tid_w[tid] = (uint16_t)(mw > 65535u ? 65535u : mw);
                                           g_tid_h[tid] = (uint16_t)(mh > 65535u ? 65535u : mh); }
@@ -4982,6 +4986,7 @@ void com_report(void){
                        "  Metal textures     : %ld created, %ld uploads\n",
                 metal_frames(), metal_tris(),
                 metal_tex_created(), metal_tex_uploaded());
+    { void hudhd_report(void); hudhd_report(); }
     fprintf(stderr,"  Draw* calls        : %llu\n",(unsigned long long)g_draw);
     fprintf(stderr,"  ps constant file   : highest used c%u, %u writes above 32\n",
             g_psc_max ? g_psc_max-1u : 0u, g_psc_drop);
