@@ -2254,7 +2254,7 @@ int dxrec_redundant(const DxRec *r){
 
 /* COMSTAT=<frame>: IDirect3DDevice9 method counts, whether they come from INSIDE
  * or OUTSIDE D3DX BeginPass / CommitChanges, and the REDUNDANT ratio (same as the
- * last value on the device).  For D3DX_HLE.md Stage 2; must be used together with
+ * last value on the device).  For docs/d3dx-hle.md Stage 2; must be used together with
  * D3DXSTAT (that wrapper keeps the BeginPass depth). */
 extern int g_dx_in_pass;
 static int g_cs_on = -1; static long g_cs_from = 0, g_cs_f0 = -1;
@@ -2315,7 +2315,7 @@ void comstat_report(void){
 /* FXTRACE=<frame>[,<frame>...]: prints every device call (arguments,
  * constant/matrix data) and the effect method markers from d3dx_hle.c in order in
  * those frames.  A behavioral reference so the native ID3DXEffect produces the
- * same device state as D3DX (D3DX_HLE.md, Stage 4). */
+ * same device state as D3DX (docs/d3dx-hle.md, Stage 4). */
 int g_fxtr = 0;
 static uint32_t g_fxtr_fr[8]; static int g_fxtr_nf;
 __attribute__((constructor)) static void fxtr_init(void){

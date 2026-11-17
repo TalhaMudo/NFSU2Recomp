@@ -20,10 +20,10 @@
  *          turns it off; D3DXVERIFY2=<n>).  Device call recording is in com.c (dxrec.h).
  * Stage 3: parameter versions (the sub_0065ab24 hook) + sub_006691b1 pass
  *          memo.  Came out WRONG in verification -> OFF by default (D3DXMEMO3=1).
- * Details, measurements and progress log: D3DX_HLE.md.
+ * Details, measurements and progress log: docs/d3dx-hle.md.
  *
  * CAUTION: every sub_XXXX here, together with the ones in runtime/overrides.c,
- * must be in genall.py's OVERRIDE list (see D3DX_HLE.md).                */
+ * must be in genall.py's OVERRIDE list (see docs/d3dx-hle.md).                */
 #include "cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1386,7 +1386,7 @@ out:
  * device calls currently have no effect.  Eligibility: every state in the pass
  * is type 1..8, no nested application, 6691b1's special paths (P&8,
  * [this+0x3c]==4 && P&1) off.
- *   D3DXMEMO3=1     : on (OFF by default -- see D3DX_HLE.md Stage 3 result)
+ *   D3DXMEMO3=1     : on (OFF by default -- see docs/d3dx-hle.md Stage 3 result)
  *   D3DXVERIFY3=<n> : on 1/n of the hits run the original, memory + device */
 #define M3_BUF 192u
 typedef struct {

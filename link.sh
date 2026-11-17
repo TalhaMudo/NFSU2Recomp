@@ -4,7 +4,7 @@
 # TWO SEPARATE BUILDS are produced; the lifted shards are SHARED, only the runtime differs:
 #   out/nfsu2_boot     original  -- the game's own look, a faithful port
 #   out/nfsu2_hd_boot  HD        -- graphics improvements (runtime/enhance.*,
-#                                   NFS_ENHANCED=1).  See GRAPHICS_RESEARCH.md
+#                                   NFS_ENHANCED=1).  See docs/graphics.md
 #   out/nfsu2_all      test suite (with the original runtime)
 #
 #   ./link.sh          both
@@ -14,7 +14,7 @@
 # BUILD=na: the North American v1.2 executable (README "Game versions").
 #   Shards from gen/na -> out/obj_na (BUILD=na ./build.sh), the runtime compiled
 #   with -DNFS_EXE_NA=1 and runtime/build_na.h (the reference build's addresses
-#   mapped to this build, tools/addrmap.py), binaries out/nfsu2_na_boot and
+#   mapped to this build, tools/lifter/addrmap.py), binaries out/nfsu2_na_boot and
 #   out/nfsu2_na_hd_boot.  No test suite binary.
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"; cd "$ROOT"
@@ -36,8 +36,8 @@ case "${BUILD:-eu}" in
       # keep the address header in step with the runtime when the map is here
       # (it needs both executables to build; the committed header is used otherwise)
       if [ -f out/na/addrmap.json ]; then
-        "$ROOT/.venv/bin/python" tools/addrmap.py header out/na/addrmap.json runtime/build_na.h \
-          runtime/*.c runtime/*.m runtime/*.h tests/boot.c
+        "$ROOT/.venv/bin/python" tools/lifter/addrmap.py header out/na/addrmap.json runtime/build_na.h \
+          runtime/*.c runtime/*.m runtime/*.h runtime/boot.c
       fi ;;
   *)  echo "BUILD must be eu or na"; exit 1 ;;
 esac
@@ -67,7 +67,7 @@ build_rt(){
     clang $OPT $XDEF -DNFS_ENHANCED=$enh -DNFS_VERSION=$VERSION -fobjc-arc -Iruntime -I$GEN -c -o "$od/$f.o" "runtime/$f.m" & pids="$pids $!"
   done
   clang $OPT -Iruntime -I$GEN -c -o "$od/impargs.o" $GEN/impargs.c & pids="$pids $!"
-  clang $OPT $XDEF -DNFS_ENHANCED=$enh -Iruntime -I$GEN -c -o "$od/boot.o" tests/boot.c & pids="$pids $!"
+  clang $OPT $XDEF -DNFS_ENHANCED=$enh -Iruntime -I$GEN -c -o "$od/boot.o" runtime/boot.c & pids="$pids $!"
   for p in $pids; do wait "$p" || { echo "compile error ($od)"; return 1; }; done
 }
 rt_objs(){ local od="$1" f o=""
@@ -98,7 +98,7 @@ fi
 # while isatest.py crashed for weeks the old gen/isatest.c got compiled and said
 # "439 passed", i.e. the tests never exercised the current lifter.  Now the stale
 # binary is deleted so ./run.sh test fails visibly.
-if "$ROOT/.venv/bin/python" "$ROOT/tools/isatest.py" >/dev/null \
+if "$ROOT/.venv/bin/python" "$ROOT/tools/verify/isatest.py" >/dev/null \
    && clang -O1 -Wno-unused-label -Iruntime -o out/isatest gen/isatest.c runtime/mem.c -lm; then
   :
 else

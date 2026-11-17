@@ -501,7 +501,7 @@ typedef struct { uint32_t entry, arg, teb; Obj *ob; } TArg;
 
 void mem_altstack_install(void);
 /* Guest threads need a BIG stack: in lifted code every guest call is a host C
- * call, and lifted frames are wide.  The main guest thread (tests/boot.c) got
+ * call, and lifted frames are wide.  The main guest thread (runtime/boot.c) got
  * 1 GB, but the worker threads the game opens with CreateThread got the macOS
  * default of 512 KB via `pthread_create(...,0,...)` -> a HOST STACK OVERFLOW in
  * deep recursion (SIGSEGV, an address outside guest space).  The reservation

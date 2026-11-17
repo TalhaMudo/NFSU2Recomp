@@ -19,7 +19,7 @@
  *   screens/     a small screenshot every 2 s (metal.m, written in the background)
  *   meta.txt     binary path, slide, clock mapping (for powermetrics)
  *
- * Analysis: tools/session_report.py <dir>.  Recording script: tools/session.sh. */
+ * Analysis: tools/perf/session_report.py <dir>.  Recording script: tools/perf/session.sh. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

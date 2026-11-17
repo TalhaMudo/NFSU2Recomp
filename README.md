@@ -37,7 +37,7 @@ The game boots, reaches the menus, and races are playable with sound.
 | Windowed, fullscreen, Retina-native and 1080p widescreen | working |
 | Career mode: profile creation (name entry), save and load | working |
 | Double-clickable `.app` with a launcher window (`./pack.sh`) | working |
-| Optional "HD" build: MSAA (2× at 1440 lines and above, 4× below), SSR, ray-traced reflections | working, see `GRAPHICS_RESEARCH.md` |
+| Optional "HD" build: MSAA (2× at 1440 lines and above, 4× below), SSR, ray-traced reflections | working, see `docs/graphics.md` |
 
 ### Known limitations
 
@@ -56,14 +56,14 @@ The game boots, reaches the menus, and races are playable with sound.
   disassembler mistook for code) are still emitted as traps. None are hit in the
   measured race scene.
 - Some visuals are unverified against a Windows reference (crowds / skinned
-  meshes). See "Remaining graphics items" in `PROJECT.md`.
+  meshes). See "Remaining graphics items" in `docs/devlog.md`.
 
 ## How it works
 
 ```
 SPEED2.EXE (PE32, x86)
-   │  tools/reloc2.py     recover the relocation table  → out/relocs.txt
-   │  tools/genall.py     recursive-descent discovery + tools/lift.py
+   │  tools/lifter/reloc2.py     recover the relocation table  → out/relocs.txt
+   │  tools/lifter/genall.py     recursive-descent discovery + tools/lifter/lift.py
    ▼                      x86 → C, one C function per guest function
 gen/all/shard_*.c  (128 files) + fntab.c (guest address → native function)
    │  build.sh            clang -O3, in parallel
@@ -77,7 +77,7 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
 - **Pointers vs. constants.** The hard problem of x86 static recompilation is
   telling a 4-byte address from a 4-byte number. This executable has its
   relocation *directory entry* zeroed, but the relocation *data* is still
-  physically present in an unnamed section. `tools/reloc2.py` parses it by hand:
+  physically present in an unnamed section. `tools/lifter/reloc2.py` parses it by hand:
   91,106 absolute addresses, all of which point into the image. Function
   discovery and jump-table recovery are seeded from it.
 - **Guest memory.** The 32-bit guest address space is reserved with `mmap`;
@@ -89,15 +89,15 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
   interpreter, handing calls back to lifted functions.
 - **D3DX effects.** The statically linked D3DX9 effect framework took ~47% of
   guest time when executed as lifted code; `runtime/d3dx_hle.c` short-circuits
-  parts of it (`D3DX_HLE.md`).
+  parts of it (`docs/d3dx-hle.md`).
 
 | Path | What it is |
 |---|---|
-| `tools/lift.py` | x86-32 → C lifter, with lazy EFLAGS (flag liveness) |
-| `tools/genall.py` | function discovery, parallel generation, sharding |
-| `tools/reloc2.py` | relocation table recovery |
-| `tools/argcount.py` | stdcall argument counts for imports |
-| `tools/isatest.py`, `tools/fuzzisa.py` | instruction-semantics tests and differential fuzzer |
+| `tools/lifter/lift.py` | x86-32 → C lifter, with lazy EFLAGS (flag liveness) |
+| `tools/lifter/genall.py` | function discovery, parallel generation, sharding |
+| `tools/lifter/reloc2.py` | relocation table recovery |
+| `tools/lifter/argcount.py` | stdcall argument counts for imports |
+| `tools/verify/isatest.py`, `tools/verify/fuzzisa.py` | instruction-semantics tests and differential fuzzer |
 | `runtime/cpu.h`, `mem.c`, `dispatch.c`, `genexec.c` | CPU state, guest memory, dispatch, run-time code |
 | `runtime/win32.c`, `win32_ext.c`, `fileio.c`, `res.c` | Win32 API layer |
 | `runtime/com.c`, `metal.m`, `vsemu.c` | Direct3D 9 / DirectInput / DirectSound COM layer, Metal renderer, shader translation |
@@ -106,13 +106,13 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
 | `runtime/enhance.c` | HD build only (`-DNFS_ENHANCED=1`) |
 | `runtime/bundle.m`, `pack.sh` | `.app` behaviour and packaging |
 | `launcher/*.swift` | the app's launcher window (Swift/SwiftUI): finds and checks the game, Original/HD, portable copy, mods |
-| `tests/boot.c` | program entry point (runs the game from its PE entry point) |
+| `runtime/boot.c` | program entry point (runs the game from its PE entry point) |
 
 ## Verification
 
 - **Instruction semantics:** 169 hand-written tests, 439 checks
-  (`tools/isatest.py` → `out/isatest`).
-- **Differential fuzzing against real x86:** `tools/fuzzisa.py` assembles random
+  (`tools/verify/isatest.py` → `out/isatest`).
+- **Differential fuzzing against real x86:** `tools/verify/fuzzisa.py` assembles random
   instruction sequences, runs them as real x86-64 code under Rosetta 2 and as
   lifted C on ARM64, and compares registers, flags and memory.
 - **Function-level tests:** 15 checks against lifted game functions
@@ -122,7 +122,7 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
 
 `./run.sh test` runs the first and third.
 
-- **Integrity run:** `tools/check.sh` plays both builds invisibly and silently
+- **Integrity run:** `tools/verify/check.sh` plays both builds invisibly and silently
   from the menus into a Quick Race (~1.5 min each) and checks the end-of-run
   report: no unsupported instructions, no unresolved indirect calls, no broken
   matrices, no GPU command buffer errors, no missing mip levels, the race was
@@ -131,8 +131,7 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
 
 ## Performance
 
-Measured on an M1 Pro at 1280×960, same scene and settings, alternating runs
-(method, raw numbers and caveats in `WINE_COMPARISON.md`):
+Measured on an M1 Pro at 1280×960, same scene and settings, alternating runs:
 
 | | This port | Wine 11.18 (wined3d, Rosetta 2) |
 |---|---|---|
@@ -150,7 +149,7 @@ HD build draws about 18 W.
 - Apple Silicon Mac, macOS 11 or later. Developed on an M1 Pro, macOS 27.
 - Xcode Command Line Tools (`clang`; `swiftc` for the launcher window).
 - Python 3 with `capstone` 5.x and `pefile` (`requirements.txt`).
-- Rosetta 2, only for `tools/fuzzisa.py`.
+- Rosetta 2, only for `tools/verify/fuzzisa.py`.
 - Your own installation of the game, with one of these executables (both v1.2
   without the CD check, built Feb 9 2005):
 
@@ -203,7 +202,7 @@ needed. With the two disc images (`.cue`/`.bin`, `.iso`, or the disc folders):
 
 ```bash
 brew install sevenzip     # only needed for .bin/.iso images
-python3 tools/install_from_discs.py ~/Games/NFSU2 "Disc 1.cue" "Disc 2.cue"
+python3 tools/packaging/install_from_discs.py ~/Games/NFSU2 "Disc 1.cue" "Disc 2.cue"
 ```
 
 This writes a normal game folder (about 1.7 GB) that the launcher can point at.
@@ -215,7 +214,7 @@ works with it (see "US data works with the supported executable" above).
 ### How the North American build is made
 
 The European executable is the reference: the runtime was written against it.
-`tools/addrmap.py` matches the two executables function by function (a byte
+`tools/lifter/addrmap.py` matches the two executables function by function (a byte
 signature with the parts that move between builds masked, aligned in order) and
 collects data-address pairs from the matched code: 23,276 of 23,277 functions
 match, most code is 16 bytes away from the European build, most data is at the
@@ -235,7 +234,7 @@ Two things differ at run time:
 
 Function discovery missed eight call targets in this executable (its linear scan
 stops on bytes an earlier, misaligned scan covered), which became traps;
-`LIFT_MISSING=1` (set by `tools/gen_v2.sh` for this build) lifts such targets in
+`LIFT_MISSING=1` (set by `tools/lifter/gen_v2.sh` for this build) lifts such targets in
 extra shards.
 
 ## Build and run
@@ -252,7 +251,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 #    to C, import argument table -> gen/all/   (~1 min on an M1 Pro)
 #    The script holds the OVERRIDE list (functions that runtime/overrides.c and
 #    runtime/d3dx_hle.c replace); it must match them or the link fails.
-tools/gen_v2.sh "$EXE"
+tools/lifter/gen_v2.sh "$EXE"
 
 # 2) compile the shards, then build the runtime and link   (~1.5 min)
 ./build.sh && ./link.sh
@@ -267,18 +266,18 @@ tools/gen_v2.sh "$EXE"
 ```
 
 For the North American v1.2 executable the same steps build a second pair of
-engines; `tools/gen_v2.sh` recognises the file by its SHA-256 and writes `gen/na`,
+engines; `tools/lifter/gen_v2.sh` recognises the file by its SHA-256 and writes `gen/na`,
 `run.sh` picks the engine by the executable, and `pack.sh` adds the engines to the
 app when they are built:
 
 ```bash
-tools/gen_v2.sh "/path/to/NA/SPEED2.EXE"       # -> gen/na
+tools/lifter/gen_v2.sh "/path/to/NA/SPEED2.EXE"       # -> gen/na
 BUILD=na ./build.sh && BUILD=na ./link.sh       # -> out/nfsu2_na_boot, out/nfsu2_na_hd_boot
 ```
 
 `runtime/build_na.h` is committed. `link.sh` regenerates it from
 `out/na/addrmap.json` when that file exists, which takes both executables:
-`tools/addrmap.py build <European SPEED2.EXE> <North American SPEED2.EXE> out/na/addrmap.json`.
+`tools/lifter/addrmap.py build <European SPEED2.EXE> <North American SPEED2.EXE> out/na/addrmap.json`.
 Do this after adding a `GA(...)` address or a `sub_` name to the runtime; game
 addresses written without `GA(...)` would be wrong in the North American engine.
 
@@ -304,7 +303,7 @@ On **Mods**, PC mods for the game's data are added from their archive or folder
 files; **NFSU2 Unlimiter** 4.0.0.802 has its own row with Download (North American
 v1.2 game). Each mod has a switch, off by default; the game folder is never
 changed: the mods are installed into a clone of it and only the files they change
-are kept, in Application Support (`docs/MODS.md`).
+are kept, in Application Support (`docs/mods.md`).
 **Restore Original Game** sets every option back to the original, unmodified
 game. Untick "Show this window when the app opens" to go straight into the game
 (hold Option to get the window back). `NFSU2_SKIP_LAUNCHER=1` / `NFSU2_ENGINE=original|hd` do the same
@@ -316,8 +315,8 @@ from scripts.
 
 While playing, **Cmd+Shift+D** writes the next frame as a PNG plus the full
 draw list (to `~/Library/Logs/NFSU2/`), for reporting rendering problems.
-`tools/session.sh [hd]` records a play session (frame times, CPU/GPU power,
-temperature, fan speed, screenshots) and `tools/session_report.py` turns it into
+`tools/perf/session.sh [hd]` records a play session (frame times, CPU/GPU power,
+temperature, fan speed, screenshots) and `tools/perf/session_report.py` turns it into
 a report.
 
 ## FAQ
@@ -336,7 +335,7 @@ Rosetta 2 is not used to run the game (only, optionally, by one test tool).
 **Is it faster than Wine or CrossOver?**
 On an M1 Pro at 1280×960: 119 fps in races (capped by the 120 Hz display)
 against 10–15 fps under Wine 11.18 with Rosetta 2, and 119 fps against 45 fps
-in the 3D menus. Method and raw numbers are in `WINE_COMPARISON.md`.
+in the 3D menus.
 
 **Is there a ready-made download?**
 Yes: the [Releases page](https://github.com/TalhaMudo/NFSU2Recomp/releases/latest) has `NFSU2.zip`. The app holds both
@@ -361,14 +360,14 @@ executable cannot be supported (it is copy-protected). Console versions are not
 supported. See [Game versions](#game-versions).
 
 **I only have the PC discs. Can I install them on a Mac?**
-Yes, without Windows: `tools/install_from_discs.py` unpacks the disc images
+Yes, without Windows: `tools/packaging/install_from_discs.py` unpacks the disc images
 into a game folder. See [Installing from the PC discs on a
 Mac](#installing-from-the-pc-discs-on-a-mac).
 
 **The sound cuts out for a moment every few seconds.**
 Fixed after v2.2: the game's two sound loops depend on waking up every 10 ms, and
 macOS woke them late or let the game's main thread keep them waiting (see
-`PROJECT.md`, "audio dropouts"). If it still happens, please attach
+`docs/devlog.md`, "audio dropouts"). If it still happens, please attach
 `~/Library/Logs/NFSU2/nfsu2.log` (`nfsu2-hd.log` for HD) to an issue: its
 `[timer]` lines show which part is late.
 
@@ -423,16 +422,31 @@ interpreter for x86 code the game generates at run time; and an end-to-end,
 playable Win32 + Direct3D 9 → macOS ARM64 + Metal port of a 23,000-function 3D
 game.
 
+## Repository layout
+
+```
+build.sh link.sh pack.sh run.sh   build, link, package and run (from the repository root)
+runtime/            Win32, Direct3D 9 -> Metal, DirectSound -> CoreAudio; boot.c is the entry point
+launcher/           the Swift launcher window of the app
+tests/              ISA / function test harness, save manager test
+tools/lifter/       x86 -> C lifter and the generation pipeline (gen_v2.sh)
+tools/analysis/     disassembly, cross-references, coverage, effect-file parsers
+tools/verify/       instruction tests, Rosetta differential fuzzer, quick race check
+tools/perf/         session recording and reports, run comparison, profiles
+tools/packaging/    app icon, sharp-HUD pack, installing from the PC discs
+tools/debug/        crash triage (diag.sh)
+tools/mods/         Binarius mod installer, NFSU2 Unlimiter build
+tools/nfsref/       Windows reference plugin (source only)
+docs/               engineering log, design notes, measurements, images
+```
+
 ## Documentation
 
-- `PROJECT.md` — chronological engineering log: findings, bugs and root causes,
+- `docs/devlog.md` — chronological engineering log: findings, bugs and root causes,
   measurements.
-- `D3DX_HLE.md` — high-level emulation of the D3DX effect framework.
-- `GRAPHICS_RESEARCH.md` — graphics research and the HD build.
-- `LIFTER_EFFICIENCY.md` — lifter efficiency work and measurements.
-- `WINE_COMPARISON.md` — comparison against Wine.
-- `LITERATURE.md` — related work.
-- `screenshots/report/nfsu2-report.html` — illustrated project report.
+- `docs/d3dx-hle.md` — high-level emulation of the D3DX effect framework.
+- `docs/graphics.md` — graphics research and the HD build.
+- `docs/lifter-efficiency.md` — lifter efficiency work and measurements.
 
 ## How this was built
 

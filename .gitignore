@@ -2,7 +2,7 @@
 # Game data + SPEED2.EXE (EA's copyrighted content)
 /Need for Speed Underground 2*/
 # Lifted C source: a translation of SPEED2.EXE's machine code (derivative work).
-# Regenerated exactly with tools/reloc2.py + tools/genall.py + tools/argcount.py.
+# Regenerated exactly with tools/lifter/reloc2.py + tools/lifter/genall.py + tools/lifter/argcount.py.
 /gen/
 # Built binaries, .app bundles, distribution zip, embedded game data
 /out/
@@ -10,10 +10,9 @@
 # --- Personal / session recordings ---
 /session.jsonl
 /Claude outputs/
-# Raw session screenshots (except selected/ and report/)
+# Raw session screenshots (except selected/)
 /screenshots/*
 !/screenshots/selected/
-!/screenshots/report/
 
 # --- Environment / temporary ---
 /.venv/
@@ -25,3 +24,12 @@ __pycache__/
 
 # Old version archive (gen/ and out/ derivatives; see arsiv/v1/OKUBENI.txt)
 /arsiv/
+
+# Built Windows reference plugin (source: tools/nfsref/nfsref.c, tools/nfsref/build.sh)
+/tools/nfsref/nfsref.asi
+# Video encoding leftovers
+ffmpeg2pass-*
+# Personal GitHub traffic tracking (not part of the port)
+/tools/traffic_log.py
+/tools/shortcut/
+/stats/

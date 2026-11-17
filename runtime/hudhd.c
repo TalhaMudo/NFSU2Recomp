@@ -1,7 +1,7 @@
 /* SHARPER HUD AND MENUS (launcher Settings › More; NFSU2_HUDHD)
  *
  * The game draws its HUD, menus, fonts and logos from small textures (most
- * 128-512 pixels) that look soft on today's screens.  hudhd.pak (tools/hudhd_pack.py,
+ * 128-512 pixels) that look soft on today's screens.  hudhd.pak (tools/packaging/hudhd_pack.py,
  * built from LunicAura106's NFSU2 Upscaled HUD) holds redrawn versions at up to four
  * times the size, keyed by the game's own texture name hash.
  *

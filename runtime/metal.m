@@ -1594,7 +1594,7 @@ static int g_hd_ssr = -1;
  *   G0 RGBA8Unorm   R0.rgb + class/4.  Since the class stays in 8 bits, edge
  *                   averages are filtered out as before (GB_ROAD/GB_CAR).
  *   G1 RGB10A2Unorm B/4: range 0..4, step 0.004.  On the road B = texture alpha x
- *                   vertex alpha <= 1 (GRAPHICS_RESEARCH.md 8); car paint's wasn't
+ *                   vertex alpha <= 1 (docs/graphics.md 8); car paint's wasn't
  *                   measured.  Above 4 it is clamped: the reflection weakens, it
  *                   doesn't break.
  *   G2 RGB10A2Unorm unit direction, code = 512 + 511*d (512 = exactly zero).  The
@@ -6420,7 +6420,7 @@ static void cursor_hide_update(int inside){
  * preference below could NOT BE TESTED under a condition that would tell them
  * apart.
  * DLINK=2: no preference, measurement only -- writes the REAL refresh rate every
- * 5 s (tools/session.sh turns it on).  DLINK=1: the same, plus prefers the maximum
+ * 5 s (tools/perf/session.sh turns it on).  DLINK=1: the same, plus prefers the maximum
  * rate (CADisplayLink, macOS 14+); first candidate if the state repeats. */
 static _Atomic unsigned long g_dl_ticks = 0;
 @interface NfsuTick : NSObject @end
@@ -6570,7 +6570,7 @@ static id<MTLTexture> dq_offscreen(void){
  * in the window server, isn't written to the preferences file and does NOT COME
  * BACK BY ITSELF when the process dies (tested with SIGKILL).  So on the first
  * disable a small watchdog process is spawned from the same binary
- * (NFSU_KISAYOL_BEKCI, the first thing tests/boot.c main does): it learns the
+ * (NFSU_KISAYOL_BEKCI, the first thing runtime/boot.c main does): it learns the
  * disabled ids through a pipe, and when the pipe closes -- however the game ends --
  * it re-enables them.  When the game goes to the background the shortcuts are
  * re-enabled right away; Cmd+Tab, Spotlight and screenshot shortcuts are untouched.

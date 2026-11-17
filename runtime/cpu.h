@@ -15,7 +15,7 @@ extern uint8_t *g_mem;
 
 /* GA(0x...): an address in the game's executable, written as it is in the
  * reference (European v1.2) build.  Other builds compile the runtime with a
- * generated header (tools/addrmap.py header) that maps every GA literal and
+ * generated header (tools/lifter/addrmap.py header) that maps every GA literal and
  * every sub_XXXXXXXX name to that build; an unmappable address stops the build. */
 #ifndef GA
 #define GA(x) (x)
@@ -58,7 +58,7 @@ static inline uint32_t parity8(uint32_t v){ v&=0xff; v^=v>>4; v^=v>>2; v^=v>>1; 
  * but the following branch usually reads only one.  Measured: the generated code
  * has 110k FLAGS_ADD + 130k FLAGS_SUB + 130k FLAGS_LOG, whereas OF is read
  * directly in only 22 places (CC_O/CC_NO), PF in 5.7k places.
- * The generator (tools/lift.py) now solves flag LIVENESS over the flow graph
+ * The generator (tools/lifter/lift.py) now solves flag LIVENESS over the flow graph
  * and gives every call a mask of "flags read later".  Since the mask is a
  * compile-time constant, unused branches are removed entirely. */
 #define F_CF  0x01u

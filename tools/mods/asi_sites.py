@@ -9,14 +9,14 @@ DllMain: one changed range of the game's .text per line, "addr len hexbytes".
 
 Each range is either
   code  - it overlaps an instruction of some lifted function: an xpatch 'w'
-          site named ul_<addr> (tools/xpatch.py), lifted as a switch;
+          site named ul_<addr> (tools/lifter/xpatch.py), lifted as a switch;
   data  - a table inside .text (MSVC 7 puts switch tables there): the lifted
           code reads it from guest memory, so the write itself is enough.
 asi_ul.h lists every range with its bytes, so the runtime can check that the
 plugin wrote exactly what was recorded before it switches anything on.
 """
 import sys, os, json, re
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lifter'))
 from lift import Lifter
 
 meta_p, exe, fntab, rec, spec_out, hdr_out = sys.argv[1:7]

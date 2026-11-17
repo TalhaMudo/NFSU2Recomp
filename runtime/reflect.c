@@ -54,7 +54,7 @@ void sub_00494270_orig(CPU *c);
 
 uint32_t call_guest(CPU *c, uint32_t fn, int nargs, const uint32_t *args);   /* com.c */
 
-/* hook sites (tools/gen_v2.sh HOOKS) */
+/* hook sites (tools/lifter/gen_v2.sh HOOKS) */
 #define H_ROAD_SCENERY  GA(0x005cab69u)   /* push 8: view 4's scenery list */
 #define H_MIRROR_SCENERY GA(0x005cae71u)  /* push 1: view 3's scenery list */
 #define H_SKY_SCALE     GA(0x0060f9f6u)   /* cmp edx,1: the sky's scale is in st0 */
@@ -146,7 +146,7 @@ int refl_hook(CPU *c, uint32_t ip){
     return 0;
 }
 
-/* ---- car lights in the road reflection (tools/gen_v2.sh OVR) -------------- */
+/* ---- car lights in the road reflection (tools/lifter/gen_v2.sh OVR) -------------- */
 void sub_006154a0(CPU *c){                  /* cdecl (eView *view) */
     refl_init();
     if (LIGHTS && !g_lights_here){ POP32(c->eip); return; }   /* drawn below instead */

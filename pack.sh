@@ -106,27 +106,27 @@ if [ -x "$LAUNCHER" ] && [ -x "$MODINST/modinstall" ]; then
   NESTED+=(Resources/modinstall/libhuff.dylib Resources/modinstall/modinstall)
 fi
 # --- sharper HUD and menus (Settings › More; runtime/hudhd.c) ---
-# hudhd.pak, built by tools/hudhd_pack.py from LunicAura106's Upscaled HUD
+# hudhd.pak, built by tools/packaging/hudhd_pack.py from LunicAura106's Upscaled HUD
 # (nfsmods.xyz/mod/4319; UHUD_SRC= the .7z, by default next to the other mod files).
 # Without it the app has no such option.
 UHUD_SRC="${UHUD_SRC:-$HOME/Downloads/nfsu2-mod-files/dl/nfsmods/NFSU2UHUD11192022a.7z}"
 if [ ! -f "$ROOT/out/hudhd.pak" ] && [ -f "$UHUD_SRC" ]; then
-  python3 -I "$ROOT/tools/hudhd_pack.py" "$UHUD_SRC" "$ROOT/out/hudhd.pak" || rm -f "$ROOT/out/hudhd.pak"
+  python3 -I "$ROOT/tools/packaging/hudhd_pack.py" "$UHUD_SRC" "$ROOT/out/hudhd.pak" || rm -f "$ROOT/out/hudhd.pak"
 fi
 if [ -f "$ROOT/out/hudhd.pak" ]; then cp "$ROOT/out/hudhd.pak" "$APP/Contents/Resources/hudhd.pak"
 else echo "note: no hudhd.pak (UHUD_SRC), the app is made without the sharper HUD option"; fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # --- icon ---
-# The game's own icon, traced to vectors, when SPEED2.EXE is here (tools/exeicon.py;
-# ICON_EXE= picks another one); otherwise the drawn speedometer (tools/mkicon.py).
+# The game's own icon, traced to vectors, when SPEED2.EXE is here (tools/packaging/exeicon.py;
+# ICON_EXE= picks another one); otherwise the drawn speedometer (tools/packaging/mkicon.py).
 ICON_EXE="${ICON_EXE:-$ROOT/Need for Speed Underground 2 - Clean Edition/Need for Speed Underground 2/SPEED2.EXE}"
 if [ ! -x "$ROOT/.venv/bin/python" ]; then
   echo "warning: no .venv, icon not generated"
-elif [ -f "$ICON_EXE" ] && "$ROOT/.venv/bin/python" "$ROOT/tools/exeicon.py" "$ICON_EXE" "$APP/Contents/Resources/AppIcon.icns" >/dev/null; then
+elif [ -f "$ICON_EXE" ] && "$ROOT/.venv/bin/python" "$ROOT/tools/packaging/exeicon.py" "$ICON_EXE" "$APP/Contents/Resources/AppIcon.icns" >/dev/null; then
   :
 else
-  "$ROOT/.venv/bin/python" "$ROOT/tools/mkicon.py" "$APP/Contents/Resources/AppIcon.icns" >/dev/null
+  "$ROOT/.venv/bin/python" "$ROOT/tools/packaging/mkicon.py" "$APP/Contents/Resources/AppIcon.icns" >/dev/null
 fi
 
 # --- embedded game data (--embed only) ---

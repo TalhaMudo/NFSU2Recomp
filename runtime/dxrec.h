@@ -1,7 +1,7 @@
 /* D3DX HLE Stage 2: recording the IDirect3DDevice9 calls a guest function
  * makes, and the "would it have no effect if made now" check.
  * The record is kept in com.c (the copies of the device state are there); the
- * user is runtime/d3dx_hle.c.  Details: D3DX_HLE.md, Stage 2.               */
+ * user is runtime/d3dx_hle.c.  Details: docs/d3dx-hle.md, Stage 2.               */
 #ifndef DXREC_H
 #define DXREC_H
 #include <stdint.h>

@@ -1,11 +1,11 @@
-/* Run-time switches for the "xpatch" sites (tools/xpatch.py).
+/* Run-time switches for the "xpatch" sites (tools/lifter/xpatch.py).
  *
  * An xpatch site is lifted twice, the original code and a patched version
  * behind `if (g_xpatch[XP_<name>])`.  This file owns the switch arrays; a
  * feature turns its patch on with xpatch_set("name", 1) or by writing
  * g_xpatch[XP_<NAME>] directly, and may change it while the game runs.
  * g_xpval[] holds the values of the `wv` sites.  With no sites in
- * tools/xpatch_eu.txt both arrays have one unused entry and the generated
+ * tools/lifter/xpatch_eu.txt both arrays have one unused entry and the generated
  * code is unchanged. */
 #include <stdio.h>
 #include <string.h>

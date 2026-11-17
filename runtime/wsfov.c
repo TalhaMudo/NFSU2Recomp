@@ -6,7 +6,7 @@
  * disassembly in the European v1.2 SPEED2.EXE.  The North American v1.2 build
  * has the same instructions, 0x10 lower in the projection setup (0x5c7fee) and
  * at the same address for the HUD marker; GA() maps them (runtime/build_na.h),
- * tools/gen_v2.sh lifts the hooks at the NA addresses.
+ * tools/lifter/gen_v2.sh lifts the hooks at the NA addresses.
  *
  * Problem: com.c's aspect_apply made the picture wide by scaling clip-space x
  * of every perspective draw, AFTER the game had culled its objects with its

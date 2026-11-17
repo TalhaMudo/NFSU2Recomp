@@ -22,7 +22,7 @@
 jmp_buf g_exit_jmp;
 int g_exit_code = 0;
 int g_exit_armed = 0;
-pthread_t g_guest_main_th;           /* set by tests/boot.c: the thread that owns g_exit_jmp */
+pthread_t g_guest_main_th;           /* set by runtime/boot.c: the thread that owns g_exit_jmp */
 /* ExitProcess / TerminateProcess.  Before: only longjmp'd out of the guest main
  * thread; the window's main loop kept running, so "Quit Game" left a frozen
  * window that had to be force-quit.  Now the main loop is told to quit too, and

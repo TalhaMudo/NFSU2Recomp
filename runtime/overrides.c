@@ -2,7 +2,7 @@
  *
  * The D3DX effect parameter tree is parsed as a CYCLE (node 0 -> 6 -> 4..8 -> 6)
  * and one more than the node array capacity (8) is requested (index 8).
- * The root cause is still open (see PROJECT.md). There are two guards here:
+ * The root cause is still open (see docs/devlog.md). There are two guards here:
  *   1) array bounds: return safely on an index beyond the capacity
  *   2) visited set: every node at most once per top-level walk
  * This way the walk terminates and the game can progress.                 */

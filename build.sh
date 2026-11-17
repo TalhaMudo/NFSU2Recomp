@@ -16,11 +16,11 @@ MCPU="${MCPU:-apple-m1}"
 MINOS="${MINOS:-11.0}"
 # -fno-strict-aliasing is MANDATORY (default since v2): lifted code accesses guest
 # memory at the same address with different types (MR32 write, MRF32 read);
-# without the flag clang's GVN can miscompile it.  See LIFTER_EFFICIENCY.md section 4.
+# without the flag clang's GVN can miscompile it.  See docs/lifter-efficiency.md section 4.
 OPT="${OPT:--O3 -mcpu=$MCPU -mmacosx-version-min=$MINOS -fno-strict-aliasing}"
 J="${J:-$(sysctl -n hw.ncpu)}"
 # BUILD=eu (default): gen/all -> out/obj    BUILD=na: gen/na -> out/obj_na
-# (North American v1.2 executable; see README "Game versions", tools/gen_v2.sh)
+# (North American v1.2 executable; see README "Game versions", tools/lifter/gen_v2.sh)
 case "${BUILD:-eu}" in
   eu) GEN=gen/all; OBJ=out/obj ;;
   na) GEN=gen/na;  OBJ=out/obj_na ;;

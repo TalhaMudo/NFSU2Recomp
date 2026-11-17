@@ -1,4 +1,4 @@
-/* Graphics enhancements (HD build only).  See enhance.h, GRAPHICS_RESEARCH.md.
+/* Graphics enhancements (HD build only).  See enhance.h, docs/graphics.md.
  *
  * 1) REFLECTION RESOLUTION
  *    The game draws three reflections into separate render targets:
@@ -49,7 +49,7 @@
  *
  * 4) SSR + reflection separation (metal.m "HD: SSR", vsemu.c ps_to_msl_ex2,
  *    camera: overrides.c sub_005c7ed0).  HD_SSR=0 off, HD_SSR_DEBUG=1.
- *    Details: GRAPHICS_RESEARCH.md §8.
+ *    Details: docs/graphics.md §8.
  *
  * 5) RAY-TRACED REFLECTIONS (metal.m "RT kernel" + "STATIC SCENE CACHE",
  *    the vsk_N compute kernel from vsemu.c vs_to_msl).  macOS 13+.
@@ -67,7 +67,7 @@
  *                      structure: §11)
  *    Diagnostics: HD_SSR_DEBUG=4 (reflection only), HD_RT_LOG=1/2,
  *    HD_RT_DUMPTAB=<frame>, HD_RT_STRESS=<N>, HD_RT_STAGE/NOTEX/PLAIN, HD_RTPROBE.
- *    Details: GRAPHICS_RESEARCH.md §9-§10.
+ *    Details: docs/graphics.md §9-§10.
  *
  * 6) GPU BUDGET (metal.m "MSAA: unnecessary store / resolve", "DEFER THE
  *    INTERMEDIATE PASS THAT SPLITS THE SCENE").  5 multisampled screen passes
@@ -75,7 +75,7 @@
  *      HD_MSLAZY=0     lazy store/resolve off (old behavior)
  *      HD_REORDER=0    intermediate pass deferral off
  *    Measurement (both builds): GPUWIN=a,b  PASSPROF=N [PASSPROF_MODE=1]
- *    HD only: HD_COMP=0  HD_RT_AB=1.   Details: GRAPHICS_RESEARCH.md §11.   */
+ *    HD only: HD_COMP=0  HD_RT_AB=1.   Details: docs/graphics.md §11.   */
 #include "enhance.h"
 #if NFS_ENHANCED
 #include <stdio.h>

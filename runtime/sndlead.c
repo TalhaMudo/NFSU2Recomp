@@ -16,7 +16,7 @@
 
 #define WINDOW_TICKS 300
 
-/* Called from guest_hook (debug.c); tools/gen_v2.sh lifts the hook site. */
+/* Called from guest_hook (debug.c); tools/lifter/gen_v2.sh lifts the hook site. */
 int sndlead_hook(CPU *c, uint32_t ip){
     (void)c;
     if (ip != GA(0x00726336u)) return 0;

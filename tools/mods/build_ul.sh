@@ -13,7 +13,7 @@
 #                     runtime/asi.c writes with ASIREC=...), see asi_sites.py.
 #                     Without a record: no sites (first run, to record).
 # 5. gen/na regenerated with the resume entries and the xpatch sites
-#    (tools/gen_v2.sh), everything compiled: BUILD=na ./build.sh, out/obj_ul.
+#    (tools/lifter/gen_v2.sh), everything compiled: BUILD=na ./build.sh, out/obj_ul.
 # Then: BUILD=na ./link.sh
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; cd "$ROOT"
@@ -27,10 +27,10 @@ OPT="${OPT:--O3 -mcpu=$MCPU -mmacosx-version-min=$MINOS -fno-strict-aliasing}"
 "$PY" tools/mods/asi_rebase.py "$ASI" out/ul
 export RELOCS=out/ul/relocs.txt
 if [ "${SKIP_UL_LIFT:-0}" != 1 ]; then
-  "$PY" tools/flagabi.py out/ul/plugin.dll out/ul/flagabi.json > out/ul/flagabi.log 2>&1
+  "$PY" tools/lifter/flagabi.py out/ul/plugin.dll out/ul/flagabi.json > out/ul/flagabi.log 2>&1
   rm -rf gen/ul
   GENOUT=gen/ul FNTAB_PREFIX=ul_ PUSHRET=1 FLAGABI=out/ul/flagabi.json X87OPT=1 RETEIP=0 MEMARG=1 LIFT_MISSING=1 \
-    "$PY" tools/genall.py out/ul/plugin.dll 16 > out/ul/gen.log 2>&1
+    "$PY" tools/lifter/genall.py out/ul/plugin.dll 16 > out/ul/gen.log 2>&1
   grep -a -E "functions  |traps \(" out/ul/gen.log
 fi
 unset RELOCS
@@ -39,10 +39,10 @@ mkdir -p gen/ul/inc
 # xpatch sites: the NA engine's own list + the plugin's recorded ones
 "$PY" tools/mods/asi_sites.py out/ul/meta.json "$EXE" gen/na/fntab.c "$REC" tools/mods/xpatch_ul.txt gen/ul/inc/asi_ul.h \
       gen/na/xpatch_data.txt
-cat tools/xpatch_na.txt tools/mods/xpatch_ul.txt > out/ul/xpatch_all.txt
+cat tools/lifter/xpatch_na.txt tools/mods/xpatch_ul.txt > out/ul/xpatch_all.txt
 
 if [ "${SKIP_NA_GEN:-0}" != 1 ]; then
-  XPATCH_SOFT=ul_ XPATCH_TAILJMP=1 EXTRA_FUNCS="$ROOT/out/ul/resume.txt" XPATCH="$ROOT/out/ul/xpatch_all.txt" tools/gen_v2.sh "$EXE" > out/ul/na_gen.log 2>&1 \
+  XPATCH_SOFT=ul_ XPATCH_TAILJMP=1 EXTRA_FUNCS="$ROOT/out/ul/resume.txt" XPATCH="$ROOT/out/ul/xpatch_all.txt" tools/lifter/gen_v2.sh "$EXE" > out/ul/na_gen.log 2>&1 \
     || { tail -20 out/ul/na_gen.log; exit 1; }
   grep -a -E "xpatch:|MISSING" out/ul/na_gen.log
   # ranges the engine generation found to be data: the runtime table says so

@@ -10,14 +10,14 @@ fi
 [ -f "$EXE" ] || { echo "SPEED2.EXE not found: $EXE"; exit 1; }
 # NFSU2_MODS=<folder>: mod files, read before the game's own (changed copies at their
 #   game-folder paths, a .deleted list); the launcher's Mods tab builds
-#   ~/Library/Application Support/NFSU2/Mods/Files.  See runtime/fileio.c, docs/MODS.md.
+#   ~/Library/Application Support/NFSU2/Mods/Files.  See runtime/fileio.c, docs/mods.md.
 # NFSU2_LANGUAGE=<language>: the game's language (launcher Settings > Game): English US,
 #   English UK, French, German, Italian, Spanish, Swedish, Danish, Dutch (or fr, de, it,
 #   es, sv, da, nl).  The text comes from LANGUAGES/<language>.BIN; movies are taken in
 #   that language when the folder has them (Scene01_fr.vp6, ealogo_dn.vp6...), otherwise
 #   English.  Unset: English, as before.  See runtime/win32_ext.c game_language.
 # NFSU2_HUDHD=1: sharper HUD and menus (launcher Settings > More): out/hudhd.pak (or the
-#   app's Resources), =<path> another pack; built by tools/hudhd_pack.py.  runtime/hudhd.c
+#   app's Resources), =<path> another pack; built by tools/packaging/hudhd_pack.py.  runtime/hudhd.c
 # NFSU2_REGION=na|eu: the game's region.  Default: detected from the data's region
 #   cars (CARS/CIVIC + RSX without CORSA + PEUGOT106 = North American, e.g. US discs).
 #   See runtime/overrides.c, region_install.
@@ -44,7 +44,7 @@ fi
 #   NFSU2_REFLECT_LIGHTS=1  the cars' lights in the road reflection
 #   NFSU2_REFLECT_DETAIL=1  full-detail models in the reflections, car cube map far plane 10 km
 # In game, Cmd+Shift+D: a PNG of that frame + the draw list (~/Library/Logs/NFSU2/
-#   or the PERFLOG directory).  Measurement recording while playing: tools/session.sh [hd].
+#   or the PERFLOG directory).  Measurement recording while playing: tools/perf/session.sh [hd].
 MODE="${1:-window}"
 case "$MODE" in
   hd)      NFSHD=1; MODE=window ;;

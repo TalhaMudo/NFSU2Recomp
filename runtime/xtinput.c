@@ -52,10 +52,10 @@ void xtinput_report(void);
 #include "xtinput_events.h"
 #include "xtinput_default_ini.h"
 
-/* NA function names are pasted together so tools/addrmap.py (which maps the
+/* NA function names are pasted together so tools/lifter/addrmap.py (which maps the
  * European sub_XXXXXXXX names used elsewhere in the runtime) leaves them alone. */
 #define NA_SUB(a) sub_##a
-void NA_SUB(00572120)(CPU *c);          /* FindScannerConfig: override, tools/gen_v2.sh OVR_NA */
+void NA_SUB(00572120)(CPU *c);          /* FindScannerConfig: override, tools/lifter/gen_v2.sh OVR_NA */
 void NA_SUB(00572120_orig)(CPU *c);
 void NA_SUB(00407750)(CPU *c);          /* RealDriver steer handler (lifted) */
 
