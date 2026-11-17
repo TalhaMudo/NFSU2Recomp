@@ -44,7 +44,8 @@ The game boots, reaches the menus, and races are playable with sound.
 - **Two builds of `SPEED2.EXE` are supported**, the European and the North
   American v1.2 ones (see [Game versions](#game-versions)); each has its own
   engine. Other builds would need their own lifting pass and address map.
-- Keyboard, mouse and game controllers (Xbox / PlayStation / MFi); no wheel
+- Keyboard, mouse and game controllers (Xbox / PlayStation / Switch / MFi, and
+  DirectInput-mode USB or Bluetooth pads such as 8BitDo's D-input mode); no wheel
   support. No network play.
 - Structured exception handling is not implemented (`RtlUnwind` /
   `RaiseException` are stubs).
@@ -387,6 +388,22 @@ brake (LT), and every button, in races and in the menus, does what it does with
 folder's `scripts/NFSU_XtendedInput.ini` is used if there is one, as in a Windows
 install with the mod; otherwise the mod's stock settings. Without the switch the
 pad is a DirectInput gamepad, bound in the game's own controller options.
+
+**My controller works in other apps but not in the game.**
+Pads that macOS's GameController framework knows (Xbox, PlayStation, Switch, MFi)
+are used directly. Other pads are read as plain HID devices, which covers
+DirectInput ("D-input") mode pads: an 8BitDo pad in D-input mode, a Logitech pad
+with its switch on D, most generic USB pads. Their buttons are laid out like an
+Xbox pad from a built-in list of known controllers (SDL's macOS mappings, e.g. the
+8BitDo Ultimate 2C), otherwise from a guess. A pad in X-input mode is not a HID
+device on macOS and is not seen at all; switch it to D-input (the pad's manual
+gives the button combination or mode switch). If the buttons come out wrong, put a
+[SDL GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB) line for the
+pad (the `platform:Mac OS X` one) into `gamecontrollerdb.txt` in the game folder;
+the whole file can be used as it is. `NFSU2_PAD_MAP` can name another file or hold
+the lines itself, and `NFSU2_PAD_HID=0` turns this off. The engine's log
+(`~/Library/Logs/NFSU2/nfsu2.log`) shows which pad was found and the mapping used
+(`[pad]` lines).
 
 **How is this different from other NFSU2 projects?**
 
