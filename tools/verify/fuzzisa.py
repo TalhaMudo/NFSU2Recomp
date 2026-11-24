@@ -1,17 +1,36 @@
 #!/usr/bin/env python3
-"""DIFFERENTIAL test for x86 semantics: real x86 (Rosetta) vs the lifter.
+"""DIFFERENTIAL test for x86 semantics: the lifter against independent oracles.
 
-The same instruction bytes are run in two places:
-  1) oracle : compiled as x86-64, runs under Rosetta    -> the real CPU
-  2) guest  : translated to C by RawLifter, runs on ARM64 -> our output
-The output (6 GPRs + flags + 128 bytes of memory) is compared.
+The same instruction bytes are run in up to four places:
+  1) rosetta : compiled as x86-64, runs under Rosetta 2 (Apple's translator)
+  2) unicorn : run by Unicorn (QEMU's translator) in true 32-bit mode
+  3) hw      : the Rosetta oracle program run natively on x86-64 hardware
+               (--export here, run there, --hw here; see below)
+  4) guest   : translated to C by RawLifter, runs on ARM64 -> our output
+The output (6 GPRs + flags + 128 bytes of memory) is compared, guest against
+every oracle and the oracles against each other.
 
-Encodings that carry the same meaning in 64-bit mode are used:
+None of 1) and 2) is a CPU: both are translators written independently of each
+other and of the lifter, so agreement with both is strong evidence but not
+proof.  3) is the real thing, for the 64-bit-safe subset.
+
+Encodings that carry the same meaning in 64-bit mode are used for 1) and 3):
   - eax..esi only (no REX, no r8+)
   - memory is always N(%rdi) / [edi+N]
   - edi and esp are NOT USED as destinations
+Templates marked m32=True are 32-bit-only encodings (one-byte inc/dec, pushad,
+aaa..., 16-bit addressing); only unicorn can check those.
+
+usage:
+  fuzzisa.py [n] [seed]                 run (oracles: ORACLES=rosetta,unicorn)
+  fuzzisa.py [n] [seed] --export DIR    also write DIR/oracle.c + DIR/README.txt
+                                        for a run on x86-64 hardware
+  fuzzisa.py [n] [seed] --hw FILE       also compare against the output of that
+                                        run (same n and seed)
+Every run writes <FUZZDIR>/coverage.json (which instruction was checked by
+which oracle), read by tools/verify/isacoverage.py.
 """
-import os, sys, random, struct, subprocess, hashlib
+import os, sys, random, struct, subprocess, hashlib, json
 import os as _os; sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'lifter'))
 from lift import RawLifter, Unsupported
 
@@ -33,15 +52,17 @@ def M(rng, lo=0, hi=96, align=4):
     return f"{off}(%rdi)"
 
 class Tmpl:
-    def __init__(self, name, gen, undef=0, skipmem=False, ptr=False):
+    def __init__(self, name, gen, undef=0, skipmem=False, ptr=False, m32=False):
         self.name, self.gen, self.undef = name, gen, undef
-        self.skipmem, self.ptr = skipmem, ptr
+        self.skipmem, self.ptr, self.m32 = skipmem, ptr, m32
 
 T = []
-def tmpl(name, undef=0, skipmem=False, ptr=False):
+def tmpl(name, undef=0, skipmem=False, ptr=False, m32=False):
     """skipmem: the result is affected by the precision difference between 80-bit
-    x87 and double (fprem, fsin...) -- the memory result isn't compared."""
-    def d(f): T.append(Tmpl(name, f, undef, skipmem, ptr)); return f
+    x87 and double (fprem, fsin...) -- the memory result isn't compared.
+    m32: a 32-bit-only encoding; assembled with .code32, not run on the 64-bit
+    oracles.  Use %edi (not %rdi) for memory in these."""
+    def d(f): T.append(Tmpl(name, f, undef, skipmem, ptr, m32)); return f
     return d
 
 # ---------------- integer core ----------------
@@ -315,7 +336,267 @@ def _(rng):
                        f"movb {M(rng,0,96,1)}, {rng.choice(R8)}",
                        f"movl ${rng.getrandbits(32)}, {M(rng)}"])
 
-def assemble(asm_list, workdir):
+# ---------------- x87: register forms, constants, compares, integer operands ----------------
+X87_3 = "flds 0(%rdi)\n\tflds 8(%rdi)\n\tflds 16(%rdi)\n\t"
+@tmpl("x87 reg-reg arithmetic")
+def _(rng):
+    i = rng.randrange(1, 3)
+    op = rng.choice(['faddp','fsubp','fsubrp','fmulp','fdivp','fdivrp'])
+    if rng.random() < 0.5:
+        return X87_3 + f"{op} %st, %st({i})\n\tfstps 64(%rdi)\n\tfstps 68(%rdi)"
+    op = rng.choice(['fadd','fsub','fsubr','fmul','fdiv','fdivr'])
+    form = rng.choice([f"%st({i}), %st", f"%st, %st({i})"])
+    return X87_3 + f"{op} {form}\n\tfstps 64(%rdi)\n\tfstps 68(%rdi)\n\tfstps 72(%rdi)"
+@tmpl("x87 constants")
+def _(rng):
+    op = rng.choice(['fldz','fld1','fldpi','fldl2e','fldl2t','fldlg2','fldln2'])
+    return f"{op}\n\t" + rng.choice(["fstps 64(%rdi)", "fstpl 64(%rdi)"])
+@tmpl("x87 compare -> status word")
+def _(rng):
+    op = rng.choice(["fcom %st(1)", "fcomp %st(1)", "fcompp", "fucom %st(1)", "fucomp %st(1)",
+                     "fucompp", "ftst", "fcoms 16(%rdi)", "fcompl 16(%rdi)", "fxam"])
+    return ("flds 8(%rdi)\n\tflds 0(%rdi)\n\t" + op +
+            "\n\tfnstsw %ax\n\tandl $0x4500, %eax\n\tffree %st(0)\n\tffree %st(1)")
+@tmpl("x87 compare -> eflags (fcomi)")
+def _(rng):
+    op = rng.choice(["fcomi %st(1), %st", "fucomi %st(1), %st", "fcomip %st(1), %st", "fucomip %st(1), %st"])
+    return "flds 8(%rdi)\n\tflds 0(%rdi)\n\t" + op + "\n\tffree %st(0)\n\tffree %st(1)"
+@tmpl("x87 fcmovcc")
+def _(rng):
+    cc = rng.choice(['b','e','be','u','nb','ne','nbe','nu'])
+    return (f"cmpl {rng.choice(R32)}, {rng.choice(R32)}\n\tflds 8(%rdi)\n\tflds 0(%rdi)\n\t"
+            f"fcmov{cc} %st(1), %st\n\tfstps 64(%rdi)\n\tfstps 68(%rdi)")
+@tmpl("x87 integer operand")
+def _(rng):
+    op = rng.choice(['fiaddl','fisubl','fisubrl','fimull','fidivl','fidivrl',
+                     'fiadds','fisubs','fimuls','fidivs'])
+    # 32(%rdi) holds random bytes (not a float): a real integer operand
+    return f"flds 0(%rdi)\n\t{op} 32(%rdi)\n\tfstps 64(%rdi)"
+@tmpl("x87 ficom / fist / fild sizes")
+def _(rng):
+    return rng.choice([
+        "flds 0(%rdi)\n\tficoml 32(%rdi)\n\tfnstsw %ax\n\tandl $0x4500, %eax\n\tfstps 64(%rdi)",
+        "flds 0(%rdi)\n\tficomps 32(%rdi)\n\tfnstsw %ax\n\tandl $0x4500, %eax",
+        "flds 0(%rdi)\n\tfistl 64(%rdi)\n\tfstps 68(%rdi)",
+        "flds 0(%rdi)\n\tfistps 64(%rdi)",
+        "flds 0(%rdi)\n\tfisttpl 64(%rdi)",
+        "filds 32(%rdi)\n\tfstps 64(%rdi)",
+        "fildq 32(%rdi)\n\tfstpl 64(%rdi)",
+        "fildl 32(%rdi)\n\tfstpl 64(%rdi)"])
+@tmpl("x87 control word / status")
+def _(rng):
+    return rng.choice([
+        "fnstcw 64(%rdi)", "fwait\n\tfnstcw 64(%rdi)",
+        "flds 0(%rdi)\n\tfnstsw %ax\n\tandl $0x3800, %eax\n\tfstps 64(%rdi)",
+        "flds 0(%rdi)\n\tflds 8(%rdi)\n\tfincstp\n\tfnstsw %ax\n\tandl $0x3800, %eax\n\tfdecstp\n\tfstps 64(%rdi)\n\tfstps 68(%rdi)",
+        "fnclex\n\tfnstsw %ax"])
+@tmpl("x87 two-operand transcendental (80-bit difference)", skipmem=True)
+def _(rng):
+    op = rng.choice(['fyl2x', 'fpatan', 'fyl2xp1'])
+    return f"flds 8(%rdi)\n\tflds 0(%rdi)\n\tfabs\n\t{op}\n\tfstps 64(%rdi)"
+@tmpl("x87 fsincos (80-bit difference)", skipmem=True)
+def _(rng): return "flds 0(%rdi)\n\tfsincos\n\tfstps 64(%rdi)\n\tfstps 68(%rdi)"
+
+# ---------------- SSE moves and the rest of SSE/SSE2 ----------------
+@tmpl("sse moves")
+def _(rng):
+    return rng.choice([
+        "movaps 0(%rdi), %xmm0\n\tmovaps %xmm0, %xmm1\n\tmovaps %xmm1, 64(%rdi)",
+        "movss 4(%rdi), %xmm0\n\tmovss %xmm0, 64(%rdi)",
+        "movups 0(%rdi), %xmm0\n\tmovss 20(%rdi), %xmm0\n\tmovups %xmm0, 64(%rdi)",
+        "movups 0(%rdi), %xmm0\n\tmovups 16(%rdi), %xmm1\n\tmovss %xmm1, %xmm0\n\tmovups %xmm0, 64(%rdi)",
+        "movups 0(%rdi), %xmm0\n\tmovlps 16(%rdi), %xmm0\n\tmovups %xmm0, 64(%rdi)",
+        "movups 0(%rdi), %xmm0\n\tmovhps 16(%rdi), %xmm0\n\tmovups %xmm0, 64(%rdi)",
+        "movups 0(%rdi), %xmm0\n\tmovlps %xmm0, 64(%rdi)\n\tmovhps %xmm0, 72(%rdi)",
+        "movups 0(%rdi), %xmm0\n\tmovntps %xmm0, 64(%rdi)",
+        "movups 0(%rdi), %xmm0\n\tmovmskps %xmm0, %eax",
+        "movd 0(%rdi), %xmm0\n\tmovd %xmm0, %eax\n\tmovups %xmm0, 64(%rdi)",
+        f"movd {rng.choice(R32)}, %xmm0\n\tmovups %xmm0, 64(%rdi)",
+        f"movd {rng.choice(R32)}, %mm0\n\tmovq %mm0, 64(%rdi)\n\temms",
+        "movq 0(%rdi), %mm0\n\tmovd %mm0, %eax\n\tmovntq %mm0, 64(%rdi)\n\temms"])
+@tmpl("sse2 moves")
+def _(rng):
+    return rng.choice([
+        "movdqa 0(%rdi), %xmm0\n\tmovdqa %xmm0, %xmm1\n\tmovdqa %xmm1, 64(%rdi)",
+        "movapd 0(%rdi), %xmm0\n\tmovapd %xmm0, 64(%rdi)",
+        "movupd 0(%rdi), %xmm0\n\tmovlpd 16(%rdi), %xmm0\n\tmovupd %xmm0, 64(%rdi)",
+        "movupd 0(%rdi), %xmm0\n\tmovhpd 16(%rdi), %xmm0\n\tmovupd %xmm0, 64(%rdi)",
+        "movsd 8(%rdi), %xmm0\n\tmovsd %xmm0, 64(%rdi)",
+        "movq 0(%rdi), %xmm0\n\tmovdqu %xmm0, 64(%rdi)",
+        "movdqu 0(%rdi), %xmm0\n\tmovq %xmm0, 64(%rdi)",
+        "movq 0(%rdi), %mm0\n\tmovq2dq %mm0, %xmm0\n\tmovdqu %xmm0, 64(%rdi)\n\temms",
+        "movdqu 0(%rdi), %xmm0\n\tmovdq2q %xmm0, %mm0\n\tmovq %mm0, 64(%rdi)\n\temms",
+        f"movdqu 0(%rdi), %xmm0\n\tpshufd ${rng.getrandbits(8)}, %xmm0, %xmm1\n\tmovdqu %xmm1, 64(%rdi)",
+        f"movdqu 0(%rdi), %xmm0\n\tpshuflw ${rng.getrandbits(8)}, %xmm0, %xmm1\n\tmovdqu %xmm1, 64(%rdi)",
+        f"movdqu 0(%rdi), %xmm0\n\tpshufhw ${rng.getrandbits(8)}, %xmm0, %xmm1\n\tmovdqu %xmm1, 64(%rdi)",
+        "movdqu 0(%rdi), %xmm0\n\tpmovmskb %xmm0, %eax",
+        "movups 0(%rdi), %xmm0\n\tcvtdq2pd %xmm0, %xmm1\n\tmovupd %xmm1, 64(%rdi)"])
+@tmpl("sse more packed/scalar float")
+def _(rng):
+    op = rng.choice(['andnps','sqrtps','unpcklpd','unpckhpd','andpd','andnpd','orpd','xorpd',
+                     'addsd','subsd','mulsd','divsd','minsd','maxsd','sqrtsd','sqrtpd',
+                     f"cmppd ${rng.randrange(0,8)},", f"cmpsd ${rng.randrange(0,8)},",
+                     f"shufpd ${rng.randrange(0,4)},"])
+    return f"movups 0(%rdi), %xmm0\n\tmovups 16(%rdi), %xmm1\n\t{op} %xmm1, %xmm0\n\tmovups %xmm0, 64(%rdi)"
+PINT = ['paddb','paddw','paddd','psubb','psubw','psubd','paddsb','paddsw','psubsb','psubsw',
+        'paddusb','paddusw','psubusb','psubusw','pand','pandn','por','pxor',
+        'pcmpeqb','pcmpeqw','pcmpeqd','pcmpgtb','pcmpgtw','pcmpgtd',
+        'pmullw','pmulhw','pmaddwd','punpcklbw','punpcklwd','punpckldq',
+        'punpckhbw','punpckhwd','punpckhdq','packuswb','packsswb','packssdw']
+@tmpl("mmx packed int (all)")
+def _(rng):
+    op = rng.choice(PINT + ['pmulhuw','pavgb','pavgw','pminub','pmaxub','pminsw','pmaxsw','psadbw',
+                            'paddq','psubq','pmuludq'])
+    return (f"movq 0(%rdi), %mm0\n\tmovq 8(%rdi), %mm1\n\t{op} %mm1, %mm0\n\t"
+            "movq %mm0, 64(%rdi)\n\temms")
+@tmpl("mmx packed int, memory operand")
+def _(rng):
+    return (f"movq 0(%rdi), %mm0\n\t{rng.choice(PINT)} 8(%rdi), %mm0\n\t"
+            "movq %mm0, 64(%rdi)\n\temms")
+@tmpl("sse2 packed int (all)")
+def _(rng):
+    op = rng.choice(PINT + ['paddq','psubq','pmuludq','pmulhuw','pminub','pmaxub',
+                            'punpcklqdq','punpckhqdq'])
+    return f"movdqu 0(%rdi), %xmm0\n\tmovdqu 16(%rdi), %xmm1\n\t{op} %xmm1, %xmm0\n\tmovdqu %xmm0, 64(%rdi)"
+@tmpl("sse2 shift imm/reg")
+def _(rng):
+    op = rng.choice(['psllw','pslld','psllq','psrlw','psrld','psrlq','psraw','psrad'])
+    if rng.random() < 0.4:
+        return f"movdqu 0(%rdi), %xmm0\n\t{op} ${rng.randrange(0,70)}, %xmm0\n\tmovdqu %xmm0, 64(%rdi)"
+    if rng.random() < 0.3:
+        return (f"movdqu 0(%rdi), %xmm0\n\t{rng.choice(['pslldq','psrldq'])} ${rng.randrange(0,18)}, %xmm0\n\t"
+                "movdqu %xmm0, 64(%rdi)")
+    return f"movdqu 0(%rdi), %xmm0\n\tmovdqu 16(%rdi), %xmm1\n\t{op} %xmm1, %xmm0\n\tmovdqu %xmm0, 64(%rdi)"
+@tmpl("pextrw/pinsrw")
+def _(rng):
+    return rng.choice([
+        f"movq 0(%rdi), %mm0\n\tpextrw ${rng.randrange(0,4)}, %mm0, %eax\n\temms",
+        f"movq 0(%rdi), %mm0\n\tpinsrw ${rng.randrange(0,4)}, {rng.choice(R32)}, %mm0\n\tmovq %mm0, 64(%rdi)\n\temms",
+        f"movdqu 0(%rdi), %xmm0\n\tpextrw ${rng.randrange(0,8)}, %xmm0, %eax",
+        f"movdqu 0(%rdi), %xmm0\n\tpinsrw ${rng.randrange(0,8)}, {rng.choice(R32)}, %xmm0\n\tmovdqu %xmm0, 64(%rdi)"])
+@tmpl("mxcsr")
+def _(rng): return "stmxcsr 64(%rdi)\n\tandl $0xffc0, 64(%rdi)"
+
+# ---------------- more integer forms ----------------
+@tmpl("setcc m8 / all conditions")
+def _(rng): return f"set{rng.choice(CC)} {rng.randrange(64,96)}(%rdi)"
+@tmpl("loope/loopne")
+def _(rng):
+    return (f"movl ${rng.randrange(1,5)}, %ecx\n1:\tsubl $1, %eax\n\tcmpl %ebx, %edx\n\t"
+            f"{rng.choice(['loope','loopne'])} 1b")
+@tmpl("string ops, 16-bit", ptr=True)
+def _(rng):
+    op = rng.choice(['movsw','stosw','lodsw','scasw','cmpsw','stosb','movsb','scasb'])
+    rep = rng.choice(['', 'rep ']) if op[:4] in ('movs','stos') else rng.choice(['', 'repe ', 'repne '])
+    return f"cld\n\tmovl ${rng.randrange(1,5)}, %ecx\n\t{rep}{op}"
+@tmpl("adc/sbb chains")
+def _(rng):
+    return (f"addl {rng.choice(R32)}, %eax\n\tadcl {rng.choice(R32)}, %edx\n\t"
+            f"subl {rng.choice(R32)}, %ecx\n\tsbbl {rng.choice(R32)}, %ebx")
+@tmpl("imul/mul/div m32", undef=F_ALL)
+def _(rng):
+    return rng.choice([f"mull {M(rng)}", f"imull {M(rng)}",
+                       f"movl $0, %edx\n\torl $1, 8(%rdi)\n\tdivl 8(%rdi)",
+                       "cltd\n\torl $0x10000, 8(%rdi)\n\tandl $0x7fffffff, 8(%rdi)\n\tidivl 8(%rdi)"])
+@tmpl("shifts on memory", undef=F_OF|F_AF)
+def _(rng):
+    op = rng.choice(['shll','shrl','sarl','roll','rorl'])
+    return rng.choice([f"{op} ${rng.randrange(0,33)}, {M(rng)}", f"{op} %cl, {M(rng)}", f"{op} {M(rng)}"])
+@tmpl("neg/not/inc/dec m8/m16/m32")
+def _(rng):
+    op = rng.choice(['neg','not','inc','dec']); sz = rng.choice(['b','w','l'])
+    return f"{op}{sz} {M(rng)}"
+
+# ---------------- control flow inside the case ----------------
+@tmpl("jcc short")
+def _(rng):
+    return (f"cmpl {rng.choice(R32)}, {rng.choice(R32)}\n\tj{rng.choice(CC)} 1f\n\t"
+            f"notl {rng.choice(R32)}\n1:")
+@tmpl("jcc after test/sub")
+def _(rng):
+    op = rng.choice([f"testl {rng.choice(R32)}, {rng.choice(R32)}",
+                     f"subl {rng.choice(R32)}, {rng.choice(R32)}",
+                     f"andl ${rng.getrandbits(32)}, {rng.choice(R32)}"])
+    return f"{op}\n\tj{rng.choice(CC)} 1f\n\taddl $0x1111, %edx\n1:"
+@tmpl("loop")
+def _(rng):
+    return f"movl ${rng.randrange(1,6)}, %ecx\n1:\taddl %ebx, %eax\n\tloop 1b"
+@tmpl("bt/bts r32,r32", undef=F_OF|F_SF|F_ZF|F_AF|F_PF)
+def _(rng):
+    op = rng.choice(['btl','btsl','btrl','btcl'])
+    return f"{op} {rng.choice(R32)}, {rng.choice(R32)}"
+@tmpl("xchg eax,r32 (one byte) / nop")
+def _(rng):
+    return rng.choice([f"xchgl %eax, {rng.choice(R32[1:])}", "nop"])
+@tmpl("movd/movq mmx")
+def _(rng):
+    op = rng.choice(['paddb','paddw','paddd','psubb','psubw','psubd','pand','por','pxor',
+                     'pcmpeqb','pcmpeqw','pcmpeqd','pmullw','punpcklbw','punpcklwd',
+                     'punpckldq','punpckhbw','punpckhwd','punpckhdq','packuswb','packsswb'])
+    return (f"movq 0(%rdi), %mm0\n\tmovq 8(%rdi), %mm1\n\t{op} %mm1, %mm0\n\t"
+            "movq %mm0, 64(%rdi)\n\temms")
+@tmpl("mmx shift imm/reg")
+def _(rng):
+    op = rng.choice(['psllw','pslld','psllq','psrlw','psrld','psrlq','psraw','psrad'])
+    if rng.random() < 0.5:
+        return (f"movq 0(%rdi), %mm0\n\t{op} ${rng.randrange(0,70)}, %mm0\n\t"
+                "movq %mm0, 64(%rdi)\n\temms")
+    # count in a register: the WHOLE 64-bit count decides (>= width clears the register)
+    return (f"movq 0(%rdi), %mm0\n\tmovq 16(%rdi), %mm1\n\t{op} %mm1, %mm0\n\t"
+            "movq %mm0, 64(%rdi)\n\temms")
+
+# ---------------- 32-bit-only encodings (unicorn oracle only) ----------------
+E32 = ['%eax','%ecx','%edx','%ebx','%ebp','%esi']
+@tmpl("inc/dec r32, one-byte 40-4F", m32=True)
+def _(rng): return f"{rng.choice(['incl','decl'])} {rng.choice(E32)}"
+@tmpl("pushad -> pop", m32=True)
+def _(rng):
+    return "pushal\n\tpopl %eax\n\tpopl %ecx\n\tpopl %edx\n\tpopl %ebx\n\taddl $16, %esp"
+@tmpl("pushad / popad", m32=True)
+def _(rng):
+    a, b = rng.sample([0, 4, 8, 16, 20, 24, 28], 2)       # 12 is the saved esp: popad skips it
+    return f"pushal\n\tnotl {a}(%esp)\n\tnegl {b}(%esp)\n\tpopal"
+@tmpl("push/pop r32, imm, m32", m32=True)
+def _(rng):
+    return rng.choice([
+        f"pushl {rng.choice(E32)}\n\tpopl {rng.choice(E32)}",
+        f"pushl ${rng.getrandbits(32)}\n\tpopl {rng.choice(E32)}",
+        f"pushl ${rng.randrange(-128,128)}\n\tpopl {rng.choice(E32)}",
+        f"pushl {rng.randrange(0,60,4)}(%edi)\n\tpopl {rng.randrange(64,96,4)}(%edi)",
+        f"pushw {rng.choice(['%ax','%cx','%dx','%bx'])}\n\tpopw {rng.choice(['%ax','%cx','%dx','%bx'])}"])
+@tmpl("pushfd/popfd", m32=True)
+def _(rng):
+    return rng.choice(["pushfl\n\tpopl %eax\n\tandl $0x8d5, %eax",
+                       "pushl %eax\n\tandl $0x8d5, (%esp)\n\torl $0x202, (%esp)\n\tpopfl"])
+@tmpl("enter/leave", m32=True)
+def _(rng):
+    return rng.choice([f"pushl %ebp\n\tmovl %esp, %ebp\n\tsubl ${rng.randrange(0,64,4)}, %esp\n\t"
+                       "movl %ebp, %eax\n\tleave",
+                       f"enter ${rng.randrange(0,64,4)}, $0\n\tmovl %esp, %ecx\n\tleave"])
+@tmpl("aaa/aas", undef=F_OF|F_SF|F_ZF|F_PF, m32=True)
+def _(rng): return rng.choice(['aaa','aas'])
+@tmpl("daa/das", undef=F_OF, m32=True)
+def _(rng): return rng.choice(['daa','das'])
+@tmpl("aam/aad", undef=F_OF|F_AF|F_CF, m32=True)
+def _(rng): return rng.choice(['aam','aad', f"aam ${rng.randrange(1,256)}", f"aad ${rng.randrange(0,256)}"])
+@tmpl("lea, 16-bit addressing", m32=True)
+def _(rng):
+    m = rng.choice(['(%bx,%si)','(%bx,%di)','(%bp,%si)','(%bp,%di)','(%si)','(%di)','(%bx)'])
+    return f"leal {rng.randrange(-200,200)}{m}, {rng.choice(E32)}"
+@tmpl("jecxz", m32=True)
+def _(rng): return "jecxz 1f\n\tnotl %eax\n1:"
+@tmpl("xlat", m32=True)
+def _(rng): return "movl %edi, %ebx\n\txlat"
+@tmpl("lea with edi base", m32=True)
+def _(rng):
+    i = rng.choice(['%eax','%ecx','%edx','%ebx'])
+    return f"leal {rng.randrange(-64,64)}(%edi,{i},{rng.choice([1,2,4,8])}), {rng.choice(E32)}"
+@tmpl("string ops with edi/esi as values", ptr=True, m32=True)
+def _(rng):
+    op = rng.choice(['movsb','movsl','stosl','lodsl','scasb','cmpsl'])
+    return f"cld\n\tmovl ${rng.randrange(1,4)}, %ecx\n\t{rng.choice(['','rep '])}{op}"
+
+def assemble(asm_list, workdir, m32=None):
     """Assemble all test instructions in a single file, return the byte arrays.
 
     A separator byte is NOT USED: an instruction's own bytes can merge with the
@@ -325,7 +606,12 @@ def assemble(asm_list, workdir):
     for i, a in enumerate(asm_list):
         src.append('.globl _c%d' % i)
         src.append('_c%d:' % i)
-        src.append('\t' + a)
+        if m32 and m32[i]:
+            src.append('\t.code32')
+            src.append('\t' + a)
+            src.append('\t.code64')
+        else:
+            src.append('\t' + a)
     src.append('.globl _cend')
     src.append('_cend:')
     src.append('\tnop')
@@ -372,12 +658,14 @@ ORACLE_C = """
 static sigjmp_buf g_jb;
 static volatile int g_infault;
 static void onfault(int sig){ (void)sig; if (g_infault) siglongjmp(g_jb, 1); _exit(9); }
-typedef struct { uint32_t r[6]; uint32_t fl; uint32_t pad; uint8_t mem[@MEMSZ@]; } St;
+/* 16-byte aligned so that mem (offset 32) is too: movaps/movdqa need it */
+typedef struct { uint32_t r[6]; uint32_t fl; uint32_t pad; uint8_t mem[@MEMSZ@]; } __attribute__((aligned(16))) St;
 extern const unsigned char CODE[];
 extern const unsigned CODE_OFF[];
 extern const unsigned CODE_LEN[];
 extern const unsigned NCASE;
 extern const unsigned char INIT[];
+#define INITSZ (32 + @MEMSZ@)   /* packed size of one initial state */
 static void *page;
 static void run_one(St *s, unsigned long long rsiv){
   __asm__ volatile(
@@ -409,10 +697,11 @@ int main(void){
   signal(SIGFPE, onfault);  signal(SIGILL, onfault); signal(SIGTRAP, onfault);
   page = mmap(0, 1<<20, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANON, -1, 0);
   for (unsigned i = 0; i < NCASE; i++){
+    if (!CODE_LEN[i]) continue;          /* 32-bit-only encoding: not for this oracle */
     unsigned char *p = (unsigned char*)page;
     memcpy(p, CODE + CODE_OFF[i], CODE_LEN[i]);
     p[CODE_LEN[i]] = 0xC3;
-    St s; memcpy(&s, INIT + i*sizeof(St), sizeof(St));
+    St s; memcpy(&s, INIT + i*INITSZ, INITSZ);
     /* if pad != 0 esi is used as a POINTER (string instructions) */
     unsigned long long rsiv = s.pad ? (unsigned long long)(unsigned long)(s.mem + 64)
                                     : (unsigned long long)s.r[5];
@@ -442,9 +731,10 @@ void guest_hook(CPU*c,uint32_t a){(void)c;(void)a;}
 void cpuid_shim(CPU*c){(void)c;} uint64_t rdtsc_shim(void){return 0;}
 """
 
-def gen_oracle(cases, chunks, workdir):
+def gen_oracle(cases, chunks, workdir, build=True):
     blob = bytearray(); offs = []; lens = []
-    for c in chunks:
+    for cs, c in zip(cases, chunks):
+        if cs['m32']: c = b''
         offs.append(len(blob)); lens.append(len(c)); blob += c
     init = bytearray()
     for cs in cases:
@@ -458,9 +748,75 @@ def gen_oracle(cases, chunks, workdir):
     o.append('const unsigned char INIT[] = {' + ','.join(str(b) for b in init) + '};')
     src = os.path.join(workdir, 'oracle.c')
     open(src, 'w').write('\n'.join(o))
+    if not build: return src
     exe = os.path.join(workdir, 'oracle')
     subprocess.run(['clang','-arch','x86_64','-O0','-o',exe,src], check=True)
     return exe
+
+# ---------------- second oracle: Unicorn (QEMU's translator), 32-bit mode ----------------
+UC_CODE, UC_STACK_LO, UC_ESP = BASE, 0x00AF0000, 0x00AFFFFC   # esp = the guest's at entry
+UC_PRE = bytes.fromhex('dbe3' '0f57c0' '0f57c9' '0f57d2' '0f57db')   # fninit; xorps xmm0..3
+
+def run_unicorn(cases, chunks):
+    """Returns {case index as str: [eax, ecx, edx, ebx, ebp, esi, flags, memhex]} in
+    the format of the other oracles, or None if unicorn isn't installed.
+    Addresses are the guest's own (edi = SCRATCH, the same stack pointer), so
+    unlike the 64-bit oracles every register is comparable."""
+    try:
+        from unicorn import Uc, UcError, UC_ARCH_X86, UC_MODE_32
+        from unicorn import x86_const as X
+    except ImportError:
+        return None
+    uc = Uc(UC_ARCH_X86, UC_MODE_32)
+    uc.mem_map(0, 0x10000)                       # 16-bit addressing forms (lea only)
+    uc.mem_map(UC_CODE, 0x10000)
+    uc.mem_map(SCRATCH & ~0xfff, 0x10000)
+    uc.mem_map(UC_STACK_LO, 0x10000)
+    uc.reg_write(X.UC_X86_REG_CR0, (uc.reg_read(X.UC_X86_REG_CR0) | 0x2) & ~0xC)   # MP, no EM/TS
+    uc.reg_write(X.UC_X86_REG_CR4, uc.reg_read(X.UC_X86_REG_CR4) | 0x600)          # OSFXSR, OSXMMEXCPT
+    GP = [X.UC_X86_REG_EAX, X.UC_X86_REG_ECX, X.UC_X86_REG_EDX,
+          X.UC_X86_REG_EBX, X.UC_X86_REG_EBP, X.UC_X86_REG_ESI]
+    out = {}
+    for i, (cs, ch) in enumerate(zip(cases, chunks)):
+        code = UC_PRE + bytes(ch)
+        # the previous case's translated blocks live at the same address: drop them,
+        # or stale code runs (seen as "the previous instruction executed again")
+        uc.ctl_remove_cache(UC_CODE, UC_CODE + 0x10000)
+        uc.mem_write(UC_CODE, code)
+        uc.mem_write(UC_STACK_LO, bytes(0x10000))
+        uc.mem_write(SCRATCH, cs['mem'])
+        for r, v in zip(GP, cs['regs']): uc.reg_write(r, v)
+        if cs['ptr']: uc.reg_write(X.UC_X86_REG_ESI, SCRATCH + 64)
+        uc.reg_write(X.UC_X86_REG_EDI, SCRATCH)
+        uc.reg_write(X.UC_X86_REG_ESP, UC_ESP)
+        uc.reg_write(X.UC_X86_REG_EFLAGS, cs['flags'])
+        uc.reg_write(X.UC_X86_REG_MXCSR, 0x1f80)   # the power-on value; unicorn starts at 0
+        try:
+            uc.emu_start(UC_CODE, UC_CODE + len(code), timeout=2_000_000, count=100000)
+        except UcError:
+            continue                              # fault (division, access): skip, like the others
+        if uc.reg_read(X.UC_X86_REG_EIP) != UC_CODE + len(code): continue
+        regs = ['%08x' % uc.reg_read(r) for r in GP]
+        fl = '%08x' % (uc.reg_read(X.UC_X86_REG_EFLAGS) & 0x8D5)
+        out[str(i)] = regs + [fl, bytes(uc.mem_read(SCRATCH, MEMSZ)).hex()]
+    return out
+
+EXPORT_README = """Run the fuzzer's oracle on real x86-64 hardware
+===============================================
+
+oracle.c is self-contained C (inline assembly, no dependencies).  On any
+x86-64 Linux machine (a cloud VM is fine: the instructions run on the CPU):
+
+    cc -O0 -mno-red-zone -o oracle oracle.c
+    ./oracle > hw.txt
+    grep -m1 'model name' /proc/cpuinfo >> hw.cpu.txt
+
+Bring hw.txt back and compare (same n and seed as the export):
+
+    tools/verify/fuzzisa.py @N@ @SEED@ --hw hw.txt
+
+Generated with: n=@N@ seed=@SEED@ (@NC@ cases for the 64-bit oracle).
+"""
 
 def gen_guest(cases, chunks, workdir):
     bodies = []; names = []; skipped = []
@@ -474,13 +830,15 @@ def gen_guest(cases, chunks, workdir):
             names.append(None); skipped.append((i, 'ERROR: ' + str(e))); continue
         bodies.append(code.replace('sub_%08x' % BASE, 't%d' % i))
         names.append('t%d' % i)
+    # one small function per case: a single main() with every case inlined made
+    # clang's compile time grow much faster than the number of cases
     o = [GUEST_HDR, '\n'.join(bodies), 'static CPU cpu; static CPU *const c = &cpu;']
-    o.append('int main(void){ mem_init(); mem_commit(0x0u,0x01000000u); mem_fault_handler_install();')
-    o.append('  unsigned char m[%d];' % MEMSZ)
+    calls = []
     for i, cs in enumerate(cases):
         if i >= len(names) or names[i] is None: continue
         regs = cs['regs']; f = cs['flags']
-        o.append('  {')
+        calls.append('  k%d();' % i)
+        o.append('static __attribute__((noinline)) void k%d(void){ unsigned char m[%d];' % (i, MEMSZ))
         o.append('   memset(&cpu,0,sizeof cpu); cpu.esp=0x00B00000u; cpu.top=0; cpu.fcw=0x037f;')
         for k, rn in enumerate(['eax','ecx','edx','ebx','ebp','esi']):
             o.append('   cpu.%s=0x%08xu;' % (rn, regs[k]))
@@ -503,17 +861,25 @@ def gen_guest(cases, chunks, workdir):
         o.append('   for(int k=0;k<%d;k++) printf("%%02x", m[k]);' % MEMSZ)
         o.append('   printf("\\n");')
         o.append('  }')
+    o.append('int main(void){ mem_init(); mem_commit(0x0u,0x01000000u); mem_fault_handler_install();')
+    o += calls
     o.append('  return 0; }')
     src = os.path.join(workdir, 'guest.c')
     open(src, 'w').write('\n'.join(o))
     exe = os.path.join(workdir, 'guest')
-    subprocess.run(['clang','-O1','-Wno-unused-label','-Iruntime','-o',exe,src,
+    subprocess.run(['clang','-O1','-Wno-unused-label','-Wno-parentheses-equality','-Iruntime','-o',exe,src,
                     'runtime/mem.c','-lm'], check=True)
     return exe, skipped
 
 def main():
-    n    = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
-    seed = int(sys.argv[2]) if len(sys.argv) > 2 else 12345
+    argv = list(sys.argv[1:]); export = hwfile = None
+    if '--export' in argv:
+        k = argv.index('--export'); export = argv[k+1]; del argv[k:k+2]
+    if '--hw' in argv:
+        k = argv.index('--hw'); hwfile = argv[k+1]; del argv[k:k+2]
+    n    = int(argv[0]) if len(argv) > 0 else 2000
+    seed = int(argv[1]) if len(argv) > 1 else 12345
+    want = [x for x in os.environ.get('ORACLES', 'rosetta,unicorn').split(',') if x]
     rng = random.Random(seed)
     workdir = os.environ.get('FUZZDIR', '/tmp/fuzzisa')
     os.makedirs(workdir, exist_ok=True)
@@ -536,18 +902,14 @@ def main():
                 struct.pack_into('<f', mem, off, v)
         flags = 0x202 | (rng.getrandbits(12) & 0x8D5)
         cases.append(dict(regs=regs, mem=bytes(mem), flags=flags, tmpl=t.name,
-                          undef=t.undef, skipmem=t.skipmem, ptr=t.ptr, asm=a))
+                          undef=t.undef, skipmem=t.skipmem, ptr=t.ptr, asm=a, m32=t.m32))
 
-    chunks = assemble(asm, workdir)
+    chunks = assemble(asm, workdir, [c['m32'] for c in cases])
     with open(os.path.join(workdir,'cases.txt'),'w') as fh:
         for i,(a,ch) in enumerate(zip(asm,chunks)):
             fh.write('%d\t%s\t%s\n' % (i, ch.hex(), a.replace(chr(10),' ; ').replace(chr(9),'')))
-    oexe = gen_oracle(cases, chunks, workdir)
     gexe, skipped = gen_guest(cases, chunks, workdir)
-
-    ro = subprocess.run([oexe], capture_output=True, text=True)
     rg = subprocess.run([gexe], capture_output=True, text=True)
-    if ro.returncode: print('  WARNING: oracle exit code %d' % ro.returncode)
     if rg.returncode: print('  WARNING: guest exit code %d  %s' % (rg.returncode, rg.stderr[:200]))
     def parse(lines):
         d = {}
@@ -555,34 +917,107 @@ def main():
             f = l.split()
             if len(f) == 9: d[f[0]] = f[1:]
         return d
-    om = parse(ro.stdout.splitlines())
     gm = parse(rg.stdout.splitlines())
 
-    bad = {}; checked = 0
+    # ---- oracles: name -> (results, same addresses as the guest?)
+    oracles = {}
+    if 'rosetta' in want:
+        oexe = gen_oracle(cases, chunks, workdir)
+        ro = subprocess.run([oexe], capture_output=True, text=True)
+        if ro.returncode: print('  WARNING: rosetta oracle exit code %d' % ro.returncode)
+        oracles['rosetta'] = (parse(ro.stdout.splitlines()), False)
+    if 'unicorn' in want:
+        um = run_unicorn(cases, chunks)
+        if um is None: print('  note: unicorn not installed (pip install "unicorn>=2,<3"); oracle skipped')
+        else: oracles['unicorn'] = (um, True)
+    if hwfile:
+        oracles['hw'] = (parse(open(hwfile).read().splitlines()), False)
+    if export:
+        os.makedirs(export, exist_ok=True)
+        gen_oracle(cases, chunks, export, build=False)
+        open(os.path.join(export, 'README.txt'), 'w').write(
+            EXPORT_README.replace('@N@', str(n)).replace('@SEED@', str(seed))
+                         .replace('@NC@', str(sum(1 for c in cases if not c['m32']))))
+        print('  exported: %s/oracle.c (+ README.txt)' % export)
+
+    def compare(i, ref, got, same_addr, names=('real', 'ours')):
+        """differences between two result rows of case i (ref is the oracle)"""
+        undef = cases[i]['undef']; diffs = []
+        for j, nm in enumerate(['eax','ecx','edx','ebx','ebp','esi']):
+            if nm == 'esi' and cases[i]['ptr'] and not same_addr: continue   # base address differs
+            if ref[j] != got[j]: diffs.append('%s: %s %s != %s %s' % (nm, names[0], ref[j], names[1], got[j]))
+        rf = int(ref[6],16) & ~undef; gf = int(got[6],16) & ~undef
+        if rf != gf: diffs.append('flags: %s %03x != %s %03x' % (names[0], rf, names[1], gf))
+        if ref[7] != got[7] and not cases[i]['skipmem']:
+            for b in range(MEMSZ):
+                a1, b1 = ref[7][b*2:b*2+2], got[7][b*2:b*2+2]
+                if a1 != b1:
+                    diffs.append('mem[%d]: %s %s != %s %s' % (b, names[0], a1, names[1], b1)); break
+        return diffs
+
+    def inp(i):
+        return 'input: ' + ' '.join('%s=%08x' % (nm, v) for nm, v in
+                 zip(['eax','ecx','edx','ebx','ebp','esi'], cases[i]['regs'])) \
+               + ' flags=%03x' % (cases[i]['flags'] & 0x8d5)
+
+    # ---- guest against every oracle
+    bad = {}; checked = 0; per = {nm: [0, 0] for nm in oracles}     # name -> [checked, mismatched]
+    status = {}                                                     # case -> {oracle: 'ok'|'diff'}
     for i in range(n):
         k = str(i)
-        if k not in gm or k not in om: continue
-        checked += 1
-        o, g = om[k], gm[k]
-        undef = cases[i]['undef']
-        diffs = []
-        for j, nm in enumerate(['eax','ecx','edx','ebx','ebp','esi']):
-            if nm == 'esi' and cases[i]['ptr']: continue   # base address differs
-            if o[j] != g[j]: diffs.append('%s: real %s != ours %s' % (nm, o[j], g[j]))
-        of_ = int(o[6],16) & ~undef; gf_ = int(g[6],16) & ~undef
-        if of_ != gf_: diffs.append('flags: real %03x != ours %03x' % (of_, gf_))
-        if o[7] != g[7] and not cases[i]['skipmem']:
-            for b in range(MEMSZ):
-                a1, b1 = o[7][b*2:b*2+2], g[7][b*2:b*2+2]
-                if a1 != b1:
-                    diffs.append('mem[%d]: real %s != ours %s' % (b, a1, b1)); break
-        if diffs:
-            inp = 'input: ' + ' '.join('%s=%08x' % (n, v) for n, v in
-                     zip(['eax','ecx','edx','ebx','ebp','esi'], cases[i]['regs'])) \
-                  + ' flags=%03x' % (cases[i]['flags'] & 0x8d5)
-            bad.setdefault(cases[i]['tmpl'], []).append((i, cases[i]['asm'], [inp] + diffs))
+        if k not in gm: continue
+        any_oracle = False
+        for nm, (res, same) in oracles.items():
+            if k not in res: continue
+            any_oracle = True; per[nm][0] += 1
+            d = compare(i, res[k], gm[k], same)
+            status.setdefault(i, {})[nm] = 'diff' if d else 'ok'
+            if d:
+                per[nm][1] += 1
+                bad.setdefault(cases[i]['tmpl'], []).append((i, cases[i]['asm'], [inp(i), 'oracle: ' + nm] + d))
+        checked += any_oracle
+
+    # ---- oracles against each other (who is right when the lifter differs from one?)
+    onames = list(oracles); odis = {}
+    for x in range(len(onames)):
+        for y in range(x + 1, len(onames)):
+            a, b2 = onames[x], onames[y]; cnt = 0; ex = {}
+            for i in range(n):
+                k = str(i)
+                if k in oracles[a][0] and k in oracles[b2][0]:
+                    cnt += 1
+                    d = compare(i, oracles[a][0][k], oracles[b2][0][k],
+                                oracles[a][1] and oracles[b2][1], names=(a, b2))
+                    if d: ex.setdefault(cases[i]['tmpl'], []).append((i, cases[i]['asm'], [inp(i)] + d))
+            odis[(a, b2)] = (cnt, ex)
+
+    # ---- coverage record for tools/verify/isacoverage.py
+    try:
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+        md = Cs(CS_ARCH_X86, CS_MODE_32)
+        cov = []
+        unl = {i: e for i, e in skipped}
+        for i, (cs, ch) in enumerate(zip(cases, chunks)):
+            cov.append(dict(tmpl=cs['tmpl'], m32=cs['m32'], skipmem=cs['skipmem'],
+                            mn=sorted({x.mnemonic for x in md.disasm(bytes(ch), BASE)}),
+                            lifted=i not in unl, err=unl.get(i), st=status.get(i, {})))
+        json.dump(dict(n=n, seed=seed, oracles=onames, cases=cov),
+                  open(os.path.join(workdir, 'coverage.json'), 'w'))
+    except ImportError:
+        pass
 
     print('\n  checked: %d/%d   not liftable: %d' % (checked, n, len(skipped)))
+    for nm in onames:
+        print('    %-8s %5d cases compared, %d mismatches' % (nm, per[nm][0], per[nm][1]))
+    for (a, b2), (cnt, ex) in odis.items():
+        nd = sum(len(v) for v in ex.values())
+        print('    %s vs %s: %d common cases, %d disagreements' % (a, b2, cnt, nd)
+              + ('' if not nd else '  (oracles disagree with each other)'))
+        for tn, lst in sorted(ex.items(), key=lambda x: -len(x[1])):
+            print('      --- %s  (%d cases) ---' % (tn, len(lst)))
+            for i, asm_, d in lst[:1]:
+                print('        #%d  %r' % (i, asm_))
+                for x in d[:3]: print('            ' + x)
     if skipped:
         seen = set()
         for i, e in skipped:
@@ -600,7 +1035,7 @@ def main():
         print('\n  --- %s  (%d cases) ---' % (tn, len(lst)))
         for i, a, d in lst[:2]:
             print('    #%d  %r' % (i, a))
-            for x in d[:4]: print('        ' + x)
+            for x in d[:5]: print('        ' + x)
     return 1
 
 if __name__ == '__main__':

@@ -31,7 +31,9 @@ fi
 #   HD_MSAA (default automatic: 2x at 1440 rows and above, 4x below; 1 = off),
 #   HD_SSR=1 (0 off), HD_SSR_CAR=1 (car paint), HD_RT=1 (ray-traced reflections; 0 = SSR),
 #   HD_GSEP=1 (G-buffer in a separate single-sampled pass), HD_MBFIX=1 (the scene stays
-#   multisampled during motion blur), HD_RT_FAR / HD_RT_BMIN (ray limits; off by default).
+#   multisampled during motion blur), HD_RT_FAR / HD_RT_BMIN (ray limits; off by default),
+#   HD_RT_HALF (rays per frame: unset/2 half, row interlace; 1 half, checkerboard; 0 all),
+#   HD_RT_AQ=1 (alpha test inside the ray traversal; off by default, measured slower on M1).
 #   Details: runtime/enhance.c, runtime/metal.m (sections of the same name)
 # Picture options, HD engine only (launcher Settings > Picture; unset = the original game):
 #   TINT=less|none|cool    the screen filter's yellow-green tint: half / none / none + cooler
@@ -79,7 +81,7 @@ unset AUTOKEY AUTOCLICK FORCESWITCH FETICK GAMELOG DUMPFRAME BOOTFLOW \
       DRAWSUM PSISO SKIPPS PSINFO BLITLOG SNDCSV SNDDUMP SNDBACKEND \
       FPSCSV AUTOKEYSTOP VCLOCK VCLOCK_MAXD DECLLOG CULLWIND RSLOG NOFOG BLITQUAD RESSCAN ASPFIX ASPLOG PSHIST MIPLIN NOANISO LODMAX \
       RTIDLOG DRAWVPS ZSHARELOG XFORMAT CAMLOG HD_SSR_DEBUG VIEWLOG HD_RTPROBE HD_RTPROBE2 HD_RT_STAGE HD_RT_NOTEX HD_RT_PLAIN HD_RT_ONLYCX HD_RT_SLOWBUILD HD_RT_LOG HD_RT_DUMPTAB HD_RT_STRESS HD_COMP HD_MSLAZY HD_REORDER HD_RT_AB HD_RT_FIX HD_RT_POISON FORCERAIN FORCETOD FORCETOD_STATE GPUWIN PASSPROF PASSPROF_MODE GPUVSDUMP \
-      SNDMUTE YAKALAKARE DRAWLIST NODRAW LIMFREE ABTEST PASSPROF_CSV HD_MBLOG HD_RT_DLOG HD_RT_ONLY HD_RTPROBE2_HER \
+      SNDMUTE YAKALAKARE DRAWLIST NODRAW LIMFREE ABTEST PASSPROF_CSV HD_MBLOG HD_RT_DLOG HD_RT_ONLY HD_RTPROBE2_HER HD_RT_AQCMP \
       STALL MEMDUMP REGFIRST ADAPTERID FPSCAP BGFPS FBONLY
 
 export FIXMAT="${FIXMAT:-1}"

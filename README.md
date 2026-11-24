@@ -13,7 +13,8 @@ ARM64 macOS app**. The game's x86 machine code is lifted to C ahead of time and
 compiled with clang; Direct3D 9 is translated to Metal, DirectSound to
 CoreAudio. There is no Wine, no emulator, no JIT and no Windows involved at run
 time. On an M1 Pro, races run at **119 fps** (the display's limit), against
-**10–15 fps** for the same game under Wine.
+**10–15 fps** for the same game under upstream Wine 11; CrossOver and Parallels
+have not been measured yet (see [Performance](#performance)).
 
 > **This repository contains no game code and no game assets.** It contains the
 > recompiler and the runtime only. You need your own copy of the game. The C
@@ -111,11 +112,22 @@ out/nfsu2_boot            ~35 MB arm64 Mach-O
 
 ## Verification
 
-- **Instruction semantics:** 169 hand-written tests, 439 checks
+- **Instruction semantics:** 184 hand-written tests, 474 checks
   (`tools/verify/isatest.py` → `out/isatest`).
-- **Differential fuzzing against real x86:** `tools/verify/fuzzisa.py` assembles random
-  instruction sequences, runs them as real x86-64 code under Rosetta 2 and as
-  lifted C on ARM64, and compares registers, flags and memory.
+- **Differential fuzzing against two independent translators:**
+  `tools/verify/fuzzisa.py` assembles random instruction sequences and runs the
+  same bytes as lifted C on ARM64, as x86-64 code under Rosetta 2, and in
+  Unicorn (QEMU's translator) in 32-bit mode, then compares registers, flags
+  and memory. Neither oracle is a CPU; the fuzzer can export its oracle program
+  for a run on x86 hardware, which has not been done yet. In a 20,000-case run
+  the 145 original templates show no difference against Rosetta; 47 templates
+  added later found five lifter defects (four in instruction forms the port
+  does not execute; the fifth, `stmxcsr` storing 0, occurs four times in the
+  game and is open) and one instruction, `cmpxchg`, where the lifter had copied
+  Rosetta's flag behaviour, which differs from the Intel manual.
+  `docs/verification-coverage.md` has the details and the coverage: 89% of the
+  game's instructions belong to mnemonics compared against at least one
+  oracle, 75% against both; the rest is almost entirely `call`/`jmp`/`ret`.
 - **Function-level tests:** 15 checks against lifted game functions
   (`out/nfsu2_all`).
 - **Reproducible generation:** the generated C is a pure function of the
@@ -140,6 +152,14 @@ Measured on an M1 Pro at 1280×960, same scene and settings, alternating runs:
 | 3D menus | 119 fps | 45 fps |
 | CPU time per frame | ~12.6 ms | ~105 ms |
 
+This is upstream Wine, measured in windowed mode, and it launched reliably only
+4 times out of 11. It is the same graphics path every Wine-based tool uses for
+this game (Direct3D 9 goes through wined3d; D3DMetal, DXMT and CrossOver's DXVK
+cover Direct3D 10–12 only), but CrossOver's own build and a virtual machine
+(Parallels with Windows 11 on Arm) have not been measured, so read the ratio as
+"against upstream Wine", not "against the best alternative".
+`docs/wine-comparison.md` lists what a proper baseline still needs.
+
 Power while racing at the display's native resolution (3024×1964, 120 fps,
 M1 Pro, `powermetrics`, a real play session): the standard build draws about
 **6.5 W** for CPU + GPU, stays at or below 70 °C and never spins the fans; the
@@ -150,7 +170,8 @@ HD build draws about 18 W.
 - Apple Silicon Mac, macOS 11 or later. Developed on an M1 Pro, macOS 27.
 - Xcode Command Line Tools (`clang`; `swiftc` for the launcher window).
 - Python 3 with `capstone` 5.x and `pefile` (`requirements.txt`).
-- Rosetta 2, only for `tools/verify/fuzzisa.py`.
+- Rosetta 2, only for `tools/verify/fuzzisa.py`; optionally `unicorn` 2.x for
+  its second oracle.
 - Your own installation of the game, with one of these executables (both v1.2
   without the CD check, built Feb 9 2005):
 
@@ -334,9 +355,12 @@ No. The game's code is recompiled to native ARM64 and runs directly on macOS.
 Rosetta 2 is not used to run the game (only, optionally, by one test tool).
 
 **Is it faster than Wine or CrossOver?**
-On an M1 Pro at 1280×960: 119 fps in races (capped by the 120 Hz display)
-against 10–15 fps under Wine 11.18 with Rosetta 2, and 119 fps against 45 fps
-in the 3D menus.
+Than upstream Wine, yes: on an M1 Pro at 1280×960, 119 fps in races (capped by
+the 120 Hz display) against 10–15 fps under Wine 11.18 with Rosetta 2, and 119
+fps against 45 fps in the 3D menus. CrossOver has not been measured. Method,
+caveats and raw data are in `docs/wine-comparison.md` and `bench/wine/`.
+Unlike Wine and CrossOver, the port does not depend on Rosetta 2, which Apple
+is phasing out after macOS 27.
 
 **Is there a ready-made download?**
 Yes: the [Releases page](https://github.com/TalhaMudo/NFSU2Recomp/releases/latest) has `NFSU2.zip`. The app holds both
@@ -432,12 +456,16 @@ it:
 - McSema, rev.ng, RetDec and BinRec are IR-based binary lifters from the research
   side.
 
-What this project adds is narrower: recovering a relocation table whose
-directory entry was zeroed and using it to separate pointers from constants; a
-differential instruction fuzzer that uses Rosetta 2 as the oracle; a hybrid
+What this project adds is narrower: statically recovering a relocation table
+whose directory entry was zeroed and using it to separate pointers from
+constants (with it 96% of the code section is decoded, with the usual
+"looks like an address" heuristic 86% plus 958 entries that start inside an
+instruction; `docs/relocation-ablation.md`); a differential instruction fuzzer
+that needs no x86 hardware, using Rosetta 2 and Unicorn as oracles; a hybrid
 interpreter for x86 code the game generates at run time; and an end-to-end,
 playable Win32 + Direct3D 9 → macOS ARM64 + Metal port of a 23,000-function 3D
-game.
+game. The closest academic work, and where these claims stop, is in
+`docs/literature.md` (§13) and `docs/research-plan.md`.
 
 ## Repository layout
 
@@ -464,6 +492,12 @@ docs/               engineering log, design notes, measurements, images
 - `docs/d3dx-hle.md` — high-level emulation of the D3DX effect framework.
 - `docs/graphics.md` — graphics research and the HD build.
 - `docs/lifter-efficiency.md` — lifter efficiency work and measurements.
+- `docs/research-plan.md` — research question, claims and their evidence, the
+  experiments done and open, threats to validity.
+- `docs/verification-coverage.md` — what the instruction tests cover, the
+  oracles' limits, the differences found.
+- `docs/relocation-ablation.md` — code discovery with and without the recovered
+  relocation table.
 
 ## How this was built
 

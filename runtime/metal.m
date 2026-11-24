@@ -2220,6 +2220,8 @@ static id<MTLAccelerationStructure> g_rt_as, g_rt_tlas;
 static int g_rt_cache = 1, g_rt_only_static;
 static id<MTLRenderPipelineState> g_rt_pso, g_rt_pso_ms;
 static id<MTLComputePipelineState> g_rt_kern, g_rt_kern2;   /* 2: the RT_V2 variable */
+static id<MTLComputePipelineState> g_rt_kern_aq[2];         /* RT_AQ: alpha test in the traversal; [1] + AQSTAT (HD_RT_AQCMP) */
+static id<MTLBuffer> g_rt_aqs;
 static id<MTLTexture> g_rt_out;
 static id<MTLArgumentEncoder> g_rt_argenc;
 static unsigned g_rt_ring;
@@ -2241,6 +2243,9 @@ static NSString *kRTFSrc = @
 "#include <metal_stdlib>\n"
 "#ifndef RT_V2\n"
 "#define RT_V2 0\n"
+"#endif\n"
+"#ifndef RT_AQ\n"
+"#define RT_AQ 0\n"
 "#endif\n"
 "using namespace metal;\n"
 "using namespace raytracing;\n"
@@ -2265,10 +2270,16 @@ static NSString *kRTFSrc = @
 "    constant SSRP &S [[buffer(0)]], instance_acceleration_structure acc [[buffer(1)]],\n"
 "    device const HDMat *MAT [[buffer(3)]],\n"
 "    device const HDAttr *ATT [[buffer(4)]], constant HDTex &TX [[buffer(6)]],\n"
-"    device const HDAttr *SATT [[buffer(7)]], constant uint *IB [[buffer(8)]]) {\n"
-/* S.cb2.w = 0 full; 1/2 = that frame's half of the checkerboard (see HALF RAYS) */
+"    device const HDAttr *SATT [[buffer(7)]], constant uint *IB [[buffer(8)]]\n"
+"#ifdef AQSTAT\n"
+"    , device atomic_uint *AQS [[buffer(9)]]\n"
+"#endif\n"
+"    ) {\n"
+/* S.cb2.w = 0 full; 1/2 = that frame's half of the checkerboard; 3/4 = that frame's
+ * rows (even / odd) of the row interlace (see HALF RAYS) */
 "  uint par = uint(S.cb2.w + 0.5);\n"
-"  uint2 tid = par == 0u ? tid0 : uint2(tid0.x * 2u + ((tid0.y + par) & 1u), tid0.y);\n"
+"  uint2 tid = par == 0u ? tid0 : (par >= 3u ? uint2(tid0.x, tid0.y * 2u + (par - 3u))\n"
+"                                             : uint2(tid0.x * 2u + ((tid0.y + par) & 1u), tid0.y));\n"
 /* S.cb0.w = scale (1 or 2): output (W/scale, H/scale); every output pixel represents
  * the (tid * scale) pixel of the full-resolution G-buffer. */
 "  uint sc = uint(max(S.cb0.w, 1.0));\n"
@@ -2316,18 +2327,76 @@ static NSString *kRTFSrc = @
 "#if RT_V2\n"
 "  isec.assume_identity_transforms(true);\n"
 "#endif\n"
+/* ALPHA TEST IN THE TRAVERSAL (RT_AQ, see hd_rt_init).  The default kernel restarts
+ * the ray from an alpha-rejected hit (up to 5 traversals from the root).  RT_AQ:
+ * one intersection_query with every triangle forced non-opaque; a candidate is
+ * committed only if it passes the same alpha test as below, so the closest passing
+ * hit comes out of ONE traversal.  Plain mode (S.cam2.w > 1.5) and S.rt2.w > 0.5
+ * (diagnostic, HD_RT_AQCMP: no alpha test) force the query opaque. */
+"#if RT_AQ\n"
+"  intersection_params ip;\n"
+"  ip.assume_geometry_type(geometry_type::triangle);\n"
+"  ip.force_opacity((S.cam2.w < 1.5 && S.rt2.w < 0.5) ? forced_opacity::non_opaque : forced_opacity::opaque);\n"
+"  intersection_query<triangle_data, instancing> q;\n"
+"#define H_INST h_inst\n"
+"#define H_PRIM h_prim\n"
+"#define H_DIST h_dist\n"
+"#define H_BC   h_bc\n"
+"  for (int k = 0; k < 1; k++) {\n"
+"    uint h_inst, h_prim; float h_dist; float2 h_bc;\n"
+"    {\n"
+"      ray r0; r0.origin = org; r0.direction = Rd; r0.min_distance = 0.01; r0.max_distance = maxd;\n"
+"      q.reset(r0, acc, ip);\n"
+"      while (q.next()) {\n"
+"        uint cb_ = IB[q.get_candidate_instance_id()];\n"
+"        bool cst = cb_ != 0xFFFFFFFFu;\n"
+"        uint c0 = (cst ? cb_ : 0u) + q.get_candidate_primitive_id() * 3u;\n"
+"        device const HDAttr *CA = cst ? SATT : ATT;\n"
+"        HDMat cm = MAT[uint(CA[c0].pad + 0.5)];\n"
+"        bool pass = true;\n"
+"#ifdef AQSTAT\n"     /* candidates: all, alpha-tested, rejected (HD_RT_AQCMP) */
+"        atomic_fetch_add_explicit(&AQS[0], 1u, memory_order_relaxed);\n"
+"        if ((cm.flags & 1u) != 0u) atomic_fetch_add_explicit(&AQS[1], 1u, memory_order_relaxed);\n"
+"#endif\n"
+"        if ((cm.flags & 1u) != 0u) {\n"
+"          float2 cbc = q.get_candidate_triangle_barycentric_coord(); float cw = 1.0 - cbc.x - cbc.y;\n"
+"          HDAttr x0 = CA[c0], x1 = CA[c0 + 1u], x2 = CA[c0 + 2u];\n"
+"          float ca = x0.col0.a * cw + x1.col0.a * cbc.x + x2.col0.a * cbc.y;\n"
+"          bool cmc = (cm.flags & 2u) != 0u;\n"
+"          float clod = clamp(log2(1.0 + q.get_candidate_triangle_distance() * S.cam2.z), 0.0, 5.0);\n"
+"          float2 cuv = cmc ? (x0.uv1.xy * cw + x1.uv1.xy * cbc.x + x2.uv1.xy * cbc.y)\n"
+"                           : (x0.uv0 * cw + x1.uv0 * cbc.x + x2.uv0 * cbc.y);\n"
+"          float cta = S.cam2.w > 0.5 ? 1.0 : TX.t[cmc ? cm.tex1 : cm.tex0].sample(rs, cuv, level(clod)).a;\n"
+"          pass = !(cta * ca < cm.prm.x);\n"
+"        }\n"
+"#ifdef AQSTAT\n"
+"        if (!pass) atomic_fetch_add_explicit(&AQS[2], 1u, memory_order_relaxed);\n"
+"#endif\n"
+"        if (pass) q.commit_triangle_intersection();\n"
+"      }\n"
+"      if (q.get_committed_intersection_type() == intersection_type::none) break;\n"
+"      h_inst = q.get_committed_instance_id(); h_prim = q.get_committed_primitive_id();\n"
+"      h_dist = q.get_committed_distance(); h_bc = q.get_committed_triangle_barycentric_coord();\n"
+"    }\n"
+"#else\n"
+/* the restarting kernel (default): kept textually as it was measured */
+"#define H_INST h.instance_id\n"
+"#define H_PRIM h.primitive_id\n"
+"#define H_DIST h.distance\n"
+"#define H_BC   h.triangle_barycentric_coord\n"
 "  for (int k = 0; k < 5; k++) {\n"
 "    ray r; r.origin = org; r.direction = Rd; r.min_distance = 0.01; r.max_distance = maxd - tot;\n"
 "    intersection_result<triangle_data, instancing> h = isec.intersect(r, acc);\n"
 "    if (h.type == intersection_type::none) break;\n"
+"#endif\n"
 /* instance table (see STATIC STORE SLOTS): ~0 = instant capture, otherwise the
  * slot's first vertex in the store; the triangle number is within the slot */
-"    uint ib = IB[h.instance_id];\n"
+"    uint ib = IB[H_INST];\n"
 "    bool st = ib != 0xFFFFFFFFu;\n"
-"    uint g0 = (st ? ib : 0u) + h.primitive_id * 3u;\n"
-"    tot += h.distance;\n"
+"    uint g0 = (st ? ib : 0u) + H_PRIM * 3u;\n"
+"    tot += H_DIST;\n"
 "    if (S.cam2.w > 1.5) { rc = float3(1.0 / (1.0 + 0.02 * tot)); conf = 1.0; break; }\n"
-"    float2 b = h.triangle_barycentric_coord; float w0 = 1.0 - b.x - b.y;\n"
+"    float2 b = H_BC; float w0 = 1.0 - b.x - b.y;\n"
 "    HDAttr a0, a1, a2;\n"
 "    if (st) { a0 = SATT[g0]; a1 = SATT[g0 + 1u]; a2 = SATT[g0 + 2u]; }\n"
 "    else    { a0 = ATT[g0];  a1 = ATT[g0 + 1u];  a2 = ATT[g0 + 2u]; }\n"
@@ -2340,7 +2409,7 @@ static NSString *kRTFSrc = @
  * recompute it with the game's formula
  * (vs_4: fog = clamp((end - depth) * scale, low, 1)) */
 "    if ((m.flags & 0x10000u) != 0u) {\n"
-"      float3 hp = org + Rd * h.distance;\n"
+"      float3 hp = org + Rd * H_DIST;\n"
 "      float zv = (S.vp * float4(hp, 1.0)).w;\n"
 "      fog = S.fogp.w > 0.5 ? clamp((S.fogp.x - zv) * S.fogp.y, S.fogp.z, 1.0) : 1.0;\n"
 "    }\n"
@@ -2348,14 +2417,16 @@ static NSString *kRTFSrc = @
 "    float lod = clamp(log2(1.0 + tot * S.cam2.z), 0.0, 5.0);\n"
 "    float4 tc = S.cam2.w > 0.5 ? float4(1.0) : TX.t[mcar ? m.tex1 : m.tex0].sample(rs, mcar ? uv1.xy : uv0, level(lod));\n"
 /* alpha test (trees, fences): the ray continues through the surface */
-"    if ((m.flags & 1u) != 0u && tc.a * col.a < m.prm.x) { org += Rd * (h.distance + 0.02); continue; }\n"
+"#if !RT_AQ\n"     /* RT_AQ: the committed hit passed the test already */
+"    if ((m.flags & 1u) != 0u && tc.a * col.a < m.prm.x) { org += Rd * (H_DIST + 0.02); continue; }\n"
+"#endif\n"
 "    float3 lit = col.rgb;\n"
 /* The static copy is stored as an UNLIT BASE.  If the part is drawn lit by
  * headlights in this frame (0x20000), the headlight term is built at the hit point
  * with the draw's CURRENT light matrix (world -> light, m.l0..l3):
  * oT1 = p.L, oT2.x = scale*q.w + offset. */
 "    if ((m.flags & 0x20000u) != 0u && S.cam2.w < 0.5) {\n"
-"      float3 hp2 = org + Rd * h.distance;\n"
+"      float3 hp2 = org + Rd * H_DIST;\n"
 "      float4 q1 = hp2.x * m.l0 + hp2.y * m.l1 + hp2.z * m.l2 + m.l3;\n"
 "      float4 q2 = float4(q1.w * m.prm.y + m.prm.z, 0.0, 1.0, 1.0);\n"
 "      float3 l1 = TX.t[m.tex1].sample(cs, hd_proj(q1, (m.flags >> 8) & 3u), level(0.0)).rgb;\n"
@@ -2525,6 +2596,12 @@ static void hd_rtstat_report(void){
             c[1], cr ? 100.0 * c[3] / cr : 0, cr ? 100.0 * c[13] / cr : 0, cr ? 100.0 * c[11] / cr : 0,
             c[4], c[5], c[6], c[7], c[8], c[9]);
 }
+/* HD_RT_AQ=1: the RT_AQ kernel variant (see hd_rt_init) */
+static int hd_rt_aq_mode(void){
+    static int v = -1;
+    if (v < 0){ const char *e = ENVC("HD_RT_AQ"); v = (e && *e == '1') ? 1 : 0; }
+    return v;
+}
 static void hd_rt_init(void){
     if (!hd_rt_on() || g_rt_pso) return;
     NSError *e = nil;
@@ -2544,6 +2621,33 @@ static void hd_rt_init(void){
           id<MTLFunction> k2 = l2 ? [l2 newFunctionWithName:@"hd_rt_kern"] : nil;
           if (k2) g_rt_kern2 = [g_dev newComputePipelineStateWithFunction:k2 error:&e2];
           if (!g_rt_kern2) fprintf(stderr, "[HD] RT kernel variant could not be built: %s\n", e2 ? [[e2 localizedDescription] UTF8String] : "?"); } }
+    /* Kernel VARIANT (RT_AQ): the alpha test inside the traversal instead of
+     * restarting the ray from the rejected hit; see ALPHA TEST IN THE TRAVERSAL in
+     * the kernel.  Measured 2026-11-11 (M1 Pro: software traversal; Quick Race
+     * capacity mode, every HD option on, in-run A/B ABTEST=RTAQ): GPU +0.32
+     * Mcycles/frame (+4.9%), i.e. SLOWER than restarting.  HD_RT_AQCMP (same data):
+     * every triangle becomes a candidate, 1.75 candidates per ray, half of them
+     * alpha-tested; the candidate round trips cost more than the restarts.  Splitting
+     * opaque / alpha-tested triangles into separate geometry would avoid at most the
+     * other half (not done: the instant / group / new layouts would all need it).
+     * A hint for hardware ray tracing (M3 and later), where the balance may differ.
+     * Not identical to the restarting kernel: that one gives up after 5 alpha
+     * layers and skips 0.03 units after each, RT_AQ finds the surface behind (~2%
+     * of the ray pixels in a race, more hits).
+     * HD_RT_AQ=1 uses it (off by default; ABTEST=RTAQ: restarting kernel in the off
+     * slice). */
+    { int aqv = hd_rt_aq_mode(), cmp = ENVC("HD_RT_AQCMP") != NULL;
+      for (int v = 0; v < 2; v++){
+          if (v ? !cmp : !(aqv || cmp)) continue;
+          NSError *e2 = nil;
+          id<MTLLibrary> l2 = [g_dev newLibraryWithSource:[(v ? @"#define RT_AQ 1\n#define AQSTAT 1\n" : @"#define RT_AQ 1\n")
+                                                           stringByAppendingString:hd_gb_src(kRTFSrc)] options:nil error:&e2];
+          id<MTLFunction> k2 = l2 ? [l2 newFunctionWithName:@"hd_rt_kern"] : nil;
+          if (k2) g_rt_kern_aq[v] = [g_dev newComputePipelineStateWithFunction:k2 error:&e2];
+          if (!g_rt_kern_aq[v]) fprintf(stderr, "[HD] RT kernel variant RT_AQ%s could not be built: %s\n", v ? "+AQSTAT" : "", e2 ? [[e2 localizedDescription] UTF8String] : "?");
+          else if (!v) fprintf(stderr, "[HD] RT kernel variant RT_AQ (alpha test in the traversal) built%s, threadgroup <= %lu (restarting kernel %lu)\n",
+                               aqv ? ", in use" : "", (unsigned long)g_rt_kern_aq[0].maxTotalThreadsPerThreadgroup,
+                               (unsigned long)g_rt_kern.maxTotalThreadsPerThreadgroup); } }
     { id<MTLFunction> xf = [lib newFunctionWithName:@"hd_rt_fix"];
       if (xf) g_rt_fixk = [g_dev newComputePipelineStateWithFunction:xf error:&e];
       g_rt_fixcnt = [g_dev newBufferWithLength:(2 + 2 * HD_MAXVSI) * 4 options:MTLResourceStorageModeShared];
@@ -3587,12 +3691,15 @@ static unsigned hd_rt_frame(id<MTLCommandBuffer> cb, int rb, unsigned upto, cons
     return (total + sbuilt) / 3;
 }
 static int g_hd_dump_now;       /* this frame was selected with DUMPFRAME (diagnostic) */
-static int g_rt_kforce;         /* HD_RTPROBE2: 1 old kernel, 2 RT_V2 (comparison with the same data) */
+static int g_rt_kforce;         /* HD_RTPROBE2: 1 old kernel, 2 RT_V2; HD_RT_AQCMP: 3 RT_AQ, 4 RT_AQ+AQSTAT (comparison with the same data) */
 static void hd_rt_trace(id<MTLCommandBuffer> cb, const void *par, size_t parsz, id<MTLTexture> zt,
                         NSUInteger W, NSUInteger H, unsigned nt){
     id<MTLComputeCommandEncoder> ce = pp_compute(cb, "RT: ray kernel (compute)");
-    [ce setComputePipelineState:g_rt_kforce == 1 ? g_rt_kern : (g_rt_kforce == 2 && g_rt_kern2) ? g_rt_kern2
-                                : (g_rt_kern2 && !abt_off("RTV2")) ? g_rt_kern2 : g_rt_kern];
+    id<MTLComputePipelineState> kp = g_rt_kforce == 1 ? g_rt_kern : (g_rt_kforce == 2 && g_rt_kern2) ? g_rt_kern2
+                                : (g_rt_kforce >= 3 && g_rt_kern_aq[g_rt_kforce - 3]) ? g_rt_kern_aq[g_rt_kforce - 3]
+                                : (g_rt_kforce == 0 && hd_rt_aq_mode() && g_rt_kern_aq[0] && !abt_off("RTAQ")) ? g_rt_kern_aq[0]
+                                : (g_rt_kern2 && !abt_off("RTV2")) ? g_rt_kern2 : g_rt_kern;
+    [ce setComputePipelineState:kp];
     [ce setTexture:g_rt_out atIndex:0];
     [ce setTexture:zt atIndex:1];
     [ce setTexture:g_hd_g[0] atIndex:2];
@@ -3610,7 +3717,9 @@ static void hd_rt_trace(id<MTLCommandBuffer> cb, const void *par, size_t parsz, 
     [ce setBuffer:g_rt_arg[g_rt_ring] offset:0 atIndex:6];
     [ce setBuffer:g_rt_sattr offset:0 atIndex:7];
     [ce useResources:g_rt_texs count:nt usage:MTLResourceUsageRead];
-    NSUInteger tw = g_rt_kern.threadExecutionWidth, th = g_rt_kern.maxTotalThreadsPerThreadgroup / tw;
+    if (kp == g_rt_kern_aq[1] && g_rt_aqs) [ce setBuffer:g_rt_aqs offset:0 atIndex:9];
+    /* the variants may have a smaller threadgroup limit (RT_AQ: more registers) */
+    NSUInteger tw = kp.threadExecutionWidth, th = kp.maxTotalThreadsPerThreadgroup / tw;
     [ce dispatchThreadgroups:MTLSizeMake((W + tw - 1) / tw, (H + th - 1) / th, 1)
        threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
     [ce endEncoding];
@@ -4001,19 +4110,87 @@ static int hd_composite(id<MTLCommandBuffer> cb, int rb, unsigned i, id<MTLTextu
                     { rt_tris = hd_rt_frame(cb, rb, i, iv, vp, ivp, 1.f / p00, 1.f / p11, &rt_nt, sp2.fogp); sp2.cb[1][3] = (float)g_rt_only_static; }
                 }
             }
+            /* HD_RT_AQCMP=1 (diagnostic, at the DUMPFRAME frames): the SAME data traced
+             * (full rays) with the restarting kernel, RT_AQ, RT_AQ without the alpha
+             * test and RT_AQ with candidate counters; the outputs are read back and
+             * compared with the restarting kernel.  "no alpha test" shows how many ray
+             * pixels alpha-tested geometry changes in this frame.  Times: each kernel
+             * alone, alternating, best of 6. */
+            if (g_hd_dump_now && ENVC("HD_RT_AQCMP") && g_rt_kern_aq[0] && g_rt_kern_aq[1]){
+                enum { NV = 4 };
+                if (!g_rt_aqs) g_rt_aqs = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+                id<MTLCommandBuffer> pb = [g_queue commandBuffer]; unsigned nt2 = 0;
+                unsigned t2 = hd_rt_frame(pb, rb, i, iv, vp, ivp, 1.f / p00, 1.f / p11, &nt2, sp2.fogp);
+                [pb commit]; [pb waitUntilCompleted];
+                MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                              width:ow height:oh mipmapped:NO];
+                od.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModeShared;
+                id<MTLTexture> keep = g_rt_out, ct[NV]; double gms[NV];
+                float sw = sp2.cb[2][3], sr = sp2.rt2[3]; sp2.cb[2][3] = 0.f;
+                static const int kf[NV] = { 1, 3, 3, 4 };
+                for (int v = 0; v < NV; v++){ ct[v] = [g_dev newTextureWithDescriptor:od]; gms[v] = 1e30; }
+                for (int it = 0; it < NV * 7; it++){
+                    int v = it % NV; g_rt_out = ct[v];
+                    if (v == 3) memset([g_rt_aqs contents], 0, 16);
+                    g_rt_kforce = kf[v]; sp2.rt2[3] = v == 2 ? 1.f : 0.f;
+                    id<MTLCommandBuffer> tb = [g_queue commandBuffer];
+                    hd_rt_trace(tb, &sp2, sizeof sp2, zt, ow, oh, nt2);
+                    [tb commit]; [tb waitUntilCompleted];
+                    double msx = (tb.GPUEndTime - tb.GPUStartTime) * 1e3;
+                    if (it >= NV && msx < gms[v]) gms[v] = msx;
+                    if (tb.error) fprintf(stderr, "[AQCMP] variant %d: command buffer error: %s\n", v, [[tb.error localizedDescription] UTF8String]);
+                }
+                g_rt_kforce = 0; g_rt_out = keep; sp2.cb[2][3] = sw; sp2.rt2[3] = sr;
+                size_t np = (size_t)ow * oh; uint8_t *px[NV];
+                for (int v = 0; v < NV; v++){ px[v] = malloc(np * 4);
+                    [ct[v] getBytes:px[v] bytesPerRow:ow * 4 fromRegion:MTLRegionMake2D(0, 0, ow, oh) mipmapLevel:0]; }
+                size_t ray = 0, hit[NV] = {0}, dif[NV] = {0}, dif4[NV] = {0}, gain[NV] = {0}; int mx[NV] = {0};
+                for (size_t p = 0; p < np; p++){
+                    const uint8_t *a = px[0] + p * 4; int any = 0;
+                    for (int v = 0; v < NV; v++){ const uint8_t *b = px[v] + p * 4; int m = 0;
+                        if (b[3]) { hit[v]++; any = 1; }
+                        if (b[3] && !a[3]) gain[v]++;
+                        for (int ch = 0; ch < 4; ch++){ int dd = abs((int)a[ch] - (int)b[ch]); if (dd > m) m = dd; }
+                        if (m > 0) dif[v]++; if (m > 4) dif4[v]++; if (m > mx[v]) mx[v] = m; }
+                    ray += any;
+                }
+                static const char *vn[NV] = { "restart", "RT_AQ", "no alpha test", "RT_AQ+stat" };
+                fprintf(stderr, "[AQCMP] frame %ld tris %u: %zu ray pixels\n", (long)atomic_load(&g_frames_drawn), t2, ray);
+                for (int v = 0; v < NV; v++)
+                    fprintf(stderr, "[AQCMP]   %-13s %.3f ms  hit %zu px (+%zu where restart misses), differs from restart %zu px (>4/255: %zu, max %d)\n",
+                            vn[v], gms[v], hit[v], gain[v], dif[v], dif4[v], mx[v]);
+                { const uint32_t *c = (const uint32_t *)[g_rt_aqs contents];
+                  fprintf(stderr, "[AQCMP]   RT_AQ candidates %u (%.2f per ray pixel), alpha-tested %u (%.1f%%), rejected %u\n",
+                          c[0], ray ? (double)c[0] / ray : 0.0, c[1], c[0] ? 100.0 * c[1] / c[0] : 0.0, c[2]); }
+                for (int v = 0; v < NV; v++) free(px[v]);
+                rt_tris = hd_rt_frame(cb, rb, i, iv, vp, ivp, 1.f / p00, 1.f / p11, &rt_nt, sp2.fogp); sp2.cb[1][3] = (float)g_rt_only_static;
+            }
             /* --- HALF RAYS ----------------------------------------------------
              * The ray kernel (~2.5 ms at 3024x1964) is the biggest item of the
              * reflection system.  Every frame only one half of a checkerboard is
              * traced; the other half is the previous frame's result left in the
              * ray texture (8 ms at 120 fps).  The composite's 4-point upscale mixes
              * the two anyway.  If the texture was just created that frame is traced
-             * fully.  HD_RT_HALF=0 old. */
+             * fully.
+             * ROW INTERLACE (default): the same number of rays, but one frame traces
+             * the even rows and the next the odd rows (full width, half height).
+             * The checkerboard halves the ray count but saved only 21% of the
+             * kernel: neighboring lanes of a 32-wide SIMD group were two pixels
+             * apart and shifted from row to row, so the groups' rays diverged and
+             * every group waited for its longest ray.  Measured (2026-11-10,
+             * Quick Race capacity mode, every HD option on, in-run A/B): GPU
+             * 7.53 -> 6.89 Mcycles/frame (-8.5%), GPU energy -4.3%.  The composite's
+             * 4-point upscale reads two taps of each field as with the checkerboard.
+             * HD_RT_HALF=0 full rays, 1 checkerboard (old), 2 or unset row interlace;
+             * ABTEST=RTROWS: checkerboard in the off slice. */
             static int half = -1; static unsigned hpar; static id<MTLTexture> hseen;
-            if (half < 0){ const char *e = ENVC("HD_RT_HALF"); half = (e && *e == '0') ? 0 : 1; }
-            NSUInteger tw2 = ow;
-            if (half && hseen == g_rt_out){ sp2.cb[2][3] = (float)(1u + (hpar++ & 1u)); tw2 = (ow + 1) / 2; }
+            if (half < 0){ const char *e = ENVC("HD_RT_HALF"); half = !e ? 2 : (*e == '0') ? 0 : (*e == '1') ? 1 : 2; }
+            NSUInteger tw2 = ow, th2 = oh;
+            if (half && hseen == g_rt_out){
+                if (half == 2 && !abt_off("RTROWS")){ sp2.cb[2][3] = (float)(3u + (hpar++ & 1u)); th2 = (oh + 1) / 2; }
+                else { sp2.cb[2][3] = (float)(1u + (hpar++ & 1u)); tw2 = (ow + 1) / 2; } }
             hseen = g_rt_out;
-            hd_rt_trace(cb, &sp2, sizeof sp2, zt, tw2, oh, rt_nt);
+            hd_rt_trace(cb, &sp2, sizeof sp2, zt, tw2, th2, rt_nt);
             sp2.cb[2][3] = 0.f;
             sp = ms ? g_rt_pso_ms : g_rt_pso;
         }

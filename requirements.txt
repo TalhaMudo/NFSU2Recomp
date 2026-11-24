@@ -6,3 +6,7 @@ pefile>=2023.2.7
 
 # Only for pack.sh's app icon (tools/packaging/exeicon.py, tools/packaging/mkicon.py)
 Pillow>=10
+
+# Optional: second oracle of the differential fuzzer (tools/verify/fuzzisa.py).
+# Without it the fuzzer runs with Rosetta 2 only.
+#   pip install "unicorn>=2,<3"
